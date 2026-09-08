@@ -1,0 +1,2871 @@
+//! Server-owned stage tracking for the MCP translation pipeline.
+//!
+//! The model is allowed to choose text and geometry, but it must not be able
+//! to accidentally skip a required image stage.  Every clean and render
+//! artifact gets a small sidecar whose source path and hashes form a chain.
+
+use anyhow::{Context, Result, anyhow, bail};
+use image::{GenericImageView, GrayImage, RgbImage};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use std::cmp::Ordering;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+const CLEAN_SIDECAR_SUFFIX: &str = ".fukidashi-clean.json";
+const RENDER_SIDECAR_SUFFIX: &str = ".fukidashi-render.json";
+const LEGACY_MANIFEST_NAME: &str = ".fukidashi-job.json";
+const MANIFEST_NAME: &str = "job.json";
+
+#[derive(Debug, Clone)]
+struct PageArtifacts {
+    analysis: PathBuf,
+    mask: PathBuf,
+    cleaned: PathBuf,
+    corrected_clean: PathBuf,
+    rendered: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanArtifact {
+    pub stage: String,
+    pub source_image: PathBuf,
+    pub cleaned_image: PathBuf,
+    pub mask_path: PathBuf,
+    pub source_sha256: String,
+    pub cleaned_sha256: String,
+    pub masked_pixels: u64,
+    pub changed_masked_pixels: u64,
+    pub changed_ratio: f64,
+    #[serde(default)]
+    pub source_dark_pixels: u64,
+    #[serde(default)]
+    pub cleaned_dark_pixels: u64,
+    #[serde(default)]
+    pub dark_pixel_reduction_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderArtifact {
+    pub stage: String,
+    pub source_image: PathBuf,
+    pub cleaned_image: PathBuf,
+    pub rendered_image: PathBuf,
+    #[serde(default)]
+    pub rendered_sha256: String,
+    pub clean_sidecar: PathBuf,
+    #[serde(default)]
+    pub typeset: serde_json::Value,
+    pub qa: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobManifest {
+    stage: String,
+    source_dir: PathBuf,
+    #[serde(default)]
+    pages: std::collections::BTreeMap<String, PageManifest>,
+    #[serde(default)]
+    expected_pages: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PageManifest {
+    source_image: PathBuf,
+    state: String,
+    /// Hash captured when the page first enters a managed job. Reusing a job
+    /// after replacing a source file would otherwise expose stale artifacts.
+    #[serde(default)]
+    source_sha256: String,
+    #[serde(default)]
+    cleaned_image: Option<PathBuf>,
+    #[serde(default)]
+    rendered_image: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Workflow {
+    root: PathBuf,
+    jobs: Arc<Mutex<std::collections::HashMap<PathBuf, PathBuf>>>,
+}
+
+/// Scope captured on the first page analysis for a source folder. Page
+/// numbers are one-based and follow the server's natural filename ordering.
+/// An explicit path list is useful for non-contiguous or synthetic fixtures.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeSpec {
+    pub start_page: Option<usize>,
+    pub end_page: Option<usize>,
+    pub include_paths: Option<Vec<PathBuf>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Registration {
+    pub job_dir: PathBuf,
+    pub expected_pages: Vec<PathBuf>,
+    pub page_state: String,
+}
+
+/// The first page in a managed job that has not reached a verified render.
+/// Exposing this through the workflow keeps clients out of internal manifests
+/// and makes resume behavior deterministic across MCP hosts clients.
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingPage {
+    pub job_dir: PathBuf,
+    pub job_id: String,
+    pub page_number: usize,
+    pub total_pages: usize,
+    pub source_image: PathBuf,
+    pub state: String,
+    pub analysis_path: PathBuf,
+}
+
+/// The server-owned paths and state for one page in a managed job.  Clients
+/// normally receive only the page number and an opaque translation token; the
+/// record is kept public for the strict loop implementation and diagnostics.
+#[derive(Debug, Clone)]
+pub struct ManagedPage {
+    pub job_dir: PathBuf,
+    pub source_image: PathBuf,
+    pub state: String,
+    pub analysis_path: PathBuf,
+    pub mask_path: PathBuf,
+    pub cleaned_image: PathBuf,
+    pub corrected_clean: PathBuf,
+    pub rendered_image: PathBuf,
+}
+
+/// Cross-process ownership marker for source-job allocation. The in-process
+/// map prevents duplicate work within one server, while this marker closes
+/// the window between creating a job directory and publishing its manifest
+/// when two MCP processes see the same source folder.
+struct SourceAllocationLock {
+    _lease: LockLease,
+}
+
+struct ManifestLock {
+    _lease: LockLease,
+}
+
+/// Held while an editor or MCP typeset operation writes a deterministic page
+/// render. The lock is advisory but works across independent MCP processes.
+pub struct RenderLock {
+    _lease: LockLease,
+}
+
+struct LockLease {
+    path: PathBuf,
+    stop: Option<mpsc::Sender<()>>,
+    heartbeat: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for LockLease {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Workflow {
+    pub fn new(root: PathBuf) -> Result<Self> {
+        let root = if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()?.join(root)
+        };
+        reject_symlink_ancestors(&root)
+            .with_context(|| format!("inspect jobs root {}", root.display()))?;
+        fs::create_dir_all(&root)
+            .with_context(|| format!("create jobs root {}", root.display()))?;
+        reject_symlink_ancestors(&root)
+            .with_context(|| format!("inspect jobs root {}", root.display()))?;
+        let root = canonical_path(&root)
+            .with_context(|| format!("resolve jobs root {}", root.display()))?;
+        Ok(Self {
+            root,
+            jobs: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Return the server-owned per-page paths for a registered source image.
+    /// New jobs use these deterministic names; legacy jobs keep their existing
+    /// flat artifacts when callers provide them explicitly.
+    pub fn page_artifacts_for_source(
+        &self,
+        source: &Path,
+    ) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, PathBuf)> {
+        let source = canonical_path(source)?;
+        let job = self.allocate_job_for_source(&source)?;
+        let manifest = load_manifest(&job)?;
+        let paths = page_artifacts(&job, &manifest, &source)?;
+        Ok((
+            paths.analysis,
+            paths.mask,
+            paths.cleaned,
+            paths.corrected_clean,
+            paths.rendered,
+        ))
+    }
+
+    /// Return the canonical analysis checkpoint for a source page and reject
+    /// checkpoints from another managed job or from an arbitrary sibling
+    /// path. This binds crop cleaning to the same source/page allocation.
+    pub fn require_analysis_for_source(&self, source: &Path, requested: &Path) -> Result<PathBuf> {
+        let requested = self.require_owned(requested, "analysis checkpoint")?;
+        let canonical = self.page_artifacts_for_source(source)?.0;
+        if !paths_same(&requested, &canonical)? {
+            bail!(
+                "analysis checkpoint must be the canonical managed page artifact {}",
+                canonical.display()
+            );
+        }
+        Ok(requested)
+    }
+
+    /// Persist the complete analysis in the managed page directory. A caller
+    /// may still request an additional checkpoint path for conversation
+    /// management; this canonical page checkpoint is always written.
+    pub fn write_analysis_artifact(
+        &self,
+        source: &Path,
+        analysis: &serde_json::Value,
+    ) -> Result<PathBuf> {
+        let source = canonical_path(source)?;
+        let job = self.allocate_job_for_source(&source)?;
+        let manifest = load_manifest(&job)?;
+        let paths = page_artifacts(&job, &manifest, &source)?;
+        atomic_json(&paths.analysis, analysis)?;
+        Ok(paths.analysis)
+    }
+
+    /// Allocate an output directory owned by the server. Source directories
+    /// are never used for generated artifacts.
+    pub fn allocate_job(&self) -> Result<PathBuf> {
+        let job = self.root.join(format!("job--{}", Uuid::new_v4().simple()));
+        create_dir_all_owned(&job, &self.root)?;
+        create_job_layout(&job, None)?;
+        Ok(job)
+    }
+
+    pub fn allocate_job_for_source(&self, source: &Path) -> Result<PathBuf> {
+        let source = canonical_path(source)?;
+        let source_dir = source
+            .parent()
+            .ok_or_else(|| anyhow!("source image has no parent directory"))?
+            .to_path_buf();
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| anyhow!("workflow job lock poisoned"))?;
+        if let Some(job) = jobs.get(&source_dir).cloned()
+            && is_safe_job_candidate(&job, &self.root)
+            && load_manifest(&job).ok().is_some_and(|manifest| {
+                paths_same(&manifest.source_dir, &source_dir).unwrap_or(false)
+            })
+        {
+            return Ok(job);
+        }
+        jobs.remove(&source_dir);
+        let _allocation_lock = acquire_source_allocation_lock(&self.root, &source_dir)?;
+        if let Some(job) = jobs.get(&source_dir).cloned()
+            && is_safe_job_candidate(&job, &self.root)
+            && load_manifest(&job).ok().is_some_and(|manifest| {
+                paths_same(&manifest.source_dir, &source_dir).unwrap_or(false)
+            })
+        {
+            return Ok(job);
+        }
+        if let Ok(entries) = fs::read_dir(&self.root) {
+            for entry in entries.flatten() {
+                let candidate = entry.path();
+                if !is_safe_job_candidate(&candidate, &self.root) {
+                    continue;
+                }
+                let Ok(bytes) = fs::read(manifest_path(&candidate))
+                    .or_else(|_| fs::read(legacy_manifest_path(&candidate)))
+                else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                let Some(raw_dir) = value.get("source_dir").and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                if fs::canonicalize(raw_dir)
+                    .ok()
+                    .and_then(|path| path_identity(&path).ok())
+                    == path_identity(&source_dir).ok()
+                {
+                    jobs.insert(source_dir.clone(), candidate.clone());
+                    return Ok(candidate);
+                }
+            }
+        }
+        let job = self.allocate_source_job(&source_dir)?;
+        let manifest = JobManifest {
+            stage: "managed".into(),
+            source_dir: source_dir.clone(),
+            pages: Default::default(),
+            expected_pages: Vec::new(),
+        };
+        save_manifest(&job, &manifest)?;
+        jobs.insert(source_dir, job.clone());
+        Ok(job)
+    }
+
+    pub fn acquire_render_lock(&self, job: &Path) -> Result<RenderLock> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let lease = acquire_lock_file(
+            job.join(".fukidashi-render.lock"),
+            &format!("render job {}", job.display()),
+        )?;
+        Ok(RenderLock { _lease: lease })
+    }
+
+    /// Allocate a readable, collision-safe layout for a new source folder.
+    /// Existing UUID-shaped legacy jobs remain valid and are never moved.
+    fn allocate_source_job(&self, source_dir: &Path) -> Result<PathBuf> {
+        let raw = source_dir
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed("comic"));
+        let slug = raw
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let slug = if slug.is_empty() { "comic" } else { &slug };
+        let source_id = stable_source_id(source_dir)?;
+        for attempt in 0..1000_u32 {
+            let id = if attempt == 0 {
+                source_id.clone()
+            } else {
+                format!("{source_id}-{attempt}")
+            };
+            let job = self
+                .root
+                .join(format!("{}--{}", &slug[..slug.len().min(48)], id));
+            match fs::create_dir(&job) {
+                Ok(()) => {
+                    create_job_layout(&job, Some(source_dir))?;
+                    return Ok(job);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if is_safe_job_candidate(&job, &self.root)
+                        && let Ok(existing) = load_manifest(&job)
+                        && paths_same(&existing.source_dir, source_dir).unwrap_or(false)
+                    {
+                        return Ok(job);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("unable to allocate a unique managed job directory")
+    }
+
+    pub fn register_analysis(
+        &self,
+        source: &Path,
+        scope: Option<&ScopeSpec>,
+    ) -> Result<Registration> {
+        let source = canonical_path(source)?;
+        let job = self.allocate_job_for_source(&source)?;
+        let _manifest_lock = acquire_manifest_lock(&job)?;
+        let mut manifest = load_manifest(&job)?;
+        if manifest.expected_pages.is_empty() {
+            manifest.expected_pages = discover_expected_pages(&source, scope)?;
+            manifest.source_dir = source
+                .parent()
+                .ok_or_else(|| anyhow!("source image has no parent directory"))?
+                .to_path_buf();
+            for expected in &manifest.expected_pages {
+                manifest
+                    .pages
+                    .entry(page_key(expected))
+                    .or_insert_with(|| PageManifest {
+                        source_image: expected.clone(),
+                        state: "pending".into(),
+                        source_sha256: sha256_file(expected).unwrap_or_default(),
+                        cleaned_image: None,
+                        rendered_image: None,
+                    });
+            }
+            create_page_layouts(&job, &manifest)?;
+            save_manifest(&job, &manifest)?;
+        } else if let Some(scope) = scope {
+            let requested = discover_expected_pages(&source, Some(scope))?;
+            if !same_path_list(&requested, &manifest.expected_pages)? {
+                bail!(
+                    "managed job already has a different expected-page scope; start a new source job or keep the original scope"
+                );
+            }
+        }
+        populate_legacy_source_hashes(&mut manifest)?;
+        validate_source_hashes(&manifest)?;
+        if !manifest
+            .expected_pages
+            .iter()
+            .any(|expected| paths_same(expected, &source).unwrap_or(false))
+        {
+            bail!(
+                "page is outside the managed expected-page scope: {}",
+                source.display()
+            );
+        }
+        let entry = manifest
+            .pages
+            .get_mut(&page_key(&source))
+            .ok_or_else(|| anyhow!("expected page is missing from the managed manifest"))?;
+        if entry.state == "pending" || entry.state.is_empty() {
+            entry.state = "analyzed".into();
+        }
+        let page_state = entry.state.clone();
+        create_page_layouts(&job, &manifest)?;
+        save_manifest(&job, &manifest)?;
+        Ok(Registration {
+            job_dir: job,
+            expected_pages: manifest.expected_pages,
+            page_state,
+        })
+    }
+
+    pub fn require_owned(&self, path: &Path, label: &str) -> Result<PathBuf> {
+        reject_symlink_ancestors(path)
+            .with_context(|| format!("inspect {label} {}", path.display()))?;
+        let candidate =
+            canonical_path(path).with_context(|| format!("resolve {label} {}", path.display()))?;
+        let root = canonical_path(&self.root)
+            .with_context(|| format!("resolve jobs root {}", self.root.display()))?;
+        if !path_starts_with(&candidate, &root) {
+            bail!(
+                "{label} must be inside server-owned jobs root {}",
+                root.display()
+            );
+        }
+        Ok(candidate)
+    }
+
+    /// Resolve the managed job root for an artifact nested below `pages/0001`
+    /// or another job subdirectory. Legacy flat artifacts resolve directly to
+    /// the job directory, so the same helper covers both layouts.
+    fn job_root_for_path(&self, path: &Path) -> Result<PathBuf> {
+        reject_symlink_ancestors(path)
+            .with_context(|| format!("inspect managed artifact {}", path.display()))?;
+        let resolved = canonical_path(path)
+            .with_context(|| format!("resolve managed artifact {}", path.display()))?;
+        let mut candidate = if resolved.is_dir() {
+            resolved
+        } else {
+            resolved
+                .parent()
+                .ok_or_else(|| anyhow!("managed artifact has no parent directory"))?
+                .to_path_buf()
+        };
+        let root = canonical_path(&self.root)
+            .with_context(|| format!("resolve jobs root {}", self.root.display()))?;
+        loop {
+            if candidate.parent() == Some(root.as_path())
+                && (manifest_path(&candidate).is_file()
+                    || legacy_manifest_path(&candidate).is_file())
+            {
+                return Ok(candidate);
+            }
+            if candidate == root {
+                break;
+            }
+            candidate = candidate
+                .parent()
+                .ok_or_else(|| anyhow!("managed artifact is outside jobs root"))?
+                .to_path_buf();
+        }
+        bail!(
+            "managed artifact {} is not inside a direct managed job",
+            path.display()
+        )
+    }
+
+    pub fn managed_job_for_path(&self, path: &Path) -> Result<PathBuf> {
+        self.job_root_for_path(path)
+    }
+
+    pub fn managed_page_records(&self, job: &Path) -> Result<Vec<serde_json::Value>> {
+        let manifest = load_manifest(job)?;
+        Ok(manifest
+            .pages
+            .values()
+            .map(|page| {
+                serde_json::json!({
+                    "source_image": page.source_image,
+                    "cleaned_image": page.cleaned_image,
+                    "rendered_image": page.rendered_image,
+                    "state": page.state,
+                })
+            })
+            .collect())
+    }
+
+    /// Resolve the deterministic artifacts for one page without allocating a
+    /// new job from the source path.  Strict translation calls use this to
+    /// resume a partially completed page and to avoid exposing path choices
+    /// to the client model.
+    pub fn managed_page(&self, job: &Path, source: &Path) -> Result<ManagedPage> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let source = canonical_path(source)
+            .with_context(|| format!("resolve managed source page {}", source.display()))?;
+        let manifest = load_manifest(&job)?;
+        let page = manifest
+            .pages
+            .get(&page_key(&source))
+            .ok_or_else(|| anyhow!("source image is not registered in the managed job"))?;
+        if !paths_same(&page.source_image, &source)? {
+            bail!("source image does not match the managed page record");
+        }
+        let artifacts = page_artifacts(&job, &manifest, &source)?;
+        Ok(ManagedPage {
+            job_dir: job,
+            source_image: page.source_image.clone(),
+            state: page.state.clone(),
+            analysis_path: artifacts.analysis,
+            mask_path: artifacts.mask,
+            cleaned_image: page.cleaned_image.clone().unwrap_or(artifacts.cleaned),
+            corrected_clean: artifacts.corrected_clean,
+            rendered_image: page.rendered_image.clone().unwrap_or(artifacts.rendered),
+        })
+    }
+
+    /// Return the content hash of an owned managed artifact.  The strict
+    /// translation token binds this hash so a second client cannot submit
+    /// translations against a changed analysis checkpoint.
+    pub fn managed_file_sha256(&self, path: &Path, label: &str) -> Result<String> {
+        let path = self.require_owned(path, label)?;
+        if !path.is_file() {
+            bail!("{label} does not exist: {}", path.display());
+        }
+        sha256_file(&path)
+    }
+
+    pub fn next_pending_page(&self, job: &Path) -> Result<Option<PendingPage>> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let mut manifest = load_manifest(&job)?;
+        // Older jobs only recorded pages in the manifest and left
+        // expected_pages empty.  Normalize that inventory before selecting a
+        // page so strict resume can use the same canonical page artifacts as
+        // a newly registered job.  Keep the legacy manifest filename when it
+        // is the only marker present; save_manifest handles that choice.
+        if manifest.expected_pages.is_empty() && !manifest.pages.is_empty() {
+            let _manifest_lock = acquire_manifest_lock(&job)?;
+            manifest = load_manifest(&job)?;
+            if manifest.expected_pages.is_empty() && !manifest.pages.is_empty() {
+                let mut expected = manifest
+                    .pages
+                    .values()
+                    .map(|page| page.source_image.clone())
+                    .collect::<Vec<_>>();
+                expected.sort_by(|left, right| natural_cmp(left, right));
+                manifest.expected_pages = expected;
+                create_page_layouts(&job, &manifest)?;
+                save_manifest(&job, &manifest)?;
+            }
+        }
+        validate_source_hashes(&manifest)?;
+        let ordered = if manifest.expected_pages.is_empty() {
+            let mut pages = manifest
+                .pages
+                .values()
+                .map(|page| page.source_image.clone())
+                .collect::<Vec<_>>();
+            pages.sort_by(|left, right| natural_cmp(left, right));
+            pages
+        } else {
+            manifest.expected_pages.clone()
+        };
+        for (index, source) in ordered.iter().enumerate() {
+            let Some(page) = manifest.pages.get(&page_key(source)) else {
+                bail!(
+                    "expected page {} is missing from the managed manifest",
+                    index + 1
+                );
+            };
+            if page.state == "rendered"
+                && page
+                    .rendered_image
+                    .as_ref()
+                    .is_some_and(|rendered| self.validate_render_input(rendered).is_ok())
+            {
+                continue;
+            }
+            let artifacts = page_artifacts(&job, &manifest, source)?;
+            return Ok(Some(PendingPage {
+                job_dir: job.clone(),
+                job_id: job
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned(),
+                page_number: index + 1,
+                total_pages: ordered.len(),
+                source_image: page.source_image.clone(),
+                state: page.state.clone(),
+                analysis_path: artifacts.analysis,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// Resolve an existing managed job directory. Job directories are direct
+    /// children of the jobs root so a model cannot select an arbitrary folder.
+    pub fn resolve_managed_job_path(&self, raw: &str) -> Result<PathBuf> {
+        let input = PathBuf::from(raw);
+        let candidate = if input.is_absolute() {
+            input
+        } else {
+            self.root.join(input)
+        };
+        reject_symlink_ancestors(&candidate)
+            .with_context(|| format!("inspect managed job directory {}", candidate.display()))?;
+        let resolved = canonical_path(&candidate)
+            .with_context(|| format!("resolve managed job directory {}", candidate.display()))?;
+        let job = if resolved.is_file()
+            && resolved
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == MANIFEST_NAME || name == LEGACY_MANIFEST_NAME)
+        {
+            resolved
+                .parent()
+                .ok_or_else(|| anyhow!("managed job manifest has no parent directory"))?
+                .to_path_buf()
+        } else {
+            resolved
+        };
+        let root = canonical_path(&self.root).context("resolve jobs root")?;
+        if job == root || job.parent() != Some(root.as_path()) {
+            bail!(
+                "managed job must be a direct child of server-owned jobs root {}",
+                root.display()
+            );
+        }
+        if !job.is_dir()
+            || (!manifest_path(&job).is_file() && !legacy_manifest_path(&job).is_file())
+        {
+            bail!("managed job is missing its job.json manifest");
+        }
+        Ok(job)
+    }
+
+    pub fn resolve_managed_job_id(&self, id: &str) -> Result<PathBuf> {
+        if id.is_empty() || id.chars().any(|ch| matches!(ch, '\\' | '/' | ':' | '.')) {
+            bail!("job_id must be the directory name returned by the pipeline");
+        }
+        self.resolve_managed_job_path(id)
+    }
+
+    /// Return a render artifact that is both in this managed job and valid in
+    /// the clean -> render sidecar chain. An explicit path is accepted only
+    /// when it names one of the manifest's rendered pages.
+    pub fn verified_render_for_job(&self, job: &Path, requested: Option<&Path>) -> Result<PathBuf> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let manifest = load_manifest(&job)?;
+        let mut pages = if manifest.expected_pages.is_empty() {
+            manifest.pages.values().collect::<Vec<_>>()
+        } else {
+            manifest
+                .expected_pages
+                .iter()
+                .filter_map(|source| manifest.pages.get(&page_key(source)))
+                .collect::<Vec<_>>()
+        };
+        pages.sort_by(|left, right| natural_cmp(&left.source_image, &right.source_image));
+        if let Some(requested) = requested {
+            let requested = self.require_owned(requested, "editor image")?;
+            if !paths_same(&self.job_root_for_path(&requested)?, &job)? {
+                bail!("rendered artifact must belong to the selected managed job");
+            }
+            if !pages.iter().any(|page| {
+                page.rendered_image
+                    .as_ref()
+                    .is_some_and(|render| paths_same(render, &requested).unwrap_or(false))
+            }) {
+                bail!("path is not a rendered artifact registered in the managed manifest");
+            }
+            self.validate_render_input(&requested)?;
+            return Ok(requested);
+        }
+        for page in pages {
+            if page.state != "rendered" {
+                continue;
+            }
+            if let Some(rendered) = page.rendered_image.as_ref()
+                && self.validate_render_input(rendered).is_ok()
+            {
+                return self.require_owned(rendered, "editor image");
+            }
+        }
+        bail!("no rendered page passed the managed clean/render validation")
+    }
+
+    pub fn require_output_owned(&self, path: &Path, label: &str) -> Result<PathBuf> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("{label} has no parent directory"))?;
+        let root = canonical_path(&self.root)
+            .with_context(|| format!("resolve jobs root {}", self.root.display()))?;
+        let absolute_parent = if parent.is_absolute() {
+            parent.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(parent)
+        };
+        if !lexically_within(&absolute_parent, &root) {
+            bail!(
+                "{label} must be inside server-owned jobs root {}",
+                root.display()
+            );
+        }
+        reject_symlink_ancestors(&absolute_parent)
+            .with_context(|| format!("inspect {label} parent {}", parent.display()))?;
+        if !absolute_parent.exists() {
+            fs::create_dir_all(&absolute_parent)
+                .with_context(|| format!("create {label} parent {}", parent.display()))?;
+        }
+        reject_symlink_ancestors(&absolute_parent)
+            .with_context(|| format!("inspect {label} parent {}", parent.display()))?;
+        // `fs::canonicalize` can return a Windows verbatim path (`\\?\E:\...`)
+        // while the configured root is represented without that prefix. Use
+        // the same canonical identity for both sides before enforcing the
+        // managed-root boundary.
+        let canonical_parent = canonical_path(&absolute_parent)
+            .with_context(|| format!("resolve {label} parent {}", parent.display()))?;
+        if !path_starts_with(&canonical_parent, &root) {
+            bail!(
+                "{label} must be inside server-owned jobs root {}",
+                root.display()
+            );
+        }
+        let parent = self.require_owned(&canonical_parent, label)?;
+        let file = path
+            .file_name()
+            .ok_or_else(|| anyhow!("{label} has no file name"))?;
+        Ok(parent.join(file))
+    }
+
+    /// Return the deterministic job-local destination for an approved font.
+    /// Sources are limited to existing regular font files in the managed job's
+    /// `fonts` directory or the Windows system font directory. Files elsewhere
+    /// in a job are not treated as font provenance merely because they are
+    /// readable.
+    pub fn font_destination(&self, job: &Path, source: &Path) -> Result<(PathBuf, String)> {
+        reject_symlink_ancestors(job)
+            .with_context(|| format!("inspect font job {}", job.display()))?;
+        let job =
+            canonical_path(job).with_context(|| format!("resolve font job {}", job.display()))?;
+        let source = canonical_path(source)
+            .with_context(|| format!("resolve font source {}", source.display()))?;
+        if !source.is_file() {
+            bail!(
+                "font path {} is not an existing regular file",
+                source.display()
+            );
+        }
+        let extension = source
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|value| value.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !matches!(extension.as_str(), "ttf" | "otf" | "ttc") {
+            bail!(
+                "font path {} is not a supported TTF/OTF/TTC file",
+                source.display()
+            );
+        }
+        let fonts_dir = job.join("fonts");
+        reject_symlink_ancestors(&fonts_dir)
+            .with_context(|| format!("inspect managed font directory {}", fonts_dir.display()))?;
+        let approved_job_font = fonts_dir.is_dir() && path_is_within(&source, &fonts_dir)?;
+        let approved_discovered = font_search_dirs()
+            .into_iter()
+            .filter(|root| root.is_dir())
+            .any(|root| path_is_within(&source, &root).unwrap_or(false));
+        let approved_explicit = configured_font_paths()
+            .into_iter()
+            .filter_map(|path| fs::canonicalize(path).ok())
+            .any(|path| path == source);
+        let approved = approved_job_font || approved_discovered || approved_explicit;
+        if !approved {
+            bail!(
+                "font path {} is outside approved font provenance; use a managed job font, configure FUKIDASHI_FONT_PATH/FUKIDASHI_FONT_DIRS, or install it in a platform font directory",
+                source.display()
+            );
+        }
+        let bytes = fs::read(&source).with_context(|| format!("read font {}", source.display()))?;
+        if bytes.is_empty() || bytes.len() > 128 * 1024 * 1024 {
+            bail!("font path {} has an invalid size", source.display());
+        }
+        let digest = Sha256::digest(&bytes);
+        let hash = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let name = source
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("font.ttf")
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        Ok((fonts_dir.join(format!("{}-{}", &hash[..16], name)), hash))
+    }
+
+    pub fn materialize_font_path(&self, job: &Path, source: &Path) -> Result<PathBuf> {
+        let (destination, _) = self.font_destination(job, source)?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| anyhow!("font destination has no parent"))?;
+        create_dir_all_owned(parent, job)?;
+        let resolved_parent = canonical_path(parent)?;
+        let resolved_job = canonical_path(job)?;
+        if !path_starts_with(&resolved_parent, &resolved_job) {
+            bail!("font destination escaped the managed job");
+        }
+        if destination.is_file() {
+            return canonical_path(&destination);
+        }
+        let temporary = tempfile::NamedTempFile::new_in(parent).context("create managed font")?;
+        fs::copy(source, temporary.path())
+            .with_context(|| format!("copy approved font {}", source.display()))?;
+        temporary
+            .persist(&destination)
+            .map_err(|error| anyhow!("promote managed font: {}", error.error))?;
+        canonical_path(&destination)
+    }
+
+    /// Materialize one compile-time bundled font into a managed job.
+    ///
+    /// The destination is content-addressed and created with a same-directory
+    /// temporary file so a release binary can provide fonts without relying on
+    /// its current working directory or on a separate download. Existing
+    /// destinations are verified byte-for-byte before they are reused.
+    pub fn materialize_bundled_font(
+        &self,
+        job: &Path,
+        font: &crate::fonts::BundledFont,
+    ) -> Result<PathBuf> {
+        if !font.has_expected_sha256() {
+            bail!(
+                "bundled font {} failed its embedded SHA-256 integrity check",
+                font.file_name
+            );
+        }
+        let job = self.require_owned(job, "bundled font job")?;
+        let name = font
+            .file_name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        if name.is_empty() {
+            bail!("bundled font has an empty file name");
+        }
+        let destination = job
+            .join("fonts")
+            .join(format!("{}-{}", &font.sha256[..16], name));
+        let destination = self.require_output_owned(&destination, "bundled font destination")?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| anyhow!("bundled font destination has no parent"))?;
+        create_dir_all_owned(parent, &job)?;
+        let resolved_job = canonical_path(&job)?;
+        let resolved_parent = canonical_path(parent)?;
+        if !path_starts_with(&resolved_parent, &resolved_job) {
+            bail!("bundled font destination escaped the managed job");
+        }
+
+        if let Some(existing) = verified_bundled_destination(&destination, font)? {
+            if !path_starts_with(&existing, &resolved_job) {
+                bail!("bundled font destination escaped the managed job");
+            }
+            return Ok(existing);
+        }
+
+        let mut temporary =
+            tempfile::NamedTempFile::new_in(parent).context("create bundled managed font")?;
+        temporary
+            .write_all(font.bytes)
+            .context("write bundled managed font")?;
+        temporary
+            .as_file()
+            .sync_all()
+            .context("flush bundled managed font")?;
+        match temporary.persist(&destination) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing = verified_bundled_destination(&destination, font)?
+                    .ok_or_else(|| anyhow!("bundled font disappeared during materialization"))?;
+                if !path_starts_with(&existing, &resolved_job) {
+                    bail!("bundled font destination escaped the managed job");
+                }
+                return Ok(existing);
+            }
+            Err(error) => {
+                return Err(anyhow!("promote bundled managed font: {}", error.error));
+            }
+        }
+        let resolved = canonical_path(&destination)?;
+        if !path_starts_with(&resolved, &resolved_job) {
+            bail!("bundled font destination escaped the managed job");
+        }
+        Ok(resolved)
+    }
+
+    pub fn write_clean_artifact(
+        &self,
+        source: &Path,
+        cleaned: &RgbImage,
+        mask: &GrayImage,
+        dilation: u8,
+        mode: &str,
+    ) -> Result<(PathBuf, PathBuf, serde_json::Value)> {
+        let source = canonical_path(source)
+            .with_context(|| format!("resolve source image {}", source.display()))?;
+        let source_image = image::open(&source).context("decode source image for validation")?;
+        if source_image.dimensions() != cleaned.dimensions()
+            || mask.dimensions() != cleaned.dimensions()
+        {
+            bail!("clean stage dimensions do not match source image");
+        }
+        let mut masked_pixels = 0_u64;
+        let mut changed_masked_pixels = 0_u64;
+        let mut source_dark_pixels = 0_u64;
+        let mut cleaned_dark_pixels = 0_u64;
+        let source_rgba = source_image.to_rgba8();
+        for (index, pixel) in mask.pixels().enumerate() {
+            if pixel[0] == 0 {
+                continue;
+            }
+            masked_pixels += 1;
+            let source_rgb = &source_rgba.as_raw()[index * 4..index * 4 + 3];
+            let clean_rgb = &cleaned.as_raw()[index * 3..index * 3 + 3];
+            let source_luma = (u32::from(source_rgb[0]) * 299
+                + u32::from(source_rgb[1]) * 587
+                + u32::from(source_rgb[2]) * 114)
+                / 1000;
+            let clean_luma = (u32::from(clean_rgb[0]) * 299
+                + u32::from(clean_rgb[1]) * 587
+                + u32::from(clean_rgb[2]) * 114)
+                / 1000;
+            if source_luma < 96 {
+                source_dark_pixels += 1;
+            }
+            if clean_luma < 96 {
+                cleaned_dark_pixels += 1;
+            }
+            if source_rgb != clean_rgb {
+                changed_masked_pixels += 1;
+            }
+        }
+        if masked_pixels == 0 {
+            bail!("clean stage produced an empty text mask; refusing to typeset");
+        }
+        if changed_masked_pixels == 0 {
+            bail!("clean stage is byte-identical inside its mask; source text was not removed");
+        }
+        let changed_ratio = changed_masked_pixels as f64 / masked_pixels as f64;
+        let dark_pixel_reduction_ratio = if source_dark_pixels == 0 {
+            1.0
+        } else {
+            (source_dark_pixels.saturating_sub(cleaned_dark_pixels) as f64)
+                / source_dark_pixels as f64
+        };
+        if changed_ratio < 0.01 {
+            bail!(
+                "clean stage changed only {:.2}% of its mask; source text was not reliably removed",
+                changed_ratio * 100.0
+            );
+        }
+        let job = self.allocate_job_for_source(&source)?;
+        let _render_lock = self.acquire_render_lock(&job)?;
+        let _manifest_lock = acquire_manifest_lock(&job)?;
+        let mut manifest = load_manifest(&job)?;
+        if manifest.expected_pages.is_empty() {
+            manifest.expected_pages = discover_expected_pages(&source, None)?;
+            manifest.source_dir = source
+                .parent()
+                .ok_or_else(|| anyhow!("source image has no parent directory"))?
+                .to_path_buf();
+            for expected in &manifest.expected_pages {
+                manifest
+                    .pages
+                    .entry(page_key(expected))
+                    .or_insert_with(|| PageManifest {
+                        source_image: expected.clone(),
+                        state: "pending".into(),
+                        source_sha256: sha256_file(expected).unwrap_or_default(),
+                        cleaned_image: None,
+                        rendered_image: None,
+                    });
+            }
+            create_page_layouts(&job, &manifest)?;
+        }
+        populate_legacy_source_hashes(&mut manifest)?;
+        validate_source_hashes(&manifest)?;
+        let paths = page_artifacts(&job, &manifest, &source)?;
+        let cleaned_path = paths.cleaned;
+        let mask_path = paths.mask;
+        save_image_atomic(&cleaned_path, cleaned).context("write owned cleaned image")?;
+        save_gray_image_atomic(&mask_path, mask).context("write owned clean mask")?;
+        let sidecar_path = clean_sidecar(&cleaned_path);
+        let artifact = CleanArtifact {
+            stage: "cleaned".into(),
+            source_image: source.clone(),
+            cleaned_image: cleaned_path.clone(),
+            mask_path: mask_path.clone(),
+            source_sha256: sha256_file(&source)?,
+            cleaned_sha256: sha256_file(&cleaned_path)?,
+            masked_pixels,
+            changed_masked_pixels,
+            changed_ratio,
+            source_dark_pixels,
+            cleaned_dark_pixels,
+            dark_pixel_reduction_ratio,
+        };
+        atomic_json(&sidecar_path, &serde_json::to_value(&artifact)?)?;
+        let entry = manifest
+            .pages
+            .get_mut(&page_key(&source))
+            .ok_or_else(|| anyhow!("cleaned page is outside the managed expected-page scope"))?;
+        entry.state = "cleaned".into();
+        entry.cleaned_image = Some(cleaned_path.clone());
+        save_manifest(&job, &manifest)?;
+        let value = json!({
+            "image_path": cleaned_path,
+            "cleaned_image_path": cleaned_path,
+            "mask_path": mask_path,
+            "workflow": {
+                "stage": "cleaned",
+                "sidecar_path": sidecar_path,
+                "source_image": source,
+                "mode": mode,
+                "dilation": dilation,
+                "masked_pixels": masked_pixels,
+                "changed_masked_pixels": changed_masked_pixels,
+                "changed_ratio": changed_ratio,
+                "source_dark_pixels": source_dark_pixels,
+                "cleaned_dark_pixels": cleaned_dark_pixels,
+                "dark_pixel_reduction_ratio": dark_pixel_reduction_ratio,
+            }
+        });
+        Ok((artifact.cleaned_image, artifact.mask_path, value))
+    }
+
+    pub fn validate_clean_input(&self, cleaned_path: &Path) -> Result<CleanArtifact> {
+        let cleaned_path = self.require_owned(cleaned_path, "typeset input")?;
+        if !cleaned_path.is_file() {
+            bail!("typeset input does not exist");
+        }
+        let sidecar_path = clean_sidecar(&cleaned_path);
+        let artifact: CleanArtifact = serde_json::from_slice(
+            &fs::read(&sidecar_path)
+                .with_context(|| format!("read clean-stage sidecar {}", sidecar_path.display()))?,
+        )
+        .context("parse clean-stage sidecar")?;
+        if artifact.stage != "cleaned" || !paths_same(&artifact.cleaned_image, &cleaned_path)? {
+            bail!("typeset input is not a valid server-owned cleaned stage");
+        }
+        let source = canonical_path(&artifact.source_image).context("resolve clean source")?;
+        let job = self.job_root_for_path(&cleaned_path)?;
+        let manifest = load_manifest(&job)?;
+        let page = manifest
+            .pages
+            .get(&page_key(&source))
+            .ok_or_else(|| anyhow!("clean stage source is not registered in its managed job"))?;
+        if !paths_same(&page.source_image, &source)? {
+            bail!("clean stage source does not match the managed page record");
+        }
+        if let Some(registered) = page.cleaned_image.as_ref() {
+            let registered_parent = registered
+                .parent()
+                .ok_or_else(|| anyhow!("managed clean artifact has no page directory"))?;
+            let cleaned_parent = cleaned_path
+                .parent()
+                .ok_or_else(|| anyhow!("clean stage has no page directory"))?;
+            if !paths_same(registered_parent, cleaned_parent)? {
+                bail!("clean stage does not belong to the managed source page");
+            }
+        }
+        if sha256_file(&source)? != artifact.source_sha256
+            || sha256_file(&cleaned_path)? != artifact.cleaned_sha256
+        {
+            bail!("clean stage was changed after validation; rerun cleaning");
+        }
+        if artifact.changed_masked_pixels == 0
+            || artifact.changed_ratio < 0.01
+            || artifact.masked_pixels == 0
+        {
+            bail!("clean stage did not reliably remove source text");
+        }
+        Ok(artifact)
+    }
+
+    /// Persist a brush-corrected derivative while retaining the original
+    /// clean artifact and its source provenance. The derivative is itself a
+    /// valid clean-stage input for a later typeset call.
+    pub fn write_derived_clean_artifact(
+        &self,
+        base: &CleanArtifact,
+        output: &Path,
+        corrected: &RgbImage,
+    ) -> Result<CleanArtifact> {
+        let output = self.require_output_owned(output, "corrected clean output")?;
+        let parent = output
+            .parent()
+            .ok_or_else(|| anyhow!("corrected clean output has no parent"))?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        image::DynamicImage::ImageRgb8(corrected.clone())
+            .write_to(temp.as_file_mut(), image::ImageFormat::Png)?;
+        temp.as_file().sync_all()?;
+        temp.persist(&output)
+            .map_err(|error| anyhow!("promote corrected clean image: {}", error.error))?;
+        let mut derived = base.clone();
+        derived.cleaned_image = output.clone();
+        derived.cleaned_sha256 = sha256_file(&output)?;
+        atomic_json(&clean_sidecar(&output), &serde_json::to_value(&derived)?)?;
+        Ok(derived)
+    }
+
+    pub fn register_render(
+        &self,
+        output: &Path,
+        clean: &CleanArtifact,
+        typeset: serde_json::Value,
+        qa: serde_json::Value,
+    ) -> Result<PathBuf> {
+        let output = self.require_owned(output, "typeset output")?;
+        if !output.is_file() {
+            bail!("typeset output does not exist");
+        }
+        let output_job = self.job_root_for_path(&output)?;
+        let _render_lock = self.acquire_render_lock(&output_job)?;
+        self.register_render_locked(&output, clean, typeset, qa)
+    }
+
+    /// Register a render while the caller already owns the job render lock.
+    /// MCP and editor renderers use this form to avoid re-entering the lock;
+    /// direct workflow callers use `register_render`, which acquires it.
+    pub(crate) fn register_render_locked(
+        &self,
+        output: &Path,
+        clean: &CleanArtifact,
+        typeset: serde_json::Value,
+        qa: serde_json::Value,
+    ) -> Result<PathBuf> {
+        let output = self.require_owned(output, "typeset output")?;
+        if !output.is_file() {
+            bail!("typeset output does not exist");
+        }
+        let output_job = self.job_root_for_path(&output)?;
+        let _manifest_lock = acquire_manifest_lock(&output_job)?;
+        let clean_path = self.require_owned(&clean.cleaned_image, "clean artifact")?;
+        let clean_job = self.job_root_for_path(&clean_path)?;
+        if !paths_same(&output_job, &clean_job)? {
+            bail!("clean artifact and typeset output must belong to the same managed job");
+        }
+        let validated_clean = self.validate_clean_input(&clean_path)?;
+        if !paths_same(&validated_clean.source_image, &clean.source_image)? {
+            bail!("clean artifact source does not match its validated sidecar");
+        }
+        let mut manifest = load_manifest(&output_job)?;
+        let source = canonical_path(&validated_clean.source_image)?;
+        let entry_source = manifest
+            .pages
+            .get(&page_key(&source))
+            .map(|entry| entry.source_image.clone())
+            .ok_or_else(|| anyhow!("rendered page is not registered in the managed job"))?;
+        if !paths_same(&entry_source, &source)? {
+            bail!("rendered source does not match the managed page record");
+        }
+        if manifest_path(&output_job).is_file() && !manifest.expected_pages.is_empty() {
+            let expected = page_artifacts(&output_job, &manifest, &source)?.rendered;
+            if !paths_same(&output, &expected)? {
+                bail!(
+                    "managed render must use the deterministic page artifact {}",
+                    expected.display()
+                );
+            }
+        }
+        let sidecar = render_sidecar(&output);
+        let artifact = RenderArtifact {
+            stage: "rendered".into(),
+            source_image: validated_clean.source_image.clone(),
+            cleaned_image: validated_clean.cleaned_image.clone(),
+            rendered_image: output.clone(),
+            rendered_sha256: sha256_file(&output)?,
+            clean_sidecar: clean_sidecar(&validated_clean.cleaned_image),
+            typeset,
+            qa,
+        };
+        atomic_json(&sidecar, &serde_json::to_value(&artifact)?)?;
+        let entry = manifest
+            .pages
+            .get_mut(&page_key(&source))
+            .ok_or_else(|| anyhow!("rendered page is not registered in the managed job"))?;
+        entry.state = "rendered".into();
+        entry.rendered_image = Some(output.clone());
+        save_manifest(&output_job, &manifest)?;
+        Ok(sidecar)
+    }
+
+    pub fn validate_render_input(&self, rendered: &Path) -> Result<RenderArtifact> {
+        let rendered = self.require_owned(rendered, "editor image")?;
+        let sidecar = render_sidecar(&rendered);
+        let artifact: RenderArtifact = serde_json::from_slice(&fs::read(&sidecar)?)?;
+        if artifact.stage != "rendered" || !paths_same(&artifact.rendered_image, &rendered)? {
+            bail!("editor image is not a server-owned rendered stage");
+        }
+        if !rendered.is_file() || !artifact.cleaned_image.is_file() {
+            bail!("rendered stage is incomplete");
+        }
+        let clean = self.validate_clean_input(&artifact.cleaned_image)?;
+        if !paths_same(&clean.source_image, &artifact.source_image)? {
+            bail!("rendered stage source does not match its clean stage");
+        }
+        if !artifact.rendered_sha256.is_empty()
+            && sha256_file(&rendered)? != artifact.rendered_sha256
+        {
+            bail!("rendered stage was changed after typesetting; rerun typesetting");
+        }
+        Ok(artifact)
+    }
+
+    /// Construct the complete editor state from the managed manifest and
+    /// render sidecars. Model-supplied pages are intentionally ignored.
+    pub fn editor_state(
+        &self,
+        rendered: &Path,
+        supplied: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let rendered = self.require_owned(rendered, "editor image")?;
+        let job = self.job_root_for_path(&rendered)?;
+        let manifest = load_manifest(&job)?;
+        let mut sources = if manifest.expected_pages.is_empty() {
+            manifest
+                .pages
+                .values()
+                .map(|page| page.source_image.clone())
+                .collect::<Vec<_>>()
+        } else {
+            manifest.expected_pages.clone()
+        };
+        sources.sort_by(|left, right| natural_cmp(left, right));
+        if sources.is_empty() {
+            bail!("managed job has no expected pages");
+        }
+        let mut pages = Vec::with_capacity(sources.len());
+        for source in sources {
+            let entry = manifest
+                .pages
+                .get(&page_key(&source))
+                .ok_or_else(|| anyhow!("expected page is missing from the managed manifest"))?;
+            if entry.state != "rendered" {
+                bail!("expected page is not rendered: {}", source.display());
+            }
+            let cleaned = entry
+                .cleaned_image
+                .as_ref()
+                .ok_or_else(|| anyhow!("rendered page has no clean artifact"))?;
+            let rendered_page = entry
+                .rendered_image
+                .as_ref()
+                .ok_or_else(|| anyhow!("rendered page has no render artifact"))?;
+            let artifact = self.validate_render_input(rendered_page)?;
+            let bubbles = editor_bubbles(&artifact.typeset, &page_key(&source));
+            pages.push(json!({
+                "id": stable_page_id(&source),
+                "image_path": source,
+                "source_image": source,
+                "cleaned_image_path": cleaned,
+                "corrected_cleaned_image_path": artifact.cleaned_image,
+                "rendered_image_path": rendered_page,
+                "state": "rendered",
+                "bubbles": bubbles,
+            }));
+        }
+        let mut state = json!({"schema_version": 1, "pages": pages});
+        if let Some(object) = supplied.and_then(serde_json::Value::as_object) {
+            for key in ["title", "source_language", "target_language", "metadata"] {
+                if let Some(value) = object.get(key) {
+                    state[key] = value.clone();
+                }
+            }
+        }
+        Ok(state)
+    }
+
+    pub fn validate_review_state(&self, rendered: &Path, state: &serde_json::Value) -> Result<()> {
+        let rendered = self.require_owned(rendered, "editor image")?;
+        let job = self.job_root_for_path(&rendered)?;
+        let manifest = load_manifest(&job)?;
+        if manifest.pages.is_empty() {
+            bail!("managed job has no analyzed pages");
+        }
+        let pending = manifest
+            .pages
+            .values()
+            .filter(|page| page.state != "rendered")
+            .map(|page| page.source_image.display().to_string())
+            .collect::<Vec<_>>();
+        if !pending.is_empty() {
+            bail!(
+                "cannot start review; managed pages are not rendered: {}",
+                pending.join(", ")
+            );
+        }
+        let pages = state
+            .get("pages")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow!("editor state must contain a pages array for a managed job"))?;
+        if pages.len() != manifest.pages.len() {
+            bail!(
+                "editor state has {} pages but managed job has {}",
+                pages.len(),
+                manifest.pages.len()
+            );
+        }
+        let expected = manifest
+            .pages
+            .values()
+            .filter_map(|page| page.rendered_image.as_ref())
+            .map(|path| path_identity(path))
+            .collect::<Result<std::collections::BTreeSet<_>>>()?;
+        let mut supplied = std::collections::BTreeSet::new();
+        for page in pages {
+            let rendered_path = page
+                .get("rendered_image_path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("every managed editor page needs rendered_image_path"))?;
+            let rendered_path = path_identity(Path::new(rendered_path))
+                .with_context(|| format!("resolve rendered page {rendered_path}"))?;
+            if !supplied.insert(rendered_path.clone()) {
+                bail!("editor state lists the same rendered page more than once");
+            }
+            if !expected.contains(&rendered_path) {
+                bail!("editor page rendered_image_path is not a rendered managed artifact");
+            }
+        }
+        if supplied != expected {
+            bail!("editor state does not include every rendered managed page exactly once");
+        }
+        Ok(())
+    }
+
+    pub fn validate_export_job(&self, project_dir: &Path) -> Result<()> {
+        let project_dir = self.require_owned(project_dir, "export project")?;
+        let manifest = load_manifest(&project_dir)?;
+        if manifest.pages.is_empty() {
+            bail!("managed job has no registered pages");
+        }
+        let pending = manifest
+            .pages
+            .values()
+            .filter(|page| page.state != "rendered")
+            .map(|page| page.source_image.display().to_string())
+            .collect::<Vec<_>>();
+        if !pending.is_empty() {
+            bail!(
+                "managed job contains pages that were not rendered: {}",
+                pending.join(", ")
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn clean_sidecar(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}{}", path.display(), CLEAN_SIDECAR_SUFFIX))
+}
+
+fn verified_bundled_destination(
+    path: &Path,
+    font: &crate::fonts::BundledFont,
+) -> Result<Option<PathBuf>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "bundled font destination is a symlink or junction: {}",
+            path.display()
+        );
+    }
+    if !metadata.is_file() {
+        bail!(
+            "bundled font destination is not a regular file: {}",
+            path.display()
+        );
+    }
+    let bytes = fs::read(path)
+        .with_context(|| format!("read bundled font destination {}", path.display()))?;
+    if bytes != font.bytes {
+        bail!(
+            "bundled font destination has unexpected contents: {}",
+            path.display()
+        );
+    }
+    Ok(Some(canonical_path(path)?))
+}
+
+fn render_sidecar(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}{}", path.display(), RENDER_SIDECAR_SUFFIX))
+}
+
+fn page_key(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+fn stable_page_id(path: &Path) -> String {
+    let mut hasher = Sha256::new();
+    let identity = path_identity(path).unwrap_or_else(|_| path.to_string_lossy().into_owned());
+    hasher.update(identity.as_bytes());
+    format!("page-{:x}", hasher.finalize())
+}
+
+fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json::Value> {
+    let mut occurrences = std::collections::HashMap::<String, usize>::new();
+    let mut used_ids = std::collections::HashSet::<String>::new();
+    let requests = typeset
+        .get("request_bubbles")
+        .and_then(serde_json::Value::as_array);
+    let reports = typeset
+        .get("report")
+        .and_then(|value| value.get("bubbles"))
+        .and_then(serde_json::Value::as_array);
+    let Some(requests) = requests else {
+        return Vec::new();
+    };
+    requests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, request)| {
+            let mut bubble = request.as_object()?.clone();
+            let identity = bubble_identity(request);
+            let occurrence = occurrences.entry(identity).or_insert(0);
+            let occurrence_index = *occurrence;
+            *occurrence = occurrence.saturating_add(1);
+            let requested_id = bubble
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| stable_bubble_id(request, page_key, occurrence_index));
+            let mut bubble_id = requested_id.clone();
+            if !used_ids.insert(bubble_id.clone()) {
+                let mut suffix = occurrence_index.saturating_add(1);
+                loop {
+                    let candidate = format!("{requested_id}-{suffix}");
+                    if used_ids.insert(candidate.clone()) {
+                        bubble_id = candidate;
+                        break;
+                    }
+                    suffix = suffix.saturating_add(1);
+                }
+            }
+            bubble.insert("id".into(), serde_json::Value::String(bubble_id));
+            if let Some(text) = request.get("text") {
+                bubble.insert("translation".into(), text.clone());
+            }
+            if let Some(report) = reports.and_then(|items| items.get(index))
+                && let Some(report) = report.as_object()
+            {
+                for (key, value) in report {
+                    bubble.entry(key.clone()).or_insert_with(|| value.clone());
+                }
+            }
+            Some(serde_json::Value::Object(bubble))
+        })
+        .collect()
+}
+
+fn stable_bubble_id(request: &serde_json::Value, page_key: &str, occurrence: usize) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bubble_identity(request).as_bytes());
+    hasher.update(occurrence.to_le_bytes());
+    let digest = format!("{:x}", hasher.finalize());
+    format!("{page_key}-bubble-{}", &digest[..16])
+}
+
+fn bubble_identity(request: &serde_json::Value) -> String {
+    let mut identity = String::new();
+    if let Some(object) = request.as_object() {
+        for key in ["bbox", "bubble_bbox", "text_bbox"] {
+            identity.push_str(key);
+            identity.push(':');
+            if let Some(value) = object.get(key) {
+                identity.push_str(&value.to_string());
+            }
+            identity.push(';');
+        }
+    } else {
+        identity.push_str(&request.to_string());
+    }
+    identity
+}
+
+/// Return the OS canonical spelling for filesystem I/O. Identity comparisons
+/// use `path_identity`, which normalizes only equivalent Windows drive/UNC
+/// spellings while leaving verbatim volume paths usable.
+fn canonical_path(path: &Path) -> Result<PathBuf> {
+    // Keep the OS canonical spelling for all I/O. In particular, Windows may
+    // return a verbatim path for long names or a volume GUID; stripping that
+    // prefix makes a valid path unusable by subsequent filesystem calls.
+    Ok(fs::canonicalize(path)?)
+}
+
+fn path_identity(path: &Path) -> Result<String> {
+    let canonical = canonical_path(path)?;
+    let value = identity_path(&canonical).to_string_lossy().into_owned();
+    #[cfg(windows)]
+    return Ok(value.to_ascii_lowercase());
+    #[cfg(not(windows))]
+    Ok(value)
+}
+
+fn paths_same(left: &Path, right: &Path) -> Result<bool> {
+    Ok(path_identity(left)? == path_identity(right)?)
+}
+
+fn path_is_within(path: &Path, root: &Path) -> Result<bool> {
+    let path = canonical_path(path)?;
+    let root = canonical_path(root)?;
+    Ok(path_starts_with(&path, &root))
+}
+
+fn lexically_within(path: &Path, root: &Path) -> bool {
+    let path = lexical_normalize(path);
+    let root = lexical_normalize(root);
+    path_starts_with(&path, &root)
+}
+
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    let path = identity_path(path);
+    let root = identity_path(root);
+    let mut path_components = path.components();
+    root.components().all(|root_component| {
+        path_components
+            .next()
+            .is_some_and(|path_component| component_equal(path_component, root_component))
+    })
+}
+
+fn component_equal(left: Component<'_>, right: Component<'_>) -> bool {
+    if cfg!(windows) {
+        left.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir | Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn identity_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let value = path.to_string_lossy();
+        if let Some(rest) = value.strip_prefix(r#"\\?\UNC\"#) {
+            return PathBuf::from(format!(r#"\\{}"#, rest));
+        }
+        // Only normalize the standard drive and UNC verbatim forms. Volume
+        // GUID and GLOBALROOT paths have no equivalent short spelling and
+        // must remain intact for identity comparisons and I/O.
+        if let Some(rest) = value.strip_prefix(r#"\\?\"#)
+            && rest.as_bytes().get(1) == Some(&b':')
+        {
+            return PathBuf::from(rest.to_owned());
+        }
+    }
+    path.to_path_buf()
+}
+
+fn reject_symlink_ancestors(path: &Path) -> Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut current = lexical_normalize(&absolute);
+    loop {
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "path component is a symlink or junction: {}",
+                    current.display()
+                )
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    Ok(())
+}
+
+fn create_dir_all_owned(path: &Path, boundary: &Path) -> Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let boundary = if boundary.is_absolute() {
+        boundary.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(boundary)
+    };
+    if !lexically_within(&absolute, &boundary) {
+        bail!(
+            "path {} is outside managed directory {}",
+            path.display(),
+            boundary.display()
+        );
+    }
+    reject_symlink_ancestors(&absolute)?;
+    fs::create_dir_all(&absolute)?;
+    reject_symlink_ancestors(&absolute)?;
+    let resolved = canonical_path(&absolute)?;
+    let resolved_boundary = canonical_path(&boundary)?;
+    if !path_starts_with(&resolved, &resolved_boundary) {
+        bail!(
+            "path {} escaped managed directory {}",
+            path.display(),
+            boundary.display()
+        );
+    }
+    Ok(())
+}
+
+fn is_safe_job_candidate(candidate: &Path, root: &Path) -> bool {
+    if reject_symlink_ancestors(candidate).is_err() {
+        return false;
+    }
+    if !candidate.is_dir() {
+        return false;
+    }
+    let Ok(resolved) = canonical_path(candidate) else {
+        return false;
+    };
+    let Ok(root) = canonical_path(root) else {
+        return false;
+    };
+    resolved.parent() == Some(root.as_path()) && path_starts_with(&resolved, &root)
+}
+
+/// Platform font directories plus explicitly configured directories. The
+/// list is discovery-only; callers still validate the file type and copy
+/// fonts into a managed job before using them for editable renders.
+pub fn font_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(root) = std::env::var_os(crate::config::ENV_STORAGE_ROOT) {
+        dirs.push(PathBuf::from(root).join("fonts"));
+    }
+    dirs.extend(crate::config::configured_font_dirs_from_disk());
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    if let Some(value) = std::env::var_os("FUKIDASHI_FONT_DIRS") {
+        dirs.extend(
+            value
+                .to_string_lossy()
+                .split(separator)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(root) = std::env::var_os("WINDIR").or_else(|| std::env::var_os("SystemRoot")) {
+            dirs.push(PathBuf::from(root).join("Fonts"));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(data) = std::env::var_os("XDG_DATA_HOME") {
+            dirs.push(PathBuf::from(data).join("fonts"));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join(".local/share/fonts"));
+        }
+        dirs.extend([
+            PathBuf::from("/usr/local/share/fonts"),
+            PathBuf::from("/usr/share/fonts"),
+        ]);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(PathBuf::from(home).join("Library/Fonts"));
+        }
+        dirs.extend([
+            PathBuf::from("/Library/Fonts"),
+            PathBuf::from("/System/Library/Fonts"),
+        ]);
+    }
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Explicit font files configured for fallback/discovery. This is separate
+/// from directory discovery so a user can point at one licensed font file.
+pub fn configured_font_paths() -> Vec<PathBuf> {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    std::env::var_os("FUKIDASHI_FONT_PATH")
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .to_string_lossy()
+                .split(separator)
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+pub fn paths_same_public(left: &Path, right: &Path) -> Result<bool> {
+    paths_same(left, right)
+}
+
+pub fn path_identity_public(path: &Path) -> Result<String> {
+    path_identity(path)
+}
+
+pub fn path_is_within_public(path: &Path, root: &Path) -> Result<bool> {
+    if path.exists() && root.exists() {
+        path_is_within(path, root)
+    } else {
+        Ok(lexically_within(path, root))
+    }
+}
+
+fn same_path_list(left: &[PathBuf], right: &[PathBuf]) -> Result<bool> {
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    left.iter()
+        .zip(right)
+        .try_fold(true, |same, (left, right)| {
+            Ok(same && paths_same(left, right)?)
+        })
+}
+
+fn supported_image(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "tif" | "tiff" | "avif"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn natural_cmp(left: &Path, right: &Path) -> Ordering {
+    let left = left
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let right = right
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let (mut li, mut ri) = (0, 0);
+    let lb = left.as_bytes();
+    let rb = right.as_bytes();
+    while li < lb.len() && ri < rb.len() {
+        let ld = lb[li].is_ascii_digit();
+        let rd = rb[ri].is_ascii_digit();
+        if ld && rd {
+            let ls = li;
+            let rs = ri;
+            while li < lb.len() && lb[li].is_ascii_digit() {
+                li += 1;
+            }
+            while ri < rb.len() && rb[ri].is_ascii_digit() {
+                ri += 1;
+            }
+            let ldigits = &left[ls..li];
+            let rdigits = &right[rs..ri];
+            let ltrim = ldigits.trim_start_matches('0');
+            let rtrim = rdigits.trim_start_matches('0');
+            let ltrim = if ltrim.is_empty() { "0" } else { ltrim };
+            let rtrim = if rtrim.is_empty() { "0" } else { rtrim };
+            match ltrim.len().cmp(&rtrim.len()).then_with(|| ltrim.cmp(rtrim)) {
+                Ordering::Equal => {}
+                order => return order,
+            }
+        } else {
+            match lb[li].cmp(&rb[ri]) {
+                Ordering::Equal => {
+                    li += 1;
+                    ri += 1;
+                }
+                order => return order,
+            }
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn discover_expected_pages(source: &Path, scope: Option<&ScopeSpec>) -> Result<Vec<PathBuf>> {
+    let source_dir = source
+        .parent()
+        .ok_or_else(|| anyhow!("source image has no parent directory"))?;
+    let mut discovered = fs::read_dir(source_dir)
+        .with_context(|| format!("scan source directory {}", source_dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_file() && supported_image(path))
+        .map(|path| canonical_path(&path).unwrap_or(path))
+        .collect::<Vec<_>>();
+    discovered.sort_by(|left, right| natural_cmp(left, right));
+    if discovered.is_empty() {
+        bail!("source directory contains no supported comic images");
+    }
+    let Some(scope) = scope else {
+        return Ok(discovered);
+    };
+    if let Some(paths) = &scope.include_paths {
+        if scope.start_page.is_some() || scope.end_page.is_some() {
+            bail!("scope.include_paths cannot be combined with start_page or end_page");
+        }
+        if paths.is_empty() {
+            bail!("scope.include_paths must contain at least one image");
+        }
+        let mut selected = Vec::new();
+        for path in paths {
+            let path = canonical_path(path)
+                .with_context(|| format!("resolve scope image {}", path.display()))?;
+            if path.parent() != Some(source_dir) || !supported_image(&path) {
+                bail!("scope image must be a supported file in the source directory");
+            }
+            if !discovered
+                .iter()
+                .any(|discovered| paths_same(discovered, &path).unwrap_or(false))
+            {
+                bail!(
+                    "scope image is not present in the source directory: {}",
+                    path.display()
+                );
+            }
+            if !selected.contains(&path) {
+                selected.push(path);
+            }
+        }
+        selected.sort_by(|left, right| natural_cmp(left, right));
+        return Ok(selected);
+    }
+    let start = scope.start_page.unwrap_or(1);
+    let end = scope.end_page.unwrap_or(discovered.len());
+    if start == 0 || end < start || end > discovered.len() {
+        bail!(
+            "scope page range must be one-based and inside 1..={}",
+            discovered.len()
+        );
+    }
+    Ok(discovered[start - 1..end].to_vec())
+}
+
+fn manifest_path(job: &Path) -> PathBuf {
+    job.join(MANIFEST_NAME)
+}
+
+fn legacy_manifest_path(job: &Path) -> PathBuf {
+    job.join(LEGACY_MANIFEST_NAME)
+}
+
+fn load_manifest(job: &Path) -> Result<JobManifest> {
+    let path = if manifest_path(job).is_file() {
+        manifest_path(job)
+    } else {
+        legacy_manifest_path(job)
+    };
+    serde_json::from_slice(&fs::read(path)?).context("parse managed job manifest")
+}
+
+fn save_manifest(job: &Path, manifest: &JobManifest) -> Result<()> {
+    let value = serde_json::to_value(manifest)?;
+    let modern_exists = manifest_path(job).is_file();
+    let legacy_exists = legacy_manifest_path(job).is_file();
+    // New jobs use one canonical manifest. Existing flat/UUID jobs retain and
+    // update only their legacy marker, avoiding a pair of files that can drift
+    // after a process interruption.
+    if modern_exists || !legacy_exists {
+        atomic_json(&manifest_path(job), &value)?;
+    } else {
+        atomic_json(&legacy_manifest_path(job), &value)?;
+    }
+    Ok(())
+}
+
+fn create_job_layout(job: &Path, source_dir: Option<&Path>) -> Result<()> {
+    for directory in ["source", "pages", "fonts", "backups", "review", "output"] {
+        create_dir_all_owned(&job.join(directory), job)?;
+    }
+    if let Some(source_dir) = source_dir {
+        atomic_json(
+            &job.join("source/source.json"),
+            &json!({"source_dir": source_dir}),
+        )?;
+    }
+    Ok(())
+}
+
+fn create_page_layouts(job: &Path, manifest: &JobManifest) -> Result<()> {
+    for index in 0..manifest.expected_pages.len() {
+        create_dir_all_owned(&job.join("pages").join(format!("{:04}", index + 1)), job)?;
+    }
+    Ok(())
+}
+
+fn page_artifacts(job: &Path, manifest: &JobManifest, source: &Path) -> Result<PageArtifacts> {
+    let index = manifest
+        .expected_pages
+        .iter()
+        .position(|candidate| paths_same(candidate, source).unwrap_or(false))
+        .ok_or_else(|| anyhow!("source image is not registered in the managed job"))?;
+    let directory = job.join("pages").join(format!("{:04}", index + 1));
+    create_dir_all_owned(&directory, job)?;
+    Ok(PageArtifacts {
+        analysis: directory.join("analysis.json"),
+        mask: directory.join("mask.png"),
+        cleaned: directory.join("cleaned.png"),
+        corrected_clean: directory.join("corrected-clean.png"),
+        rendered: directory.join("rendered.png"),
+    })
+}
+
+fn stable_source_id(source_dir: &Path) -> Result<String> {
+    let digest = source_digest(source_dir)?;
+    Ok(digest[..16].to_owned())
+}
+
+fn populate_legacy_source_hashes(manifest: &mut JobManifest) -> Result<()> {
+    for page in manifest.pages.values_mut() {
+        if !page.source_sha256.is_empty() || !page.source_image.is_file() {
+            continue;
+        }
+        let current = sha256_file(&page.source_image)?;
+        if let Some(cleaned) = page.cleaned_image.as_deref() {
+            let sidecar = clean_sidecar(cleaned);
+            if let Ok(bytes) = fs::read(&sidecar)
+                && let Ok(artifact) = serde_json::from_slice::<CleanArtifact>(&bytes)
+                && !artifact.source_sha256.is_empty()
+                && artifact.source_sha256 != current
+            {
+                bail!(
+                    "legacy source image changed since its clean artifact was created: {}",
+                    page.source_image.display()
+                );
+            }
+        }
+        page.source_sha256 = current;
+    }
+    Ok(())
+}
+
+fn validate_source_hashes(manifest: &JobManifest) -> Result<()> {
+    for page in manifest.pages.values() {
+        if page.source_sha256.is_empty() || !page.source_image.is_file() {
+            continue;
+        }
+        let current = sha256_file(&page.source_image)?;
+        if current != page.source_sha256 {
+            bail!(
+                "source image changed after managed job allocation: {}; start a new source job before processing it again",
+                page.source_image.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn source_digest(source_dir: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(path_identity(source_dir)?.as_bytes());
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn acquire_source_allocation_lock(root: &Path, source_dir: &Path) -> Result<SourceAllocationLock> {
+    let digest = source_digest(source_dir)?;
+    let lease = acquire_lock_file(
+        root.join(format!(".fukidashi-source-{digest}.lock")),
+        &format!("source job {}", source_dir.display()),
+    )?;
+    Ok(SourceAllocationLock { _lease: lease })
+}
+
+fn acquire_manifest_lock(job: &Path) -> Result<ManifestLock> {
+    let lease = acquire_lock_file(
+        job.join(".fukidashi-manifest.lock"),
+        &format!("managed manifest {}", job.display()),
+    )?;
+    Ok(ManifestLock { _lease: lease })
+}
+
+fn acquire_lock_file(path: PathBuf, label: &str) -> Result<LockLease> {
+    const WAIT: Duration = Duration::from_secs(10);
+    const STALE: Duration = Duration::from_secs(10 * 60);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(file, "pid={}", std::process::id());
+                let _ = file.sync_all();
+                let (stop, receiver) = mpsc::channel();
+                let heartbeat_path = path.clone();
+                let heartbeat = thread::spawn(move || {
+                    while receiver.recv_timeout(Duration::from_secs(30)).is_err() {
+                        let Ok(mut file) = OpenOptions::new().write(true).open(&heartbeat_path)
+                        else {
+                            break;
+                        };
+                        let _ = file.set_len(0);
+                        let _ = writeln!(file, "pid={}", std::process::id());
+                        let _ = file.sync_all();
+                    }
+                });
+                return Ok(LockLease {
+                    path,
+                    stop: Some(stop),
+                    heartbeat: Some(heartbeat),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > STALE)
+                    && !lock_owner_is_alive(&path);
+                if stale {
+                    let _ = fs::remove_file(&path);
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for another process to finish {}", label);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn lock_owner_is_alive(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(pid) = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid=")?.trim().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0;
+        let result = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+        unsafe { CloseHandle(handle) };
+        result && code == STILL_ACTIVE as u32
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        false
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        false
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("sidecar has no parent"))?;
+    reject_symlink_ancestors(parent)?;
+    fs::create_dir_all(parent)?;
+    reject_symlink_ancestors(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temp, value)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map(|_| ())
+        .map_err(|error| anyhow!("promote sidecar: {}", error.error))
+}
+
+fn save_image_atomic(path: &Path, image: &RgbImage) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("image has no parent directory"))?;
+    reject_symlink_ancestors(parent)?;
+    fs::create_dir_all(parent)?;
+    reject_symlink_ancestors(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    image::DynamicImage::ImageRgb8(image.clone())
+        .write_to(temp.as_file_mut(), image::ImageFormat::Png)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map(|_| ())
+        .map_err(|error| anyhow!("promote image: {}", error.error))
+}
+
+fn save_gray_image_atomic(path: &Path, image: &GrayImage) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("mask has no parent directory"))?;
+    reject_symlink_ancestors(parent)?;
+    fs::create_dir_all(parent)?;
+    reject_symlink_ancestors(parent)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+    image::DynamicImage::ImageLuma8(image.clone())
+        .write_to(temp.as_file_mut(), image::ImageFormat::Png)?;
+    temp.as_file().sync_all()?;
+    temp.persist(path)
+        .map(|_| ())
+        .map_err(|error| anyhow!("promote mask: {}", error.error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{Rgba, RgbaImage};
+    use tempfile::tempdir;
+
+    #[test]
+    fn clean_artifact_rejects_unchanged_mask() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.png");
+        let image = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
+        image::DynamicImage::ImageRgba8(image.clone())
+            .save(&source)
+            .unwrap();
+        let rgb = image::DynamicImage::ImageRgba8(image).to_rgb8();
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let mut mask = GrayImage::new(8, 8);
+        mask.put_pixel(2, 2, image::Luma([255]));
+        let error = workflow
+            .write_clean_artifact(&source, &rgb, &mask, 3, "crop")
+            .unwrap_err();
+        assert!(error.to_string().contains("byte-identical"));
+    }
+
+    #[test]
+    fn derived_clean_artifact_is_owned_and_keeps_original_unchanged() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.png");
+        let mut source_image = RgbaImage::from_pixel(8, 8, Rgba([0, 0, 0, 255]));
+        source_image.put_pixel(3, 3, Rgba([20, 20, 20, 255]));
+        source_image.save(&source).unwrap();
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let cleaned = RgbImage::from_pixel(8, 8, image::Rgb([255, 255, 255]));
+        let mut mask = GrayImage::new(8, 8);
+        mask.put_pixel(3, 3, image::Luma([255]));
+        let (cleaned_path, _, _) = workflow
+            .write_clean_artifact(&source, &cleaned, &mask, 3, "crop")
+            .unwrap();
+        let base = workflow.validate_clean_input(&cleaned_path).unwrap();
+        let mut corrected = cleaned.clone();
+        corrected.put_pixel(4, 4, image::Rgb([1, 2, 3]));
+        let derived_path = base
+            .cleaned_image
+            .parent()
+            .unwrap()
+            .join("fukidashi-corrected-clean-page-0.png");
+        let derived = workflow
+            .write_derived_clean_artifact(&base, &derived_path, &corrected)
+            .unwrap();
+        assert_eq!(
+            *image::open(&cleaned_path)
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(4, 4),
+            image::Rgb([255, 255, 255])
+        );
+        assert_eq!(
+            *image::open(&derived.cleaned_image)
+                .unwrap()
+                .to_rgb8()
+                .get_pixel(4, 4),
+            image::Rgb([1, 2, 3])
+        );
+        assert!(
+            workflow
+                .validate_clean_input(&derived.cleaned_image)
+                .is_ok()
+        );
+        assert!(
+            workflow
+                .write_derived_clean_artifact(&base, &dir.path().join("outside.png"), &corrected)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn clean_artifact_is_required_before_typeset() {
+        let dir = tempdir().unwrap();
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let error = workflow
+            .validate_clean_input(&dir.path().join("source.png"))
+            .unwrap_err();
+        assert!(error.to_string().contains("resolve typeset input"));
+    }
+
+    #[test]
+    fn expected_inventory_is_natural_sorted_and_scope_is_persistent() {
+        let dir = tempdir().unwrap();
+        for name in ["page-1.png", "page-2.png", "page-10.png"] {
+            RgbaImage::from_pixel(2, 2, Rgba([255, 255, 255, 255]))
+                .save(dir.path().join(name))
+                .unwrap();
+        }
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let scope = ScopeSpec {
+            start_page: Some(2),
+            end_page: Some(3),
+            include_paths: None,
+        };
+        let page_two = dir.path().join("page-2.png");
+        let first = workflow.register_analysis(&page_two, Some(&scope)).unwrap();
+        assert_eq!(
+            first.expected_pages,
+            vec![
+                canonical_path(&dir.path().join("page-2.png")).unwrap(),
+                canonical_path(&dir.path().join("page-10.png")).unwrap(),
+            ]
+        );
+        let page_ten = dir.path().join("page-10.png");
+        workflow.register_analysis(&page_ten, Some(&scope)).unwrap();
+        let page_one_error = workflow
+            .register_analysis(&dir.path().join("page-1.png"), None)
+            .unwrap_err();
+        assert!(page_one_error.to_string().contains("outside the managed"));
+        let incomplete = workflow.validate_export_job(&first.job_dir).unwrap_err();
+        assert!(incomplete.to_string().contains("not rendered"));
+    }
+
+    #[test]
+    fn readable_jobs_isolate_similar_sources_and_nested_page_lifecycle() {
+        let dir = tempdir().unwrap();
+        let first_source_dir = dir.path().join("first").join("comic");
+        let second_source_dir = dir.path().join("second").join("comic");
+        fs::create_dir_all(&first_source_dir).unwrap();
+        fs::create_dir_all(&second_source_dir).unwrap();
+        for source_dir in [&first_source_dir, &second_source_dir] {
+            let mut source = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
+            source.put_pixel(3, 3, Rgba([0, 0, 0, 255]));
+            source.save(source_dir.join("page-1.png")).unwrap();
+        }
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let first_source = first_source_dir.join("page-1.png");
+        let second_source = second_source_dir.join("page-1.png");
+        let first = workflow.register_analysis(&first_source, None).unwrap();
+        let second = workflow.register_analysis(&second_source, None).unwrap();
+        let reopened = Workflow::new(dir.path().join("jobs")).unwrap();
+        assert_eq!(
+            reopened
+                .register_analysis(&first_source, None)
+                .unwrap()
+                .job_dir,
+            first.job_dir
+        );
+        assert_ne!(first.job_dir, second.job_dir);
+        let first_analysis = workflow.page_artifacts_for_source(&first_source).unwrap().0;
+        assert!(
+            workflow
+                .require_analysis_for_source(&second_source, &first_analysis)
+                .is_err()
+        );
+        for registration in [&first, &second] {
+            let name = registration.job_dir.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("comic--"));
+            assert_eq!(name.len(), "comic--".len() + 16);
+            assert!(registration.job_dir.join("job.json").is_file());
+            assert!(registration.job_dir.join("source/source.json").is_file());
+            assert!(registration.job_dir.join("pages/0001").is_dir());
+            assert!(registration.job_dir.join("fonts").is_dir());
+            assert!(registration.job_dir.join("backups").is_dir());
+            assert!(registration.job_dir.join("review").is_dir());
+            assert!(registration.job_dir.join("output").is_dir());
+        }
+        let cleaned = RgbImage::from_pixel(8, 8, image::Rgb([255, 255, 255]));
+        let mut mask = GrayImage::new(8, 8);
+        mask.put_pixel(3, 3, image::Luma([255]));
+        let (cleaned_path, _, _) = workflow
+            .write_clean_artifact(&first_source, &cleaned, &mask, 3, "full")
+            .unwrap();
+        assert_eq!(
+            cleaned_path.file_name().and_then(|name| name.to_str()),
+            Some("cleaned.png")
+        );
+        assert_eq!(
+            cleaned_path
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str()),
+            Some("0001")
+        );
+        assert!(cleaned_path.parent().unwrap().join("mask.png").is_file());
+        assert!(
+            !cleaned_path
+                .parent()
+                .unwrap()
+                .join("corrected-clean.png")
+                .exists()
+        );
+        let rendered = cleaned_path.parent().unwrap().join("rendered.png");
+        cleaned.save(&rendered).unwrap();
+        let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
+        workflow
+            .register_render(&rendered, &clean, json!({}), json!({}))
+            .unwrap();
+        let (second_cleaned_path, _, _) = workflow
+            .write_clean_artifact(&second_source, &cleaned, &mask, 3, "full")
+            .unwrap();
+        let second_rendered = second_cleaned_path.parent().unwrap().join("rendered.png");
+        cleaned.save(&second_rendered).unwrap();
+        let second_clean = workflow.validate_clean_input(&second_cleaned_path).unwrap();
+        let error = workflow
+            .register_render(&second_rendered, &clean, json!({}), json!({}))
+            .unwrap_err();
+        assert!(error.to_string().contains("same managed job"));
+        assert!(!crate::workflow::render_sidecar(&second_rendered).exists());
+        workflow
+            .register_render(&second_rendered, &second_clean, json!({}), json!({}))
+            .unwrap();
+        assert!(workflow.validate_render_input(&rendered).is_ok());
+        let state = workflow.editor_state(&rendered, None).unwrap();
+        workflow.validate_review_state(&rendered, &state).unwrap();
+        workflow.validate_export_job(&first.job_dir).unwrap();
+        assert!(first.job_dir.join("pages/0001/rendered.png").is_file());
+        assert!(second.job_dir.join("pages/0001/rendered.png").is_file());
+        fs::write(
+            first.job_dir.join("project.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "pages": [{
+                    "id": "page-1",
+                    "image_path": first_source,
+                    "rendered_image_path": rendered,
+                    "bubbles": []
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            first.job_dir.join("review.json"),
+            br#"{"review_session_id":"test-session","revision":1,"status":"approved","action":"approve_export","approved_pages":[0]}"#,
+        )
+        .unwrap();
+        let exports = dir.path().join("exports");
+        let export =
+            crate::export::export_project_to(&first.job_dir, "zip", Some(&exports)).unwrap();
+        assert!(
+            Path::new(export["output_path"].as_str().unwrap())
+                .starts_with(fs::canonicalize(&exports).unwrap())
+        );
+    }
+
+    #[test]
+    fn source_job_allocation_validates_preexisting_collisions_and_extended_ids() {
+        let dir = tempdir().unwrap();
+        let first_source_dir = dir.path().join("one").join("comic");
+        let second_source_dir = dir.path().join("two").join("comic");
+        fs::create_dir_all(&first_source_dir).unwrap();
+        fs::create_dir_all(&second_source_dir).unwrap();
+        let source = first_source_dir.join("page.png");
+        RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255]))
+            .save(&source)
+            .unwrap();
+        let jobs = dir.path().join("jobs");
+        fs::create_dir_all(&jobs).unwrap();
+        let source_id = stable_source_id(&canonical_path(&first_source_dir).unwrap()).unwrap();
+        assert_eq!(source_id.len(), 16);
+        let colliding = jobs.join(format!("comic--{source_id}"));
+        fs::create_dir_all(&colliding).unwrap();
+        fs::write(
+            manifest_path(&colliding),
+            serde_json::to_vec(&JobManifest {
+                stage: "managed".into(),
+                source_dir: canonical_path(&second_source_dir).unwrap(),
+                pages: Default::default(),
+                expected_pages: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let workflow = Workflow::new(jobs).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+        assert_ne!(registration.job_dir, colliding);
+        assert!(
+            registration
+                .job_dir
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .ends_with(&format!("--{source_id}-1"))
+        );
+        let preserved: JobManifest =
+            serde_json::from_slice(&fs::read(manifest_path(&colliding)).unwrap()).unwrap();
+        assert_eq!(
+            preserved.source_dir,
+            canonical_path(&second_source_dir).unwrap()
+        );
+    }
+
+    #[test]
+    fn source_job_allocation_is_cross_process_safe() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("nested").join("comic");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("page.png");
+        RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255]))
+            .save(&source)
+            .unwrap();
+        let jobs = dir.path().join("jobs");
+        let left = Workflow::new(jobs.clone()).unwrap();
+        let right = Workflow::new(jobs.clone()).unwrap();
+        let left_source = source.clone();
+        let right_source = source.clone();
+        let first = std::thread::spawn(move || left.register_analysis(&left_source, None));
+        let second = std::thread::spawn(move || right.register_analysis(&right_source, None));
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        assert_eq!(first.job_dir, second.job_dir);
+        let jobs = fs::read_dir(jobs)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+            .count();
+        assert_eq!(jobs, 1);
+    }
+
+    #[test]
+    fn source_replacement_fails_closed_in_an_existing_job() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("comic");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("page.png");
+        RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255]))
+            .save(&source)
+            .unwrap();
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        workflow.register_analysis(&source, None).unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([255, 255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let error = workflow.register_analysis(&source, None).unwrap_err();
+        assert!(error.to_string().contains("source image changed"));
+    }
+
+    #[test]
+    fn legacy_manifest_inventory_preserves_existing_page_records() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("comic");
+        fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("page.png");
+        RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 255]))
+            .save(&source)
+            .unwrap();
+        let jobs = dir.path().join("jobs");
+        let job = jobs.join("legacy-job");
+        fs::create_dir_all(&job).unwrap();
+        let cleaned = job.join("cleaned.png");
+        let rendered = job.join("rendered.png");
+        RgbImage::from_pixel(4, 4, image::Rgb([255, 255, 255]))
+            .save(&cleaned)
+            .unwrap();
+        RgbImage::from_pixel(4, 4, image::Rgb([255, 255, 255]))
+            .save(&rendered)
+            .unwrap();
+        let source = canonical_path(&source).unwrap();
+        let manifest = JobManifest {
+            stage: "rendered".into(),
+            source_dir: canonical_path(&source_dir).unwrap(),
+            pages: [(
+                page_key(&source),
+                PageManifest {
+                    source_image: source.clone(),
+                    state: "rendered".into(),
+                    source_sha256: String::new(),
+                    cleaned_image: Some(cleaned.clone()),
+                    rendered_image: Some(rendered.clone()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            expected_pages: Vec::new(),
+        };
+        fs::write(
+            legacy_manifest_path(&job),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        let workflow = Workflow::new(jobs).unwrap();
+        workflow.register_analysis(&source, None).unwrap();
+        let saved: JobManifest =
+            serde_json::from_slice(&fs::read(legacy_manifest_path(&job)).unwrap()).unwrap();
+        let page = saved.pages.get(&page_key(&source)).unwrap();
+        assert_eq!(page.state, "rendered");
+        assert_eq!(page.cleaned_image.as_deref(), Some(cleaned.as_path()));
+        assert_eq!(page.rendered_image.as_deref(), Some(rendered.as_path()));
+        assert!(!manifest_path(&job).exists());
+    }
+
+    #[test]
+    fn next_pending_page_normalizes_legacy_inventory_before_resume() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("comic");
+        fs::create_dir_all(&source_dir).unwrap();
+        let first = source_dir.join("page-01.png");
+        let second = source_dir.join("page-02.png");
+        for source in [&first, &second] {
+            RgbaImage::from_pixel(4, 4, Rgba([255, 255, 255, 255]))
+                .save(source)
+                .unwrap();
+        }
+        let first = canonical_path(&first).unwrap();
+        let second = canonical_path(&second).unwrap();
+        let source_dir = canonical_path(&source_dir).unwrap();
+        let jobs = dir.path().join("jobs");
+        let job = jobs.join("legacy-job");
+        fs::create_dir_all(&job).unwrap();
+        let pages = [
+            (
+                page_key(&first),
+                PageManifest {
+                    source_image: first.clone(),
+                    state: "analyzed".into(),
+                    source_sha256: String::new(),
+                    cleaned_image: None,
+                    rendered_image: None,
+                },
+            ),
+            (
+                page_key(&second),
+                PageManifest {
+                    source_image: second,
+                    state: "analyzed".into(),
+                    source_sha256: String::new(),
+                    cleaned_image: None,
+                    rendered_image: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        fs::write(
+            legacy_manifest_path(&job),
+            serde_json::to_vec_pretty(&JobManifest {
+                stage: "managed".into(),
+                source_dir,
+                pages,
+                expected_pages: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let workflow = Workflow::new(jobs).unwrap();
+        let pending = workflow.next_pending_page(&job).unwrap().unwrap();
+        assert_eq!(pending.page_number, 1);
+        assert_eq!(pending.total_pages, 2);
+        assert!(pending.analysis_path.ends_with("pages/0001/analysis.json"));
+        let saved: JobManifest =
+            serde_json::from_slice(&fs::read(legacy_manifest_path(&job)).unwrap()).unwrap();
+        assert_eq!(saved.expected_pages.len(), 2);
+        assert!(job.join("pages/0001").is_dir());
+        assert!(job.join("pages/0002").is_dir());
+    }
+
+    #[test]
+    fn generated_bubble_ids_are_stable_and_unique() {
+        let first = json!({
+            "request_bubbles": [
+                {"bbox":{"x1":1,"y1":1,"x2":4,"y2":4},"text":"same"},
+                {"bbox":{"x1":5,"y1":5,"x2":8,"y2":8},"text":"other"},
+                {"bbox":{"x1":1,"y1":1,"x2":4,"y2":4},"text":"same"}
+            ]
+        });
+        let reordered = json!({
+            "request_bubbles": [
+                {"bbox":{"x1":5,"y1":5,"x2":8,"y2":8},"text":"other"},
+                {"bbox":{"x1":1,"y1":1,"x2":4,"y2":4},"text":"same"},
+                {"bbox":{"x1":1,"y1":1,"x2":4,"y2":4},"text":"same"}
+            ]
+        });
+        let first = editor_bubbles(&first, "page");
+        let reordered = editor_bubbles(&reordered, "page");
+        let ids = first
+            .iter()
+            .map(|bubble| bubble["id"].as_str().unwrap().to_owned())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 3);
+        let other_id = first
+            .iter()
+            .find(|bubble| bubble["text"] == "other")
+            .unwrap()["id"]
+            .clone();
+        assert_eq!(
+            reordered
+                .iter()
+                .find(|bubble| bubble["text"] == "other")
+                .unwrap()["id"],
+            other_id
+        );
+        let first_same = first
+            .iter()
+            .filter(|bubble| bubble["text"] == "same")
+            .map(|bubble| bubble["id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        let reordered_same = reordered
+            .iter()
+            .filter(|bubble| bubble["text"] == "same")
+            .map(|bubble| bubble["id"].as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(first_same, reordered_same);
+        let translated = editor_bubbles(
+            &json!({
+                "request_bubbles": [{
+                    "bbox":{"x1":1,"y1":1,"x2":4,"y2":4},
+                    "text":"changed translation"
+                }]
+            }),
+            "page",
+        );
+        assert!(first_same.contains(translated[0]["id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn managed_job_selector_rejects_traversal_and_accepts_job_directory() {
+        let dir = tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        let job = jobs.join("1b5c2f14ee4a4b469353b3786fdf1025");
+        fs::create_dir_all(&job).unwrap();
+        fs::write(
+            manifest_path(&job),
+            serde_json::to_vec(&JobManifest {
+                stage: "rendered".into(),
+                source_dir: dir.path().into(),
+                pages: Default::default(),
+                expected_pages: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let workflow = Workflow::new(jobs.clone()).unwrap();
+        assert_eq!(
+            workflow
+                .resolve_managed_job_id("1b5c2f14ee4a4b469353b3786fdf1025")
+                .unwrap(),
+            canonical_path(&job).unwrap()
+        );
+        assert_eq!(
+            workflow
+                .resolve_managed_job_path(&manifest_path(&job).to_string_lossy())
+                .unwrap(),
+            canonical_path(&job).unwrap()
+        );
+        assert!(workflow.resolve_managed_job_path("../").is_err());
+        assert!(workflow.resolve_managed_job_id("..\\secret").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_output_creation_rejects_symlink_escape_before_mkdir() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let workflow = Workflow::new(jobs.clone()).unwrap();
+        symlink(&outside, jobs.join("escape")).unwrap();
+
+        let output = jobs.join("escape").join("created.json");
+        assert!(
+            workflow
+                .require_output_owned(&output, "test output")
+                .is_err()
+        );
+        assert!(!outside.join("created.json").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn clean_artifact_accepts_normal_and_verbatim_windows_paths() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("page.png");
+        let mut source_image = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
+        source_image.put_pixel(3, 3, Rgba([0, 0, 0, 255]));
+        source_image.save(&source).unwrap();
+        let cleaned = RgbImage::from_pixel(8, 8, image::Rgb([255, 255, 255]));
+        let mut mask = GrayImage::new(8, 8);
+        mask.put_pixel(3, 3, image::Luma([255]));
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let (cleaned_path, _, _) = workflow
+            .write_clean_artifact(&source, &cleaned, &mask, 3, "crop")
+            .unwrap();
+        let verbatim_cleaned = fs::canonicalize(&cleaned_path).unwrap();
+        workflow.validate_clean_input(&cleaned_path).unwrap();
+        workflow.validate_clean_input(&verbatim_cleaned).unwrap();
+
+        let sidecar_path = clean_sidecar(&cleaned_path);
+        let mut sidecar: serde_json::Value =
+            serde_json::from_slice(&fs::read(&sidecar_path).unwrap()).unwrap();
+        sidecar["source_image"] = serde_json::json!(fs::canonicalize(&source).unwrap());
+        sidecar["cleaned_image"] = serde_json::json!(verbatim_cleaned);
+        sidecar["mask_path"] =
+            serde_json::json!(fs::canonicalize(sidecar["mask_path"].as_str().unwrap()).unwrap());
+        fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
+        workflow.validate_clean_input(&cleaned_path).unwrap();
+    }
+
+    #[test]
+    fn editor_state_synthesizes_legacy_pages_and_empty_bubbles() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        for name in ["page-1.png", "page-2.png"] {
+            let mut source = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
+            source.put_pixel(3, 3, Rgba([0, 0, 0, 255]));
+            source.save(source_dir.join(name)).unwrap();
+        }
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let page_one = source_dir.join("page-1.png");
+        let page_two = source_dir.join("page-2.png");
+        let first = workflow.register_analysis(&page_one, None).unwrap();
+        workflow.register_analysis(&page_two, None).unwrap();
+        // Exercise the legacy flat-artifact branch explicitly. Existing jobs
+        // keep their marker and may continue to store renders at the job root.
+        fs::rename(
+            manifest_path(&first.job_dir),
+            legacy_manifest_path(&first.job_dir),
+        )
+        .unwrap();
+        let mut rendered_paths = Vec::new();
+        for source in [&page_one, &page_two] {
+            let cleaned = RgbImage::from_pixel(8, 8, image::Rgb([255, 255, 255]));
+            let mut mask = GrayImage::new(8, 8);
+            mask.put_pixel(3, 3, image::Luma([255]));
+            let (cleaned_path, _, _) = workflow
+                .write_clean_artifact(source, &cleaned, &mask, 3, "crop")
+                .unwrap();
+            let rendered = first
+                .job_dir
+                .join(format!("legacy-{}.png", page_key(source)));
+            cleaned.save(&rendered).unwrap();
+            workflow
+                .register_render(
+                    &rendered,
+                    &workflow.validate_clean_input(&cleaned_path).unwrap(),
+                    serde_json::Value::Null,
+                    json!({}),
+                )
+                .unwrap();
+            rendered_paths.push(rendered);
+        }
+        let state = workflow.editor_state(&rendered_paths[0], None).unwrap();
+        let pages = state["pages"].as_array().unwrap();
+        assert_eq!(pages.len(), 2);
+        assert!(pages.iter().all(|page| page["bubbles"].is_array()));
+        assert!(
+            pages
+                .iter()
+                .all(|page| page["rendered_image_path"].is_string())
+        );
+        let reopened_job = workflow
+            .resolve_managed_job_path(&first.job_dir.to_string_lossy())
+            .unwrap();
+        let selected = workflow
+            .verified_render_for_job(&reopened_job, None)
+            .unwrap();
+        assert!(selected.is_file());
+    }
+}

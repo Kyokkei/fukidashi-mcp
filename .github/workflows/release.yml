@@ -1,0 +1,94 @@
+name: tagged release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+          - os: windows-latest
+            platform: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --locked --release --all-features
+
+      - name: Stage Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="package/fukidashi-mcp"
+          mkdir -p "$stage/licenses/fonts" release-assets
+          install -m 0755 target/release/fukidashi-mcp "$stage/fukidashi-mcp"
+          cp README.md LICENSE LICENSE-Comic-Translate "$stage/"
+          cp assets/fonts/ComicNeue-OFL.txt assets/fonts/PatrickHand-OFL.txt assets/fonts/README.md "$stage/licenses/fonts/"
+          archive="fukidashi-mcp-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          tar -C package -czf "release-assets/$archive" fukidashi-mcp
+          sha256sum "release-assets/$archive" > "release-assets/$archive.sha256"
+
+      - name: Stage Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = 'package/fukidashi-mcp'
+          New-Item -ItemType Directory -Force -Path "$stage/licenses/fonts", 'release-assets' | Out-Null
+          Copy-Item 'target/release/fukidashi-mcp.exe' "$stage/fukidashi-mcp.exe"
+          Copy-Item README.md, LICENSE, LICENSE-Comic-Translate $stage
+          Copy-Item assets/fonts/ComicNeue-OFL.txt, assets/fonts/PatrickHand-OFL.txt, assets/fonts/README.md "$stage/licenses/fonts/"
+          $archive = "fukidashi-mcp-$env:GITHUB_REF_NAME-windows-x86_64.zip"
+          Compress-Archive -Path 'package/fukidashi-mcp' -DestinationPath "release-assets/$archive" -Force
+          $hash = (Get-FileHash "release-assets/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $archive" | Set-Content -NoNewline "release-assets/$archive.sha256"
+
+      - name: Upload platform package
+        uses: actions/upload-artifact@v4
+        with:
+          name: fukidashi-mcp-${{ matrix.platform }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: publish GitHub release
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fukidashi-mcp-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish tagged release with gh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -n "${GITHUB_REF_NAME}"
+          test -f "release-assets/fukidashi-mcp-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
+          test -f "release-assets/fukidashi-mcp-${GITHUB_REF_NAME}-linux-x86_64.tar.gz.sha256"
+          test -f "release-assets/fukidashi-mcp-${GITHUB_REF_NAME}-windows-x86_64.zip"
+          test -f "release-assets/fukidashi-mcp-${GITHUB_REF_NAME}-windows-x86_64.zip.sha256"
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Fukidashi MCP ${GITHUB_REF_NAME}" \
+            --generate-notes

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "fukidashi": {
+      "command": "fukidashi-mcp",
+      "args": [],
+      "env": {
+        "FUKIDASHI_STORAGE_ROOT": "<absolute-path>/Fukidashi",
+        "FUKIDASHI_PROVIDER": "cpu"
+      }
+    }
+  }
+}
