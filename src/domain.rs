@@ -84,7 +84,7 @@ pub struct TypesetPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preserve_by_default: Option<bool>,
     /// Whether the translator marked this item as needing review. The editor
-    /// surfaces this as an explicit bubble flag that the user can clear.
+    /// surfaces this as advisory context; only an explicit user flag blocks approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub needs_review: Option<bool>,
     /// Explicit editor flag state, retained across a rerender/reopen cycle.

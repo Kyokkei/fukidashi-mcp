@@ -133,6 +133,9 @@ fn editor_gallery_variants_and_render_endpoint_are_constrained() {
         "render",
         "translation",
         "flagged",
+        "errorPanel",
+        "showError",
+        "bubbleAdvisory",
     ] {
         assert!(html.contains(marker), "editor HTML missing {marker}");
     }
@@ -329,6 +332,32 @@ async fn review_submit_wakes_matching_waiter_and_persists_audit() {
     assert!(dir.path().join("review-audit.json").is_file());
 }
 
+#[tokio::test]
+async fn reopening_review_wakes_old_waiter_with_a_stale_revision_error() {
+    let dir = tempdir().unwrap();
+    let image_path = dir.path().join("page.png");
+    ImageBuffer::<Rgb<u8>, _>::from_pixel(20, 20, Rgb([255, 255, 255]))
+        .save(&image_path)
+        .unwrap();
+    let state = json!({
+        "schema_version": 1,
+        "pages": [{"id":"p1","image_path":"page.png","bubbles":[]}]
+    });
+    let first = serve_editor(&image_path, state.clone()).unwrap();
+    let session = first["review_session_id"].as_str().unwrap().to_owned();
+    let revision = first["review_revision"].as_u64().unwrap();
+    let waiter = tokio::spawn({
+        let session = session.clone();
+        async move { wait_for_review(&session, revision, 10).await }
+    });
+
+    let second = serve_editor(&image_path, state).unwrap();
+    assert_eq!(second["review_session_id"], session);
+    assert_eq!(second["review_revision"], revision + 1);
+    let error = waiter.await.unwrap().unwrap_err().to_string();
+    assert!(error.contains("stale review revision"));
+}
+
 #[test]
 fn review_rejects_stale_revision_and_malformed_bbox() {
     let dir = tempdir().unwrap();
@@ -424,7 +453,6 @@ fn approval_rejects_flags_issues_and_dirty_render_state() {
     assert!(response.starts_with("HTTP/1.1 400"));
     assert!(response.contains("render_dirty"));
     assert!(response.contains("flagged_bubble"));
-    assert!(response.contains("missing_translation"));
     assert!(response.contains("issue"));
 }
 
@@ -434,6 +462,7 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
     let source = dir.path().join("page.png");
     let mut source_image = ImageBuffer::<Rgb<u8>, _>::from_pixel(32, 32, Rgb([255, 255, 255]));
     source_image.put_pixel(3, 3, Rgb([0, 0, 0]));
+    source_image.put_pixel(28, 4, Rgb([0, 0, 0]));
     source_image.save(&source).unwrap();
     let jobs = dir.path().join("jobs");
     let workflow = Workflow::new(jobs).unwrap();
@@ -473,18 +502,42 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
         max_font_size: Some(8.0),
         shape: Some("rectangle".into()),
     };
-    let report = fukidashi_mcp::typeset::typeset_page(
-        &cleaned_path,
-        std::slice::from_ref(&payload),
-        &rendered_path,
-    )
-    .unwrap();
+    let payload2 = TypesetPayload {
+        id: Some("b2".into()),
+        source_text: Some("second source".into()),
+        kind: Some("dialogue".into()),
+        preserve_by_default: Some(false),
+        needs_review: Some(false),
+        flagged: Some(false),
+        bbox: Rect {
+            x1: 15.0,
+            y1: 15.0,
+            x2: 31.0,
+            y2: 31.0,
+        },
+        bubble_bbox: None,
+        text_bbox: None,
+        padding: None,
+        text: "x".into(),
+        font_path: Some(font.display().to_string()),
+        min_font_size: Some(1.0),
+        max_font_size: Some(8.0),
+        shape: Some("rectangle".into()),
+    };
+    let payloads = [payload.clone(), payload2];
+    let report =
+        fukidashi_mcp::typeset::typeset_page(&cleaned_path, &payloads, &rendered_path).unwrap();
+    let mut request_bubbles = serde_json::to_value(payloads).unwrap();
+    for bubble in request_bubbles.as_array_mut().unwrap() {
+        bubble["bubble_bbox"] = serde_json::Value::Null;
+        bubble["text_bbox"] = serde_json::Value::Null;
+    }
     let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
     workflow
         .register_render(
             &rendered_path,
             &clean,
-            json!({"request_bubbles":[payload],"report":report}),
+            json!({"request_bubbles":request_bubbles,"report":report}),
             json!({}),
         )
         .unwrap();
@@ -506,13 +559,19 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
         serde_json::from_slice(&fs::read(result["persistence_path"].as_str().unwrap()).unwrap())
             .unwrap();
     let bubble = edited["pages"][0]["bubbles"][0].clone();
-    edited["pages"][0]["bubbles"] = json!([]);
+    let retained_bubble = edited["pages"][0]["bubbles"][1].clone();
+    edited["pages"][0]["bubbles"] = json!([retained_bubble]);
     edited["pages"][0]["removed_bubbles"] = json!([{
         "id": "b1",
         "bbox": bubble["bbox"],
         "source_text": "source",
         "translation": "dịch",
         "removed_reason": "preserve_original"
+    }]);
+    edited["pages"][0]["correction_strokes"] = json!([{
+        "mode": "cover",
+        "size": 3,
+        "points": [{"x": 28, "y": 4}, {"x": 28, "y": 4}]
     }]);
     edited["pages"][0]["render_dirty"] = json!(true);
     let save = request(
@@ -539,15 +598,13 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
     );
     let restored = image::open(&rendered_path).unwrap().to_rgb8();
     assert_eq!(*restored.get_pixel(3, 3), Rgb([0, 0, 0]));
+    assert_eq!(*restored.get_pixel(28, 4), Rgb([255, 255, 255]));
     let persisted: serde_json::Value =
         serde_json::from_slice(&fs::read(result["persistence_path"].as_str().unwrap()).unwrap())
             .unwrap();
-    assert!(
-        persisted["pages"][0]["bubbles"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
+    let persisted_bubbles = persisted["pages"][0]["bubbles"].as_array().unwrap();
+    assert_eq!(persisted_bubbles.len(), 1);
+    assert_eq!(persisted_bubbles[0]["id"], "b2");
     assert_eq!(persisted["pages"][0]["removed_bubbles"][0]["id"], "b1");
     assert_eq!(persisted["pages"][0]["render_dirty"], false);
 }

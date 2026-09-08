@@ -966,15 +966,47 @@ fn removed_bubble_id(value: &Value) -> Option<&str> {
 }
 
 fn page_render_signature(page: &Value) -> Value {
+    fn without_review_metadata(value: &Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(
+                values
+                    .iter()
+                    .map(without_review_metadata)
+                    .collect::<Vec<_>>(),
+            ),
+            Value::Object(object) => Value::Object(
+                object
+                    .iter()
+                    .filter(|(key, value)| {
+                        !matches!(
+                            key.as_str(),
+                            "flagged"
+                                | "problem"
+                                | "needs_review"
+                                | "flag_reason"
+                                | "problem_reason"
+                                | "removed_reason"
+                        ) && !value.is_null()
+                    })
+                    .map(|(key, value)| (key.clone(), without_review_metadata(value)))
+                    .collect(),
+            ),
+            _ => value.clone(),
+        }
+    }
+
     json!({
-        "bubbles": page.get("bubbles").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        "bubbles": page
+            .get("bubbles")
+            .map(without_review_metadata)
+            .unwrap_or_else(|| Value::Array(Vec::new())),
         "removed_bubbles": page
             .get("removed_bubbles")
-            .cloned()
+            .map(without_review_metadata)
             .unwrap_or_else(|| Value::Array(Vec::new())),
         "correction_strokes": page
             .get("correction_strokes")
-            .cloned()
+            .map(without_review_metadata)
             .unwrap_or_else(|| Value::Array(Vec::new())),
     })
 }
@@ -1052,25 +1084,14 @@ fn review_blockers(state: &Value) -> Vec<Value> {
                     bubbles
                         .iter()
                         .filter(|bubble| {
-                            let explicit_flag = bubble
+                            bubble
                                 .get("flagged")
                                 .and_then(Value::as_bool)
                                 .unwrap_or(false)
                                 || bubble
                                     .get("problem")
                                     .and_then(Value::as_bool)
-                                    .unwrap_or(false);
-                            let has_source_text = bubble
-                                .get("source_text")
-                                .or_else(|| bubble.get("original_text"))
-                                .or_else(|| bubble.get("text"))
-                                .and_then(Value::as_str)
-                                .is_some_and(|text| !text.trim().is_empty());
-                            let missing_translation = bubble
-                                .get("translation")
-                                .and_then(Value::as_str)
-                                .is_none_or(|text| text.trim().is_empty());
-                            explicit_flag || (has_source_text && missing_translation)
+                                    .unwrap_or(false)
                         })
                         .map(|bubble| {
                             let explicit_flag = bubble
@@ -1093,12 +1114,12 @@ fn review_blockers(state: &Value) -> Vec<Value> {
                                 .unwrap_or_else(|| Value::String(String::new()));
                             json!({
                                 "page": page_index,
-                                "kind": if explicit_flag { "flagged_bubble" } else { "missing_translation" },
+                                "kind": "flagged_bubble",
                                 "bubble_id": bubble.get("id").cloned().unwrap_or(Value::Null),
                                 "bbox": bubble.get("bbox").cloned().unwrap_or(Value::Null),
                                 "source_ocr": source_ocr,
                                 "current_translation": current_translation,
-                                "origin": if explicit_flag { "bubble-flag" } else { "server-state" },
+                                "origin": if explicit_flag { "bubble-flag" } else { "bubble-problem" },
                             })
                         }),
                 );
@@ -1297,10 +1318,8 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
         return;
     };
     for (index, base_page) in base_pages.iter_mut().enumerate() {
-        let Some(base_object) = base_page.as_object_mut() else {
-            continue;
-        };
-        let base_id = base_object
+        let baseline_signature = page_render_signature(base_page);
+        let base_id = base_page
             .get("id")
             .and_then(Value::as_str)
             .map(str::to_owned);
@@ -1317,104 +1336,113 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
         let Some(saved_object) = saved_page.and_then(Value::as_object) else {
             continue;
         };
-        if let Some(issues) = saved_object.get("issues").filter(|value| value.is_array()) {
-            base_object.insert("issues".to_owned(), issues.clone());
-        }
-        if let Some(strokes) = saved_object
-            .get("correction_strokes")
-            .filter(|value| value.is_array())
-        {
-            base_object.insert("correction_strokes".to_owned(), strokes.clone());
-        }
-        if let Some(render_dirty) = saved_object
-            .get("render_dirty")
-            .filter(|value| value.is_boolean())
-        {
-            base_object.insert("render_dirty".to_owned(), render_dirty.clone());
-        }
-        if let Some(rendered_revision) = saved_object
-            .get("rendered_state_revision")
-            .filter(|value| value.is_u64())
-        {
-            base_object.insert(
-                "rendered_state_revision".to_owned(),
-                rendered_revision.clone(),
-            );
-        }
         let saved_removed_bubbles = saved_object
             .get("removed_bubbles")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let removed_ids: std::collections::HashSet<String> = saved_removed_bubbles
-            .iter()
-            .filter_map(removed_bubble_id)
-            .map(str::to_owned)
-            .collect();
-        base_object.insert(
-            "removed_bubbles".to_owned(),
-            Value::Array(saved_removed_bubbles.clone()),
-        );
         let saved_bubbles = saved_object
             .get("bubbles")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let Some(base_bubbles) = base_object.get_mut("bubbles").and_then(Value::as_array_mut)
-        else {
-            continue;
-        };
-        base_bubbles.retain(|bubble| {
-            bubble
-                .get("id")
-                .and_then(Value::as_str)
-                .is_none_or(|id| !removed_ids.contains(id))
-        });
-        for base_bubble in base_bubbles.iter_mut() {
-            let Some(base_bubble_object) = base_bubble.as_object_mut() else {
+
+        {
+            let Some(base_object) = base_page.as_object_mut() else {
                 continue;
             };
-            let id = base_bubble_object
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let saved_bubble = saved_bubbles.iter().find(|candidate| {
-                candidate
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .zip(id.as_deref())
-                    .is_some_and(|(left, right)| left == right)
-            });
-            let Some(saved_bubble) = saved_bubble.and_then(Value::as_object) else {
-                continue;
-            };
-            for key in [
-                "translation",
-                "bbox",
-                "font_size",
-                "padding",
-                "reading_order",
-                "flagged",
-            ] {
-                if let Some(value) = saved_bubble.get(key) {
-                    base_bubble_object.insert(key.to_owned(), value.clone());
+            if let Some(issues) = saved_object.get("issues").filter(|value| value.is_array()) {
+                base_object.insert("issues".to_owned(), issues.clone());
+            }
+            if let Some(strokes) = saved_object
+                .get("correction_strokes")
+                .filter(|value| value.is_array())
+            {
+                base_object.insert("correction_strokes".to_owned(), strokes.clone());
+            }
+            if let Some(rendered_revision) = saved_object
+                .get("rendered_state_revision")
+                .filter(|value| value.is_u64())
+            {
+                base_object.insert(
+                    "rendered_state_revision".to_owned(),
+                    rendered_revision.clone(),
+                );
+            }
+            let removed_ids: std::collections::HashSet<String> = saved_removed_bubbles
+                .iter()
+                .filter_map(removed_bubble_id)
+                .map(str::to_owned)
+                .collect();
+            base_object.insert(
+                "removed_bubbles".to_owned(),
+                Value::Array(saved_removed_bubbles.clone()),
+            );
+            if let Some(base_bubbles) = base_object.get_mut("bubbles").and_then(Value::as_array_mut)
+            {
+                base_bubbles.retain(|bubble| {
+                    bubble
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| !removed_ids.contains(id))
+                });
+                for base_bubble in base_bubbles.iter_mut() {
+                    let Some(base_bubble_object) = base_bubble.as_object_mut() else {
+                        continue;
+                    };
+                    let id = base_bubble_object
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let saved_bubble = saved_bubbles.iter().find(|candidate| {
+                        candidate
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .zip(id.as_deref())
+                            .is_some_and(|(left, right)| left == right)
+                    });
+                    let Some(saved_bubble) = saved_bubble.and_then(Value::as_object) else {
+                        continue;
+                    };
+                    for key in [
+                        "translation",
+                        "bbox",
+                        "font_size",
+                        "padding",
+                        "reading_order",
+                        "flagged",
+                        "problem",
+                        "flag_reason",
+                        "problem_reason",
+                        "needs_review",
+                    ] {
+                        if let Some(value) = saved_bubble.get(key) {
+                            base_bubble_object.insert(key.to_owned(), value.clone());
+                        }
+                    }
+                }
+                let base_ids: std::collections::HashSet<String> = base_bubbles
+                    .iter()
+                    .filter_map(|bubble| {
+                        bubble.get("id").and_then(Value::as_str).map(str::to_owned)
+                    })
+                    .collect();
+                for saved_bubble in saved_bubbles {
+                    let Some(id) = saved_bubble.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if !removed_ids.contains(id)
+                        && !base_ids.contains(id)
+                        && saved_bubble.get("bbox").is_some()
+                    {
+                        base_bubbles.push(saved_bubble);
+                    }
                 }
             }
         }
-        let base_ids: std::collections::HashSet<String> = base_bubbles
-            .iter()
-            .filter_map(|bubble| bubble.get("id").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        for saved_bubble in saved_bubbles {
-            let Some(id) = saved_bubble.get("id").and_then(Value::as_str) else {
-                continue;
-            };
-            if !removed_ids.contains(id)
-                && !base_ids.contains(id)
-                && saved_bubble.get("bbox").is_some()
-            {
-                base_bubbles.push(saved_bubble);
-            }
+        let render_dirty = page_render_signature(base_page) != baseline_signature;
+        if let Some(base_object) = base_page.as_object_mut() {
+            base_object.insert("render_dirty".to_owned(), Value::Bool(render_dirty));
         }
     }
 }
@@ -1573,11 +1601,13 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             bbox,
             bubble_bbox: bubble
                 .get("bubble_bbox")
+                .filter(|value| !value.is_null())
                 .cloned()
                 .map(serde_json::from_value)
                 .transpose()?,
             text_bbox: bubble
                 .get("text_bbox")
+                .filter(|value| !value.is_null())
                 .cloned()
                 .map(serde_json::from_value)
                 .transpose()?,
@@ -1963,6 +1993,48 @@ mod tests {
             .unwrap();
         assert_eq!(flagged["source_ocr"], Value::Null);
         assert_eq!(flagged["current_translation"], "");
+    }
+
+    #[test]
+    fn reopening_a_matching_sidecar_clears_stale_dirty_without_blocking_advisory() {
+        let bbox = json!({"x1": 1.0, "y1": 1.0, "x2": 8.0, "y2": 8.0});
+        let mut base = normalize_editor_state(json!({
+            "state_revision": 3,
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{
+                    "id": "bubble-1",
+                    "bbox": bbox,
+                    "bubble_bbox": null,
+                    "translation": "Bản dịch",
+                    "needs_review": true
+                }]
+            }]
+        }))
+        .unwrap();
+        let saved = json!({
+            "state_revision": 4,
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{
+                    "id": "bubble-1",
+                    "bbox": {"x1": 1.0, "y1": 1.0, "x2": 8.0, "y2": 8.0},
+                    "translation": "Bản dịch",
+                    "needs_review": true
+                }],
+                "render_dirty": true
+            }]
+        });
+        merge_saved_edits(&mut base, &saved);
+        assert_eq!(base["pages"][0]["render_dirty"], false);
+        assert!(review_blockers(&base).is_empty());
+
+        let mut flagged = saved;
+        flagged["pages"][0]["bubbles"][0]["flagged"] = json!(true);
+        merge_saved_edits(&mut base, &flagged);
+        let blockers = review_blockers(&base);
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0]["kind"], "flagged_bubble");
     }
 
     #[test]

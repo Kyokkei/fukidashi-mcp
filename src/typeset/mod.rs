@@ -158,12 +158,14 @@ pub fn post_render_qa(
     {
         let safe = bubble
             .get("safe_bbox")
+            .filter(|value| !value.is_null())
             .cloned()
             .map(serde_json::from_value::<crate::domain::Rect>)
             .transpose()
             .context("typeset QA safe_bbox is malformed")?;
         let ink = bubble
             .get("ink_bbox")
+            .filter(|value| !value.is_null())
             .cloned()
             .map(serde_json::from_value::<crate::domain::Rect>)
             .transpose()

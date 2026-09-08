@@ -1233,7 +1233,9 @@ impl FukidashiServer {
                     .get("preserve_by_default")
                     .and_then(serde_json::Value::as_bool),
                 needs_review: Some(needs_review),
-                flagged: Some(needs_review),
+                // Model uncertainty is advisory. Only an explicit editor flag
+                // or problem is an approval blocker.
+                flagged: None,
                 bbox,
                 bubble_bbox: None,
                 text_bbox: None,
@@ -3238,6 +3240,56 @@ mod tests {
                 .as_str()
                 .is_some()
         );
+        let fixes_review_path = review_path.clone();
+        let fixes = server
+            .review_and_export_inner(review_request.clone(), move |url| {
+                let endpoint = url.strip_prefix("http://").ok_or_else(|| {
+                    FukidashiError::RuntimeUnavailable("test editor URL is not HTTP".into())
+                })?;
+                let (host, suffix) = endpoint.split_once('/').ok_or_else(|| {
+                    FukidashiError::RuntimeUnavailable("test editor URL has no token".into())
+                })?;
+                let review: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(&fixes_review_path).map_err(FukidashiError::Io)?,
+                )?;
+                let revision = review["revision"].as_u64().ok_or_else(|| {
+                    FukidashiError::RuntimeUnavailable("test review has no revision".into())
+                })?;
+                let token = suffix.trim_end_matches('/');
+                let request_path = format!("/{token}/review/submit");
+                let body = serde_json::json!({
+                    "revision": revision,
+                    "action": "request_fixes",
+                    "feedback": [{
+                        "page": 0,
+                        "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
+                        "issue_type": "custom",
+                        "note": "second-pass fixture",
+                        "origin": "image-pixels"
+                    }]
+                })
+                .to_string();
+                let mut stream = std::net::TcpStream::connect(host)?;
+                use std::io::{Read, Write};
+                write!(
+                    stream,
+                    "POST {request_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )?;
+                let mut response = Vec::new();
+                stream.read_to_end(&mut response)?;
+                if !response.starts_with(b"HTTP/1.1 200") {
+                    return Err(FukidashiError::RuntimeUnavailable(
+                        String::from_utf8_lossy(&response).into_owned(),
+                    ));
+                }
+                Ok(())
+            })
+            .await;
+        let fixes_value = extract_tool_json(fixes, "combined fixes round").unwrap();
+        assert_eq!(fixes_value["protocol"], "review-v1");
+        assert_eq!(fixes_value["status"], "fixes_requested");
+        assert_eq!(fixes_value["review"]["action"], "request_fixes");
         let result = server
             .review_and_export_inner(
                 review_request,
@@ -3358,7 +3410,7 @@ mod tests {
         .unwrap();
         assert_eq!(payloads[0].text, "原文");
         assert_eq!(payloads[0].needs_review, Some(true));
-        assert_eq!(payloads[0].flagged, Some(true));
+        assert_eq!(payloads[0].flagged, None);
         assert_eq!(
             analysis["translation_handoff"]["items"][0]["keep_source"],
             true

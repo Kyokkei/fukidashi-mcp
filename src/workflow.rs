@@ -1584,17 +1584,6 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
             if let Some(text) = request.get("text") {
                 bubble.insert("translation".into(), text.clone());
             }
-            // Strict translation carries `needs_review` through the render
-            // sidecar. Surface it as an explicit, user-clearable flag unless
-            // the sidecar already records a later editor decision.
-            if !bubble.contains_key("flagged")
-                && request
-                    .get("needs_review")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-            {
-                bubble.insert("flagged".into(), serde_json::Value::Bool(true));
-            }
             if let Some(report) = reports.and_then(|items| items.get(index))
                 && let Some(report) = report.as_object()
             {
@@ -2808,14 +2797,15 @@ mod tests {
     }
 
     #[test]
-    fn editor_bubbles_surface_needs_review_as_an_explicit_clearable_flag() {
-        let flagged = editor_bubbles(
+    fn editor_bubbles_keep_needs_review_advisory_without_creating_a_flag() {
+        let advisory = editor_bubbles(
             &json!({
                 "request_bubbles": [{"id":"b1","bbox":{"x1":1,"y1":1,"x2":8,"y2":8},"text":"dịch","needs_review":true}]
             }),
             "page-1",
         );
-        assert_eq!(flagged[0]["flagged"], true);
+        assert_eq!(advisory[0]["needs_review"], true);
+        assert!(advisory[0].get("flagged").is_none());
 
         let cleared = editor_bubbles(
             &json!({
