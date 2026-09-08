@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 
 use rmcp::{
     ServerHandler,
@@ -67,6 +71,10 @@ pub struct CleanRequest {
     pub crop_padding: Option<u32>,
     #[serde(default)]
     pub crop_minimum_size: Option<u32>,
+    /// Strict-v1 policy for text detected outside dialogue bubbles. Preserve
+    /// is the safe default; replace must be explicitly requested.
+    #[serde(default)]
+    pub sfx_mode: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TypesetRequest {
@@ -126,6 +134,24 @@ pub struct WaitReviewRequest {
     pub timeout_seconds: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewAndExportRequest {
+    /// Select a managed job by its server-returned job id or exact job path.
+    #[serde(default)]
+    pub job_id: Option<String>,
+    #[serde(default)]
+    pub job_path: Option<String>,
+    /// Compatibility selector for a known rendered artifact.
+    #[serde(default)]
+    pub image_path: Option<String>,
+    /// Export format after explicit browser approval. Defaults to zip.
+    #[serde(default = "default_export_format")]
+    pub format: String,
+    /// Maximum time to keep this combined call pending for the browser.
+    #[serde(default = "default_review_timeout")]
+    pub timeout_seconds: u64,
+}
+
 /// Start or resume the server-owned translation loop.  A new loop may be
 /// started from one source image; a resumed loop is selected by the job id or
 /// managed job path returned by an earlier call.  The submit call deliberately
@@ -146,6 +172,10 @@ pub struct TranslationStartRequest {
     pub target_language: Option<String>,
     #[serde(default)]
     pub scope: Option<AnalyzeScope>,
+    /// `preserve` keeps structurally unmatched text out of clean/typeset;
+    /// `replace` opts into translating and replacing it. Defaults to preserve.
+    #[serde(default)]
+    pub sfx_mode: Option<String>,
 }
 
 /// One translation decision keyed by the stable OCR item id.  `keep_source`
@@ -173,6 +203,10 @@ pub struct TranslationSubmitRequest {
 
 fn default_review_timeout() -> u64 {
     3600
+}
+
+fn default_export_format() -> String {
+    "zip".to_owned()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -207,6 +241,7 @@ struct TranslationClaim {
     item_ids: BTreeSet<String>,
     source_language: Option<String>,
     target_language: Option<String>,
+    replace_sfx: bool,
     in_progress: bool,
     consumed: bool,
 }
@@ -254,6 +289,46 @@ fn json_result<T: Serialize>(value: &T, is_error: bool) -> CallToolResult {
     }
 }
 
+fn launch_default_browser(url: &str) -> Result<(), FukidashiError> {
+    #[cfg(windows)]
+    {
+        Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(0x0800_0000)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| {
+                FukidashiError::RuntimeUnavailable(format!(
+                    "unable to open the default browser: {error}"
+                ))
+            })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| {
+                FukidashiError::RuntimeUnavailable(format!(
+                    "unable to open the default browser: {error}"
+                ))
+            })
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| {
+                FukidashiError::RuntimeUnavailable(format!(
+                    "unable to open the default browser: {error}"
+                ))
+            })
+    }
+}
+
 fn save_json_atomic(
     path: &std::path::Path,
     value: &serde_json::Value,
@@ -283,6 +358,8 @@ fn compact_analysis(
         .map(|item| {
             serde_json::json!({
                 "id": item.id,
+                "kind": item.kind,
+                "preserve_by_default": item.preserve_by_default,
                 "source_text": item.source_text,
                 "source_language": item.source_language,
                 "confidence": item.confidence,
@@ -312,6 +389,8 @@ const MAX_SAVED_ANALYSIS_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Debug, Clone)]
 struct SavedTranslationItem {
     id: String,
+    kind: String,
+    preserve_by_default: bool,
     source_text: String,
     source_language: String,
     confidence: f32,
@@ -342,15 +421,27 @@ fn read_saved_analysis(
 fn saved_translation_items(
     analysis: &serde_json::Value,
 ) -> Result<Vec<SavedTranslationItem>, FukidashiError> {
-    let items = analysis
+    let Some(items) = analysis
         .get("translation_handoff")
         .and_then(|handoff| handoff.get("items"))
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            FukidashiError::InvalidInput(
-                "analysis checkpoint has no translation_handoff.items array".into(),
-            )
-        })?;
+    else {
+        let has_detected_regions =
+            ["bubbles", "text_lines", "unmatched_text"]
+                .into_iter()
+                .any(|key| {
+                    analysis
+                        .get(key)
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|items| !items.is_empty())
+                });
+        if !has_detected_regions {
+            return Ok(Vec::new());
+        }
+        return Err(FukidashiError::InvalidInput(
+            "analysis checkpoint has no translation_handoff.items array".into(),
+        ));
+    };
     let mut seen = BTreeSet::new();
     let mut parsed = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
@@ -369,6 +460,24 @@ fn saved_translation_items(
                 "analysis checkpoint contains duplicate translation id {id:?}"
             )));
         }
+        // Older checkpoints did not carry a structural class.  Their stable
+        // IDs still give us a backwards-compatible classification boundary.
+        let kind = item
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .filter(|kind| !kind.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if id.starts_with("text-") {
+                    "unmatched_text".to_owned()
+                } else {
+                    "dialogue".to_owned()
+                }
+            });
+        let preserve_by_default = item
+            .get("preserve_by_default")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| kind == "unmatched_text");
         let source_text = item
             .get("source_text")
             .and_then(serde_json::Value::as_str)
@@ -397,6 +506,8 @@ fn saved_translation_items(
         }
         parsed.push(SavedTranslationItem {
             id,
+            kind,
+            preserve_by_default,
             source_text,
             source_language: item
                 .get("source_language")
@@ -434,6 +545,8 @@ fn saved_translation_items(
 fn strict_item_json(item: &SavedTranslationItem) -> serde_json::Value {
     let mut value = serde_json::json!({
         "id": item.id,
+        "kind": item.kind,
+        "preserve_by_default": item.preserve_by_default,
         "source_text": item.source_text,
         "source_language": item.source_language,
         "confidence": item.confidence,
@@ -479,6 +592,40 @@ fn strict_response_items(items: &[SavedTranslationItem]) -> Vec<serde_json::Valu
     items.iter().map(strict_item_json).collect()
 }
 
+fn resolve_sfx_mode(raw: Option<&str>) -> Result<bool, FukidashiError> {
+    match raw.unwrap_or("preserve") {
+        "preserve" => Ok(false),
+        "replace" => Ok(true),
+        value => Err(FukidashiError::InvalidInput(format!(
+            "sfx_mode must be preserve or replace, got {value:?}"
+        ))),
+    }
+}
+
+fn translatable_items(
+    items: &[SavedTranslationItem],
+    replace_sfx: bool,
+) -> Vec<SavedTranslationItem> {
+    items
+        .iter()
+        .filter(|item| replace_sfx || !item.preserve_by_default)
+        .cloned()
+        .collect()
+}
+
+fn preserved_item_json(item: &SavedTranslationItem) -> serde_json::Value {
+    serde_json::json!({
+        "id": item.id,
+        "kind": item.kind,
+        "source_text": item.source_text,
+        "bbox": item.bbox,
+        "translation_allowed": false,
+        "preserved": true,
+        "keep_source": true,
+        "needs_review": item.needs_review,
+    })
+}
+
 impl FukidashiServer {
     fn issue_translation_claim(
         &self,
@@ -486,8 +633,10 @@ impl FukidashiServer {
         analysis: &serde_json::Value,
         source_language: Option<String>,
         target_language: Option<String>,
+        replace_sfx: bool,
     ) -> Result<String, FukidashiError> {
-        let items = saved_translation_items(analysis)?;
+        let all_items = saved_translation_items(analysis)?;
+        let items = translatable_items(&all_items, replace_sfx);
         if items.is_empty() {
             return Err(FukidashiError::InvalidInput(
                 "page has no translation items; keep the page outside the translation scope or review it manually instead of fabricating an unchanged clean artifact".into(),
@@ -509,6 +658,7 @@ impl FukidashiServer {
             item_ids,
             source_language,
             target_language,
+            replace_sfx,
             in_progress: false,
             consumed: false,
         };
@@ -613,17 +763,18 @@ impl FukidashiServer {
             "status": "review_ready",
             "job_id": job_id,
             "next_action": {
-                "tool": "fukidashi_serve_editor",
-                "arguments": {"job_id": job_id},
-            },
-            "wait_for_review": {
-                "tool": "fukidashi_wait_for_review",
+                "tool": "fukidashi_review_and_export",
                 "arguments": {
-                    "review_session_id": "<review_session_id returned by fukidashi_serve_editor>",
-                    "revision": "<revision returned by fukidashi_serve_editor>",
+                    "job_id": job_id,
+                    "format": "zip",
                 },
             },
-            "export_after": "the wait result explicitly approves export",
+            "compatibility_actions": {
+                "serve": {"tool": "fukidashi_serve_editor", "arguments": {"job_id": job_id}},
+                "wait": "call fukidashi_wait_for_review with the returned review_session_id and review_revision",
+                "export": "call fukidashi_export only after explicit approval",
+            },
+            "export_after": "the combined review tool exports only after explicit approval",
         }))
     }
 
@@ -633,8 +784,19 @@ impl FukidashiServer {
         analysis: &serde_json::Value,
         source_language: Option<String>,
         target_language: Option<String>,
+        replace_sfx: bool,
     ) -> Result<serde_json::Value, FukidashiError> {
-        let items = saved_translation_items(analysis)?;
+        let all_items = saved_translation_items(analysis)?;
+        let items = translatable_items(&all_items, replace_sfx);
+        let preserved_items = if replace_sfx {
+            Vec::new()
+        } else {
+            all_items
+                .iter()
+                .filter(|item| item.preserve_by_default)
+                .map(preserved_item_json)
+                .collect::<Vec<_>>()
+        };
         let job_id = pending.job_id.clone();
         if items.is_empty() {
             return Ok(serde_json::json!({
@@ -644,6 +806,9 @@ impl FukidashiServer {
                 "page_number": pending.page_number,
                 "total_pages": pending.total_pages,
                 "translation_items": [],
+                "required_translation_ids": [],
+                "preserved_items": preserved_items,
+                "sfx_mode": if replace_sfx { "replace" } else { "preserve" },
                 "error": "page has no translation items; the server will not fabricate an unchanged clean artifact",
                 "next_action": {
                     "action": "manual_scope_required",
@@ -651,8 +816,13 @@ impl FukidashiServer {
                 },
             }));
         }
-        let token =
-            self.issue_translation_claim(pending, analysis, source_language, target_language)?;
+        let token = self.issue_translation_claim(
+            pending,
+            analysis,
+            source_language,
+            target_language,
+            replace_sfx,
+        )?;
         let ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
         Ok(serde_json::json!({
             "protocol": "strict-v1",
@@ -661,7 +831,9 @@ impl FukidashiServer {
             "page_number": pending.page_number,
             "total_pages": pending.total_pages,
             "page_state": pending.state,
+            "sfx_mode": if replace_sfx { "replace" } else { "preserve" },
             "translation_items": strict_response_items(&items),
+            "preserved_items": preserved_items,
             "required_translation_ids": ids,
             "work_token": token,
             "next_action": {
@@ -734,27 +906,166 @@ impl FukidashiServer {
         .map_err(|error| FukidashiError::Inference(format!("OCR worker failed: {error}")))?
     }
 
+    async fn complete_preserved_page(
+        &self,
+        pending: &PendingPage,
+        analysis: &serde_json::Value,
+    ) -> Result<(), FukidashiError> {
+        let mut preserved = analysis.clone();
+        if preserved
+            .get("translation_handoff")
+            .and_then(serde_json::Value::as_object)
+            .is_none()
+        {
+            preserved["translation_handoff"] = serde_json::json!({
+                "target_language": preserved
+                    .get("target_language")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                "items": [],
+            });
+        }
+        if preserved["translation_handoff"].get("items").is_none() {
+            preserved["translation_handoff"]["items"] = serde_json::json!([]);
+        }
+        let items = saved_translation_items(&preserved)?;
+        if !items.is_empty() {
+            let item_values = preserved["translation_handoff"]["items"]
+                .as_array_mut()
+                .ok_or_else(|| {
+                    FukidashiError::InvalidInput(
+                        "analysis checkpoint has no mutable translation items".into(),
+                    )
+                })?;
+            for item in item_values {
+                item["preserve_by_default"] = serde_json::Value::Bool(true);
+                item["keep_source"] = serde_json::Value::Bool(true);
+                item["translation"] = serde_json::Value::Null;
+                item["status"] = serde_json::Value::String("preserved".into());
+            }
+        }
+        preserved["translation_handoff"]["status"] = serde_json::Value::String("preserved".into());
+        preserved["strict_v1"] = serde_json::json!({
+            "status": "preserved",
+            "sfx_mode": "preserve",
+            "preserved_count": items.len(),
+        });
+        self.workflow
+            .write_analysis_artifact(&pending.source_image, &preserved)
+            .map_err(|error| {
+                FukidashiError::Inference(format!("persist preserved handoff: {error}"))
+            })?;
+
+        let (cleaned_path, _, _) = self
+            .workflow
+            .write_passthrough_clean_artifact(&pending.source_image)
+            .map_err(|error| {
+                FukidashiError::Inference(format!("create pass-through clean stage: {error}"))
+            })?;
+        let page = self
+            .workflow
+            .managed_page(&pending.job_dir, &pending.source_image)
+            .map_err(|error| FukidashiError::InvalidInput(error.to_string()))?;
+        let workflow = Arc::clone(&self.workflow);
+        let job_dir = page.job_dir.clone();
+        let rendered_path = page.rendered_image;
+        tokio::task::spawn_blocking(move || {
+            let _render_lock = workflow
+                .acquire_render_lock(&job_dir)
+                .map_err(|error| FukidashiError::Inference(error.to_string()))?;
+            if rendered_path.is_file() {
+                std::fs::remove_file(&rendered_path).map_err(FukidashiError::Io)?;
+            }
+            let render_sidecar = PathBuf::from(format!(
+                "{}{}",
+                rendered_path.display(),
+                ".fukidashi-render.json"
+            ));
+            if render_sidecar.is_file() {
+                std::fs::remove_file(render_sidecar).map_err(FukidashiError::Io)?;
+            }
+            let report = crate::typeset::typeset_page(&cleaned_path, &[], &rendered_path).map_err(
+                |error| FukidashiError::Inference(format!("pass-through typeset failed: {error}")),
+            )?;
+            let clean = workflow
+                .validate_clean_input(&cleaned_path)
+                .map_err(|error| FukidashiError::Inference(error.to_string()))?;
+            workflow
+                .register_render_locked(
+                    &rendered_path,
+                    &clean,
+                    serde_json::json!({
+                        "request_bubbles": [],
+                        "report": report,
+                    }),
+                    serde_json::json!({"strict_v1": true, "passthrough": true}),
+                )
+                .map_err(|error| {
+                    FukidashiError::Inference(format!("register pass-through render: {error}"))
+                })?;
+            Ok::<_, FukidashiError>(())
+        })
+        .await
+        .map_err(|error| {
+            FukidashiError::Inference(format!("pass-through render worker failed: {error}"))
+        })??;
+        Ok(())
+    }
+
     async fn prepare_strict_page(
         &self,
         pending: PendingPage,
         request: &TranslationStartRequest,
     ) -> Result<serde_json::Value, FukidashiError> {
-        let analysis = if pending.analysis_path.is_file() {
-            read_saved_analysis(&self.workflow, &pending.analysis_path)?
-        } else {
-            self.analyze_strict_page(&pending, request).await?
-        };
-        let source_language = analysis
-            .get("source_language")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| request.source_language.clone());
-        let target_language = analysis
-            .get("target_language")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| request.target_language.clone());
-        self.strict_page_response(&pending, &analysis, source_language, target_language)
+        let replace_sfx = resolve_sfx_mode(request.sfx_mode.as_deref())?;
+        let mut pending = pending;
+        let mut auto_preserved_pages = Vec::new();
+        loop {
+            let analysis = if pending.analysis_path.is_file() {
+                read_saved_analysis(&self.workflow, &pending.analysis_path)?
+            } else {
+                self.analyze_strict_page(&pending, request).await?
+            };
+            let all_items = saved_translation_items(&analysis)?;
+            let items = translatable_items(&all_items, replace_sfx);
+            if !replace_sfx && items.is_empty() {
+                self.complete_preserved_page(&pending, &analysis).await?;
+                auto_preserved_pages.push(pending.page_number);
+                match self.workflow.next_pending_page(&pending.job_dir) {
+                    Ok(Some(next)) => {
+                        pending = next;
+                        continue;
+                    }
+                    Ok(None) => {
+                        let mut response = self.strict_review_ready(&pending.job_dir)?;
+                        response["auto_preserved_pages"] = serde_json::json!(auto_preserved_pages);
+                        return Ok(response);
+                    }
+                    Err(error) => return Err(FukidashiError::InvalidInput(error.to_string())),
+                }
+            }
+            let source_language = analysis
+                .get("source_language")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| request.source_language.clone());
+            let target_language = analysis
+                .get("target_language")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| request.target_language.clone());
+            let mut response = self.strict_page_response(
+                &pending,
+                &analysis,
+                source_language,
+                target_language,
+                replace_sfx,
+            )?;
+            if !auto_preserved_pages.is_empty() {
+                response["auto_preserved_pages"] = serde_json::json!(auto_preserved_pages);
+            }
+            return Ok(response);
+        }
     }
 
     fn resolve_strict_job(
@@ -806,7 +1117,8 @@ impl FukidashiServer {
         claim: &TranslationClaim,
         submissions: &[TranslationSubmission],
     ) -> Result<Vec<TypesetPayload>, FukidashiError> {
-        let items = saved_translation_items(analysis)?;
+        let all_items = saved_translation_items(analysis)?;
+        let items = translatable_items(&all_items, claim.replace_sfx);
         let index_by_id = items
             .iter()
             .enumerate()
@@ -861,7 +1173,7 @@ impl FukidashiServer {
                 }
                 text.to_owned()
             };
-            selected.push(((*index, id.to_owned()), text, keep_source, needs_review));
+            selected.push((id.to_owned(), text, keep_source, needs_review));
         }
         if seen != claim.item_ids {
             let missing = claim
@@ -884,10 +1196,15 @@ impl FukidashiServer {
                 )
             })?;
         let mut payloads = Vec::with_capacity(selected.len());
-        for ((index, id), text, keep_source, needs_review) in selected {
-            let item = item_values.get_mut(index).ok_or_else(|| {
-                FukidashiError::InvalidInput(format!("translation id {id:?} disappeared"))
-            })?;
+        for (id, text, keep_source, needs_review) in selected {
+            let item = item_values
+                .iter_mut()
+                .find(|item| {
+                    item.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                })
+                .ok_or_else(|| {
+                    FukidashiError::InvalidInput(format!("translation id {id:?} disappeared"))
+                })?;
             item["translation"] = serde_json::Value::String(text.clone());
             item["keep_source"] = serde_json::Value::Bool(keep_source);
             item["needs_review"] = serde_json::Value::Bool(needs_review);
@@ -903,6 +1220,20 @@ impl FukidashiServer {
             );
             let bbox = serde_json::from_value::<Rect>(item["bbox"].clone())?.validate()?;
             payloads.push(TypesetPayload {
+                id: Some(id.clone()),
+                source_text: item
+                    .get("source_text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                kind: item
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                preserve_by_default: item
+                    .get("preserve_by_default")
+                    .and_then(serde_json::Value::as_bool),
+                needs_review: Some(needs_review),
+                flagged: Some(needs_review),
                 bbox,
                 bubble_bbox: None,
                 text_bbox: None,
@@ -914,8 +1245,43 @@ impl FukidashiServer {
                 shape: None,
             });
         }
+        if !claim.replace_sfx {
+            for item in item_values.iter_mut() {
+                let preserve = item
+                    .get("preserve_by_default")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_else(|| {
+                        item.get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|kind| kind == "unmatched_text")
+                            .or_else(|| {
+                                item.get("id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|id| id.starts_with("text-"))
+                            })
+                            .unwrap_or(false)
+                    });
+                if preserve {
+                    item["preserve_by_default"] = serde_json::Value::Bool(true);
+                    item["keep_source"] = serde_json::Value::Bool(true);
+                    item["translation"] = serde_json::Value::Null;
+                    item["status"] = serde_json::Value::String("preserved".into());
+                }
+            }
+        }
         analysis["translation_handoff"]["status"] = serde_json::Value::String("submitted".into());
-        analysis["strict_v1"] = serde_json::json!({"status": "submitted"});
+        analysis["strict_v1"] = serde_json::json!({
+            "status": "submitted",
+            "sfx_mode": if claim.replace_sfx { "replace" } else { "preserve" },
+            "preserved_count": if claim.replace_sfx {
+                0
+            } else {
+                all_items
+                    .iter()
+                    .filter(|item| item.preserve_by_default)
+                    .count()
+            },
+        });
         Ok(payloads)
     }
 }
@@ -990,7 +1356,14 @@ fn resolve_analysis_scope(scope: &AnalyzeScope) -> Result<ScopeSpec, FukidashiEr
     })
 }
 
-fn checkpoint_text_regions(path: &std::path::Path) -> Result<Vec<Rect>, FukidashiError> {
+fn rects_overlap(left: Rect, right: Rect) -> bool {
+    left.x1 < right.x2 && right.x1 < left.x2 && left.y1 < right.y2 && right.y1 < left.y2
+}
+
+fn checkpoint_text_regions(
+    path: &std::path::Path,
+    replace_sfx: bool,
+) -> Result<Vec<Rect>, FukidashiError> {
     const MAX_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_file() || metadata.len() > MAX_CHECKPOINT_BYTES {
@@ -999,13 +1372,41 @@ fn checkpoint_text_regions(path: &std::path::Path) -> Result<Vec<Rect>, Fukidash
         ));
     }
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let preserved_bboxes = if replace_sfx {
+        Vec::new()
+    } else {
+        value
+            .get("translation_handoff")
+            .and_then(|handoff| handoff.get("items"))
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item.get("preserve_by_default")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_else(|| {
+                        item.get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|kind| kind == "unmatched_text")
+                            .or_else(|| {
+                                item.get("id")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|id| id.starts_with("text-"))
+                            })
+                            .unwrap_or(false)
+                    })
+            })
+            .filter_map(|item| serde_json::from_value::<Rect>(item.get("bbox").cloned()?).ok())
+            .filter_map(|rect| rect.validate().ok())
+            .collect::<Vec<_>>()
+    };
     let lines = value
         .get("text_lines")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| {
             FukidashiError::InvalidInput("analysis checkpoint has no text_lines array".into())
         })?;
-    lines
+    let regions = lines
         .iter()
         // Low-confidence unmatched detections are commonly art/sfx geometry
         // (for example the dots on a chastity device), not text strokes.  Do
@@ -1021,14 +1422,22 @@ fn checkpoint_text_regions(path: &std::path::Path) -> Result<Vec<Rect>, Fukidash
                 .map_err(FukidashiError::from)
                 .and_then(Rect::validate)
         })
-        .collect()
+        .collect::<std::result::Result<Vec<_>, FukidashiError>>()?;
+    Ok(regions
+        .into_iter()
+        .filter(|rect| {
+            !preserved_bboxes
+                .iter()
+                .any(|preserved| rects_overlap(*rect, *preserved))
+        })
+        .collect())
 }
 
 #[tool_router]
 impl FukidashiServer {
     #[tool(
         name = "fukidashi_translation_start",
-        description = "Strict-v1 server-owned translation loop. Start from one source image or resume with job_id/job_path. The server analyzes or reuses the first unfinished page and returns compact stable translation items plus an opaque work_token. Do not inspect managed job files or construct artifact paths; the submit call accepts only that token and the exact item IDs."
+        description = "Strict-v1 server-owned translation loop. Start from one source image or resume with job_id/job_path. The server analyzes or reuses the first unfinished page and returns compact stable translation items plus an opaque work_token. sfx_mode=preserve (default) keeps structurally unmatched text-* items out of translation, cleaning, and typesetting; preserve-only pages receive a verified pass-through stage and advance automatically; use replace only explicitly. Do not inspect managed job files or construct artifact paths; the submit call accepts only that token and the exact item IDs."
     )]
     pub async fn translation_start(
         &self,
@@ -1042,6 +1451,16 @@ impl FukidashiServer {
                     "protocol": "strict-v1",
                     "error": "ocr_mode must be local or auto",
                     "next_step": "retry fukidashi_translation_start with ocr_mode=local or omit it"
+                }),
+                true,
+            );
+        }
+        if let Err(error) = resolve_sfx_mode(req.sfx_mode.as_deref()) {
+            return json_result(
+                &serde_json::json!({
+                    "protocol": "strict-v1",
+                    "error": error.to_string(),
+                    "next_step": "retry fukidashi_translation_start with sfx_mode=preserve or sfx_mode=replace"
                 }),
                 true,
             );
@@ -1236,6 +1655,11 @@ impl FukidashiServer {
                 text_regions: Vec::new(),
                 crop_padding: None,
                 crop_minimum_size: None,
+                sfx_mode: Some(if claim.replace_sfx {
+                    "replace".into()
+                } else {
+                    "preserve".into()
+                }),
             };
             let clean_result = self.clean_page(Parameters(clean_request)).await;
             let _ = self
@@ -1307,6 +1731,11 @@ impl FukidashiServer {
                     source_language: claim.source_language.clone(),
                     target_language: claim.target_language.clone(),
                     scope: None,
+                    sfx_mode: Some(if claim.replace_sfx {
+                        "replace".into()
+                    } else {
+                        "preserve".into()
+                    }),
                 };
                 self.prepare_strict_page(next, &next_request).await
             }
@@ -1564,7 +1993,7 @@ impl FukidashiServer {
     }
     #[tool(
         name = "fukidashi_clean_page",
-        description = "Remove text strokes with LaMa. mode=full preserves page inference; mode=crop requires mask_path, text_regions, or a full analysis_path and avoids detection/OCR."
+        description = "Remove text strokes with LaMa. mode=full preserves page inference; mode=crop requires mask_path, text_regions, or a full analysis_path and avoids detection/OCR. sfx_mode=preserve (default) excludes structurally unmatched text-* regions from analysis-derived cleaning; use replace explicitly."
     )]
     pub async fn clean_page(&self, Parameters(req): Parameters<CleanRequest>) -> CallToolResult {
         let image_path = match path(&req.image_path) {
@@ -1588,6 +2017,12 @@ impl FukidashiServer {
                 true,
             );
         }
+        let replace_sfx = match resolve_sfx_mode(req.sfx_mode.as_deref()) {
+            Ok(value) => value,
+            Err(error) => {
+                return json_result(&serde_json::json!({"error": error.to_string()}), true);
+            }
+        };
         let mut text_regions = req.text_regions;
         if let Some(analysis_path) = req.analysis_path.as_deref() {
             let analysis_path = match path(analysis_path) {
@@ -1611,7 +2046,7 @@ impl FukidashiServer {
                     );
                 }
             };
-            match checkpoint_text_regions(&analysis_path) {
+            match checkpoint_text_regions(&analysis_path, replace_sfx) {
                 Ok(mut regions) => text_regions.append(&mut regions),
                 Err(error) => {
                     return json_result(&serde_json::json!({"error":error.to_string()}), true);
@@ -1693,6 +2128,7 @@ impl FukidashiServer {
             value["masked_pixels"] = value["workflow"]["masked_pixels"].clone();
             value["dilation"] = serde_json::json!(dilation);
             value["mode"] = serde_json::json!(mode);
+            value["sfx_mode"] = serde_json::json!(if replace_sfx { "replace" } else { "preserve" });
             value["elapsed_seconds"] = serde_json::json!(started.elapsed().as_secs_f64());
             value["crop_count"] = serde_json::json!(crops.len());
             value["crops"] = serde_json::json!(crops);
@@ -1908,6 +2344,207 @@ impl FukidashiServer {
             ),
         }
     }
+
+    async fn review_and_export_inner<F>(
+        &self,
+        req: ReviewAndExportRequest,
+        launch: F,
+    ) -> CallToolResult
+    where
+        F: FnOnce(&str) -> Result<(), FukidashiError>,
+    {
+        if !matches!(req.format.as_str(), "zip" | "epub" | "html_monolith") {
+            return json_result(
+                &serde_json::json!({
+                    "protocol": "review-v1",
+                    "error": "format must be zip, epub, or html_monolith"
+                }),
+                true,
+            );
+        }
+        let served = self
+            .serve_editor(Parameters(EditorRequest {
+                image_path: req.image_path,
+                job_path: req.job_path,
+                job_id: req.job_id,
+                json_data: None,
+            }))
+            .await;
+        let served = match extract_tool_json(served, "serve editor") {
+            Ok(value) => value,
+            Err(error) => {
+                return json_result(
+                    &serde_json::json!({
+                        "protocol": "review-v1",
+                        "error": error.to_string(),
+                        "next_step": "finish every page and call fukidashi_review_and_export with the exact managed job id"
+                    }),
+                    true,
+                );
+            }
+        };
+        let url = match served.get("url").and_then(serde_json::Value::as_str) {
+            Some(value) => value.to_owned(),
+            None => {
+                return json_result(
+                    &serde_json::json!({"protocol":"review-v1","error":"serve editor returned no review URL"}),
+                    true,
+                );
+            }
+        };
+
+        let review_session_id = match served
+            .get("review_session_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(value) => value.to_owned(),
+            None => {
+                return json_result(
+                    &serde_json::json!({"protocol":"review-v1","error":"serve editor returned no review_session_id","editor_url":url}),
+                    true,
+                );
+            }
+        };
+        let revision = match served
+            .get("review_revision")
+            .and_then(serde_json::Value::as_u64)
+        {
+            Some(value) => value,
+            None => {
+                return json_result(
+                    &serde_json::json!({"protocol":"review-v1","error":"serve editor returned no review_revision","editor_url":url}),
+                    true,
+                );
+            }
+        };
+        if let Err(error) = launch(&url) {
+            return json_result(
+                &serde_json::json!({
+                    "protocol": "review-v1",
+                    "status": "browser_launch_failed",
+                    "editor_url": url,
+                    "review_session_id": review_session_id,
+                    "review_revision": revision,
+                    "error": error.to_string(),
+                    "next_action": {
+                        "tool": "fukidashi_wait_for_review",
+                        "arguments": {
+                            "review_session_id": review_session_id,
+                            "revision": revision,
+                            "timeout_seconds": req.timeout_seconds,
+                        },
+                    },
+                }),
+                true,
+            );
+        }
+        let review =
+            match crate::editor::wait_for_review(&review_session_id, revision, req.timeout_seconds)
+                .await
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    let value = serde_json::json!({
+                        "protocol": "review-v1",
+                        "status": "review_wait_failed",
+                        "editor_url": url,
+                        "review_session_id": review_session_id,
+                        "review_revision": revision,
+                        "error": error.to_string(),
+                    });
+                    return json_result(&value, true);
+                }
+            };
+        let action = review
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if action == "request_fixes" {
+            let value = serde_json::json!({
+                "protocol": "review-v1",
+                "status": "fixes_requested",
+                "editor_url": url,
+                "review": review,
+                "feedback": review.get("feedback").cloned().unwrap_or(serde_json::Value::Array(Vec::new())),
+                "next_action": "apply the returned feedback, serve the editor again, and call fukidashi_review_and_export",
+            });
+            return json_result(&value, false);
+        }
+        if action != "approve_export" {
+            return json_result(
+                &serde_json::json!({
+                    "protocol": "review-v1",
+                    "status": "review_wait_failed",
+                    "editor_url": url,
+                    "error": "review returned no supported action"
+                }),
+                true,
+            );
+        }
+        let persistence_path = match served
+            .get("persistence_path")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(value) => PathBuf::from(value),
+            None => {
+                return json_result(
+                    &serde_json::json!({"protocol":"review-v1","status":"approved_export_blocked","editor_url":url,"error":"serve editor returned no persistence path"}),
+                    true,
+                );
+            }
+        };
+        let project_dir = match persistence_path.parent() {
+            Some(value) => value.to_path_buf(),
+            None => {
+                return json_result(
+                    &serde_json::json!({"protocol":"review-v1","status":"approved_export_blocked","editor_url":url,"error":"review persistence path has no managed job parent"}),
+                    true,
+                );
+            }
+        };
+        let export = self
+            .export(Parameters(ExportRequest {
+                project_dir: project_dir.display().to_string(),
+                format: req.format,
+            }))
+            .await;
+        match extract_tool_json(export, "review export") {
+            Ok(export) => {
+                let value = serde_json::json!({
+                    "protocol": "review-v1",
+                    "status": "exported",
+                    "editor_url": url,
+                    "review": review,
+                    "export": export,
+                });
+                json_result(&value, false)
+            }
+            Err(error) => json_result(
+                &serde_json::json!({
+                    "protocol": "review-v1",
+                    "status": "approved_export_blocked",
+                    "editor_url": url,
+                    "review": review,
+                    "error": error.to_string(),
+                    "next_action": "resolve the export validation error and call fukidashi_export with the exact managed project directory"
+                }),
+                true,
+            ),
+        }
+    }
+
+    #[tool(
+        name = "fukidashi_review_and_export",
+        description = "Serve the managed local editor, open it in the platform default browser, and keep this single MCP call pending until the user submits review. Return actionable feedback when fixes are requested; after explicit approval automatically export the requested format (default zip). The server owns the review session and exact managed paths."
+    )]
+    pub async fn review_and_export(
+        &self,
+        Parameters(req): Parameters<ReviewAndExportRequest>,
+    ) -> CallToolResult {
+        self.review_and_export_inner(req, launch_default_browser)
+            .await
+    }
+
     #[tool(
         name = "fukidashi_serve_editor",
         description = "Serve the local loopback comic editor. Reopen an existing managed job with job_path (directory or job.json; legacy .fukidashi-job.json is also accepted) or job_id; the server selects a verified render and reconstructs every page. image_path remains supported for a known rendered artifact; json_data is metadata only."
@@ -2190,18 +2827,22 @@ impl ServerHandler for FukidashiServer {
             ))
             .with_instructions(
                 "Local managed comic-translation workflow. Prefer the strict-v1 two-call loop: call \
-fukidashi_translation_start with one source image, job_path, or job_id, then call \
-fukidashi_translation_submit with only the returned work_token and one structured decision for \
-each required_translation_ids entry. The server owns page selection, analysis, clean, typeset, \
-stage reuse, model release, and advancement. Use keep_source=true and/or needs_review=true for \
-uncertain OCR instead of aborting. Never shell-read managed manifests/checkpoints, import or \
-search for Fukidashi packages, invent artifact paths, or pass artifact paths to the strict submit \
-call. After the final submission, call fukidashi_serve_editor with its exact returned job_id and \
-immediately call fukidashi_wait_for_review with the returned review_session_id and revision. \
-Export only after review explicitly approves. Primitive fukidashi_analyze_page, \
-fukidashi_clean_page, and fukidashi_typeset tools remain available for compatibility; pass \
-their exact server-returned paths and stable IDs. Use \
-fukidashi_release_models between bounded legacy batches on memory-constrained machines.",
+                fukidashi_translation_start with one source image, job_path, or job_id, then call \
+                fukidashi_translation_submit with only the returned work_token and one structured decision for \
+                each required_translation_ids entry. The server owns page selection, analysis, clean, typeset, \
+                stage reuse, model release, and advancement. sfx_mode=preserve is the default: structurally \
+                unmatched text-* items are reported as preserved audit data and are excluded from required \
+                translations, cleaning, and typesetting; preserve-only pages get a verified pass-through stage; \
+                use sfx_mode=replace only when explicitly requested. \
+                Use keep_source=true and/or needs_review=true for uncertain OCR instead of aborting. Never \
+                shell-read managed manifests/checkpoints, import or search for Fukidashi packages, invent artifact \
+                paths, or pass artifact paths to the strict submit call. After review_ready, call \
+                fukidashi_review_and_export with the exact returned job_id; it opens the local editor and keeps \
+                the single MCP call pending until review, returning feedback or exporting zip after approval. \
+                fukidashi_serve_editor and fukidashi_wait_for_review remain compatibility tools. Primitive \
+                fukidashi_analyze_page, fukidashi_clean_page, and fukidashi_typeset tools remain available for \
+                compatibility; pass their exact server-returned paths and stable IDs. Use \
+                fukidashi_release_models between bounded legacy batches on memory-constrained machines.",
             )
     }
 }
@@ -2242,9 +2883,11 @@ mod tests {
         assert_eq!(info.server_info.name, "fukidashi-mcp");
         assert!(instructions.contains("fukidashi_translation_start"));
         assert!(instructions.contains("fukidashi_translation_submit"));
+        assert!(instructions.contains("fukidashi_review_and_export"));
+        assert!(instructions.contains("sfx_mode=preserve"));
         assert!(instructions.contains("fukidashi_analyze_page"));
         assert!(instructions.contains("fukidashi_wait_for_review"));
-        assert!(instructions.contains("Export only after review"));
+        assert!(instructions.contains("after approval"));
     }
 
     fn test_config(root: &std::path::Path) -> Config {
@@ -2282,9 +2925,77 @@ mod tests {
                     "correction_applied": false,
                     "bbox": {"x1": 1.0, "y1": 1.0, "x2": 15.0, "y2": 15.0},
                     "status": "pending"
+                }, {
+                    "id": "text-sfx",
+                    "source_text": "クス",
+                    "ocr_text": "クス",
+                    "source_language": "ja",
+                    "confidence": 0.92,
+                    "correction_applied": false,
+                    "kind": "unmatched_text",
+                    "preserve_by_default": true,
+                    "bbox": {"x1": 2.0, "y1": 2.0, "x2": 8.0, "y2": 8.0},
+                    "status": "pending"
                 }]
             }
         })
+    }
+
+    #[test]
+    fn strict_sfx_policy_preserves_legacy_text_ids_by_default() {
+        let items = saved_translation_items(&strict_fixture_analysis()).unwrap();
+        let preserved = translatable_items(&items, false);
+        let replaced = translatable_items(&items, true);
+        assert_eq!(
+            preserved
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["bubble-1"]
+        );
+        assert_eq!(replaced.len(), 2);
+        assert_eq!(items[1].kind, "unmatched_text");
+        assert!(items[1].preserve_by_default);
+        assert_eq!(preserved_item_json(&items[1])["translation_allowed"], false);
+    }
+
+    #[test]
+    fn strict_submission_updates_dialogue_by_id_when_preserved_text_is_first() {
+        let mut analysis = strict_fixture_analysis();
+        let items = analysis["translation_handoff"]["items"]
+            .as_array_mut()
+            .unwrap();
+        items.swap(0, 1);
+        let claim = TranslationClaim {
+            job_dir: PathBuf::from("C:/jobs/job"),
+            source_image: PathBuf::from("C:/source/page.png"),
+            page_number: 1,
+            total_pages: 1,
+            analysis_path: PathBuf::from("C:/jobs/job/pages/0001/analysis.json"),
+            analysis_sha256: "hash".into(),
+            item_ids: ["bubble-1".into()].into_iter().collect(),
+            source_language: Some("ja".into()),
+            target_language: Some("vi".into()),
+            replace_sfx: false,
+            in_progress: true,
+            consumed: false,
+        };
+        FukidashiServer::apply_strict_translations(
+            &mut analysis,
+            &claim,
+            &[TranslationSubmission {
+                id: "bubble-1".into(),
+                translation: Some("dịch".into()),
+                keep_source: Some(false),
+                needs_review: Some(false),
+            }],
+        )
+        .unwrap();
+        let saved = analysis["translation_handoff"]["items"].as_array().unwrap();
+        assert_eq!(saved[0]["id"], "text-sfx");
+        assert_eq!(saved[0]["status"], "preserved");
+        assert_eq!(saved[1]["id"], "bubble-1");
+        assert_eq!(saved[1]["translation"], "dịch");
     }
 
     #[tokio::test]
@@ -2312,14 +3023,20 @@ mod tests {
         let server = FukidashiServer::new(config).unwrap();
         let result = server
             .translation_start(Parameters(TranslationStartRequest {
-                job_id: Some(job_id),
+                job_id: Some(job_id.clone()),
                 ..Default::default()
             }))
             .await;
         let value = extract_tool_json(result, "strict start").unwrap();
         assert_eq!(value["protocol"], "strict-v1");
         assert_eq!(value["status"], "page_ready");
+        assert_eq!(value["sfx_mode"], "preserve");
         assert_eq!(value["translation_items"][0]["id"], "bubble-1");
+        assert_eq!(
+            value["required_translation_ids"],
+            serde_json::json!(["bubble-1"])
+        );
+        assert_eq!(value["preserved_items"][0]["id"], "text-sfx");
         assert!(
             value["work_token"]
                 .as_str()
@@ -2332,6 +3049,244 @@ mod tests {
                 .to_string()
                 .contains(source.to_string_lossy().as_ref())
         );
+        let replace = server
+            .translation_start(Parameters(TranslationStartRequest {
+                job_id: Some(job_id),
+                sfx_mode: Some("replace".into()),
+                ..Default::default()
+            }))
+            .await;
+        let replace = extract_tool_json(replace, "strict replace start").unwrap();
+        assert_eq!(replace["sfx_mode"], "replace");
+        assert_eq!(replace["translation_items"].as_array().unwrap().len(), 2);
+        assert_eq!(replace["preserved_items"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn preserve_only_page_creates_pass_through_render_and_advances() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("comic");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("cover.png");
+        image::RgbImage::from_pixel(24, 24, image::Rgb([240, 240, 240]))
+            .save(&source)
+            .unwrap();
+        let config = test_config(temp.path());
+        let workflow = Workflow::new(config.jobs_dir()).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+        let analysis = serde_json::json!({
+            "source_language": "ja",
+            "target_language": "vi",
+            "bubbles": [],
+            "text_lines": [],
+            "unmatched_text": [],
+            "translation_handoff": {"target_language":"vi","status":"pending","items":[]}
+        });
+        workflow
+            .write_analysis_artifact(&source, &analysis)
+            .unwrap();
+        let job_id = registration
+            .job_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let server = FukidashiServer::new(config).unwrap();
+        let result = server
+            .translation_start(Parameters(TranslationStartRequest {
+                job_id: Some(job_id.clone()),
+                ..Default::default()
+            }))
+            .await;
+        let value = extract_tool_json(result, "preserve-only start").unwrap();
+        assert_eq!(value["status"], "review_ready");
+        assert_eq!(value["auto_preserved_pages"], serde_json::json!([1]));
+        let page = server
+            .workflow
+            .managed_page(&registration.job_dir, &source)
+            .unwrap();
+        assert_eq!(page.state, "rendered");
+        let clean = server
+            .workflow
+            .validate_clean_input(&page.cleaned_image)
+            .unwrap();
+        assert!(clean.passthrough);
+        assert!(
+            server
+                .workflow
+                .validate_render_input(&page.rendered_image)
+                .is_ok()
+        );
+        assert!(
+            server
+                .workflow
+                .next_pending_page(&registration.job_dir)
+                .unwrap()
+                .is_none()
+        );
+
+        // The same path handles an SFX-only analysis and records it as
+        // preserved audit data instead of dead-ending with manual scope.
+        let second_source_dir = temp.path().join("sfx-comic");
+        std::fs::create_dir_all(&second_source_dir).unwrap();
+        let second_source = second_source_dir.join("sfx-only.png");
+        image::RgbImage::from_pixel(24, 24, image::Rgb([240, 240, 240]))
+            .save(&second_source)
+            .unwrap();
+        let second = server
+            .workflow
+            .register_analysis(&second_source, None)
+            .unwrap();
+        let mut sfx = strict_fixture_analysis();
+        let items = sfx["translation_handoff"]["items"].as_array_mut().unwrap();
+        items.remove(0);
+        sfx["bubbles"] = serde_json::json!([]);
+        sfx["text_lines"] = serde_json::json!([]);
+        sfx["unmatched_text"] = serde_json::json!([]);
+        server
+            .workflow
+            .write_analysis_artifact(&second_source, &sfx)
+            .unwrap();
+        let result = server
+            .translation_start(Parameters(TranslationStartRequest {
+                job_id: Some(
+                    second
+                        .job_dir
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
+                ..Default::default()
+            }))
+            .await;
+        let value = extract_tool_json(result, "sfx-only start").unwrap();
+        assert_eq!(value["status"], "review_ready");
+        assert_eq!(value["auto_preserved_pages"], serde_json::json!([1]));
+    }
+
+    #[tokio::test]
+    async fn combined_review_call_waits_for_approval_then_exports_zip() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("comic");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("page-1.png");
+        let mut source_image = image::RgbImage::from_pixel(32, 32, image::Rgb([255, 255, 255]));
+        source_image.put_pixel(3, 3, image::Rgb([0, 0, 0]));
+        source_image.save(&source).unwrap();
+
+        let config = test_config(temp.path());
+        let workflow = Workflow::new(config.jobs_dir()).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+        let cleaned = image::RgbImage::from_pixel(32, 32, image::Rgb([255, 255, 255]));
+        let mut mask = image::GrayImage::new(32, 32);
+        mask.put_pixel(3, 3, image::Luma([255]));
+        let (cleaned_path, _, _) = workflow
+            .write_clean_artifact(&source, &cleaned, &mask, 3, "full")
+            .unwrap();
+        let rendered_path = workflow.page_artifacts_for_source(&source).unwrap().4;
+        crate::typeset::typeset_page(&cleaned_path, &[], &rendered_path).unwrap();
+        let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
+        workflow
+            .register_render(
+                &rendered_path,
+                &clean,
+                serde_json::json!({"request_bubbles": [], "report": {"bubbles": []}}),
+                serde_json::json!({}),
+            )
+            .unwrap();
+
+        let job_id = registration
+            .job_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let review_path = registration.job_dir.join("review.json");
+        let server = FukidashiServer::new(config).unwrap();
+        let review_request = ReviewAndExportRequest {
+            job_id: Some(job_id),
+            job_path: None,
+            image_path: None,
+            format: "zip".into(),
+            timeout_seconds: 10,
+        };
+        let failed = server
+            .review_and_export_inner(review_request.clone(), |_| {
+                Err(FukidashiError::RuntimeUnavailable(
+                    "test browser unavailable".into(),
+                ))
+            })
+            .await;
+        let failed_text = failed
+            .content
+            .into_iter()
+            .find_map(|block| match block {
+                ContentBlock::Text(value) => Some(value.text),
+                _ => None,
+            })
+            .unwrap();
+        let failed_value: serde_json::Value = serde_json::from_str(&failed_text).unwrap();
+        assert_eq!(failed_value["status"], "browser_launch_failed");
+        assert!(failed_value["editor_url"].as_str().is_some());
+        assert_eq!(
+            failed_value["next_action"]["tool"],
+            "fukidashi_wait_for_review"
+        );
+        assert!(
+            failed_value["next_action"]["arguments"]["review_session_id"]
+                .as_str()
+                .is_some()
+        );
+        let result = server
+            .review_and_export_inner(
+                review_request,
+                move |url| {
+                    let endpoint = url.strip_prefix("http://").ok_or_else(|| {
+                        FukidashiError::RuntimeUnavailable("test editor URL is not HTTP".into())
+                    })?;
+                    let (host, suffix) = endpoint.split_once('/').ok_or_else(|| {
+                        FukidashiError::RuntimeUnavailable("test editor URL has no token".into())
+                    })?;
+                    let review: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(&review_path).map_err(FukidashiError::Io)?,
+                    )?;
+                    let revision = review["revision"].as_u64().ok_or_else(|| {
+                        FukidashiError::RuntimeUnavailable("test review has no revision".into())
+                    })?;
+                    let token = suffix.trim_end_matches('/');
+                    let request_path = format!("/{token}/review/submit");
+                    let body = serde_json::json!({
+                        "revision": revision,
+                        "action": "approve_export",
+                        "approved_pages": [0]
+                    })
+                    .to_string();
+                    let mut stream = std::net::TcpStream::connect(host)?;
+                    use std::io::{Read, Write};
+                    write!(
+                        stream,
+                        "POST {request_path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )?;
+                    let mut response = Vec::new();
+                    stream.read_to_end(&mut response)?;
+                    if !response.starts_with(b"HTTP/1.1 200") {
+                        return Err(FukidashiError::RuntimeUnavailable(
+                            String::from_utf8_lossy(&response).into_owned(),
+                        ));
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+        let value = extract_tool_json(result, "combined review/export").unwrap();
+        assert_eq!(value["protocol"], "review-v1");
+        assert_eq!(value["status"], "exported");
+        assert_eq!(value["review"]["action"], "approve_export");
+        let output = value["export"]["output_path"].as_str().unwrap();
+        assert!(std::path::Path::new(output).is_file());
+        assert!(output.ends_with(".zip"));
     }
 
     #[test]
@@ -2347,6 +3302,7 @@ mod tests {
             item_ids: ["bubble-1".into()].into_iter().collect(),
             source_language: Some("ja".into()),
             target_language: Some("vi".into()),
+            replace_sfx: false,
             in_progress: true,
             consumed: false,
         };
@@ -2401,6 +3357,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payloads[0].text, "原文");
+        assert_eq!(payloads[0].needs_review, Some(true));
+        assert_eq!(payloads[0].flagged, Some(true));
         assert_eq!(
             analysis["translation_handoff"]["items"][0]["keep_source"],
             true
@@ -2453,6 +3411,8 @@ mod tests {
                 status: "pending",
                 items: vec![TranslationItem {
                     id: "bubble-1".into(),
+                    kind: "dialogue".into(),
+                    preserve_by_default: false,
                     source_text: "原文".into(),
                     ocr_text: "原文".into(),
                     confidence: 0.9,
@@ -2502,6 +3462,12 @@ mod tests {
         let request = TypesetRequest {
             image_path: "E:/clean.png".into(),
             bubbles: vec![TypesetPayload {
+                id: None,
+                source_text: None,
+                kind: None,
+                preserve_by_default: None,
+                needs_review: None,
+                flagged: None,
                 bbox,
                 bubble_bbox: None,
                 text_bbox: None,
@@ -2544,6 +3510,12 @@ mod tests {
             y2: 40.0,
         };
         let mut bubbles = vec![TypesetPayload {
+            id: None,
+            source_text: None,
+            kind: None,
+            preserve_by_default: None,
+            needs_review: None,
+            flagged: None,
             bbox,
             bubble_bbox: None,
             text_bbox: None,

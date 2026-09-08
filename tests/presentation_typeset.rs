@@ -40,6 +40,12 @@ fn narrow_tall_comic_bubble_fits_vietnamese_dialogue() {
     let report = fukidashi_mcp::typeset::typeset_page_with_fallbacks(
         &source,
         &[TypesetPayload {
+            id: None,
+            source_text: None,
+            kind: None,
+            preserve_by_default: None,
+            needs_review: None,
+            flagged: None,
             bbox,
             bubble_bbox: None,
             text_bbox: None,
@@ -163,6 +169,12 @@ fn raster_output_is_png_and_does_not_modify_source() {
     let original = ImageBuffer::<Rgba<u8>, _>::from_pixel(200, 120, Rgba([240, 240, 240, 255]));
     original.save(&source).unwrap();
     let payload = TypesetPayload {
+        id: None,
+        source_text: None,
+        kind: None,
+        preserve_by_default: None,
+        needs_review: None,
+        flagged: None,
         bbox: Rect {
             x1: 20.0,
             y1: 20.0,

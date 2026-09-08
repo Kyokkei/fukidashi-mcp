@@ -49,6 +49,11 @@ pub struct CleanArtifact {
     pub cleaned_dark_pixels: u64,
     #[serde(default)]
     pub dark_pixel_reduction_ratio: f64,
+    /// A preserve-mode page may have no translatable pixels. Its clean stage
+    /// is an explicit server-owned pass-through of the source image rather
+    /// than an inference result with a fabricated mask.
+    #[serde(default)]
+    pub passthrough: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1060,6 +1065,7 @@ impl Workflow {
             source_dark_pixels,
             cleaned_dark_pixels,
             dark_pixel_reduction_ratio,
+            passthrough: false,
         };
         atomic_json(&sidecar_path, &serde_json::to_value(&artifact)?)?;
         let entry = manifest
@@ -1088,6 +1094,70 @@ impl Workflow {
             }
         });
         Ok((artifact.cleaned_image, artifact.mask_path, value))
+    }
+
+    /// Create a verified clean stage for a preserve-mode page with no
+    /// translatable dialogue. The unchanged image is intentional: the server
+    /// records this as an explicit pass-through so it can advance without
+    /// pretending an inpainting mask removed text.
+    pub fn write_passthrough_clean_artifact(
+        &self,
+        source: &Path,
+    ) -> Result<(PathBuf, PathBuf, serde_json::Value)> {
+        let source = canonical_path(source)
+            .with_context(|| format!("resolve source image {}", source.display()))?;
+        let source_image = image::open(&source).context("decode source image for pass-through")?;
+        let dimensions = source_image.dimensions();
+        let source_rgb = source_image.to_rgb8();
+        let job = self.allocate_job_for_source(&source)?;
+        let _render_lock = self.acquire_render_lock(&job)?;
+        let _manifest_lock = acquire_manifest_lock(&job)?;
+        let mut manifest = load_manifest(&job)?;
+        let paths = page_artifacts(&job, &manifest, &source)?;
+        save_image_atomic(&paths.cleaned, &source_rgb).context("write pass-through clean image")?;
+        save_gray_image_atomic(&paths.mask, &GrayImage::new(dimensions.0, dimensions.1))
+            .context("write pass-through clean mask")?;
+        let source_sha256 = sha256_file(&source)?;
+        let artifact = CleanArtifact {
+            stage: "cleaned".into(),
+            source_image: source.clone(),
+            cleaned_image: paths.cleaned.clone(),
+            mask_path: paths.mask.clone(),
+            source_sha256: source_sha256.clone(),
+            cleaned_sha256: source_sha256,
+            masked_pixels: 0,
+            changed_masked_pixels: 0,
+            changed_ratio: 1.0,
+            source_dark_pixels: 0,
+            cleaned_dark_pixels: 0,
+            dark_pixel_reduction_ratio: 1.0,
+            passthrough: true,
+        };
+        let sidecar_path = clean_sidecar(&paths.cleaned);
+        atomic_json(&sidecar_path, &serde_json::to_value(&artifact)?)?;
+        let entry = manifest
+            .pages
+            .get_mut(&page_key(&source))
+            .ok_or_else(|| anyhow!("pass-through page is outside the managed job scope"))?;
+        entry.state = "cleaned".into();
+        entry.cleaned_image = Some(paths.cleaned.clone());
+        entry.rendered_image = None;
+        save_manifest(&job, &manifest)?;
+        Ok((
+            paths.cleaned,
+            paths.mask,
+            json!({
+                "image_path": artifact.cleaned_image,
+                "cleaned_image_path": artifact.cleaned_image,
+                "mask_path": artifact.mask_path,
+                "workflow": {
+                    "stage": "cleaned",
+                    "mode": "preserve",
+                    "passthrough": true,
+                    "sidecar_path": sidecar_path,
+                }
+            }),
+        ))
     }
 
     pub fn validate_clean_input(&self, cleaned_path: &Path) -> Result<CleanArtifact> {
@@ -1130,9 +1200,10 @@ impl Workflow {
         {
             bail!("clean stage was changed after validation; rerun cleaning");
         }
-        if artifact.changed_masked_pixels == 0
-            || artifact.changed_ratio < 0.01
-            || artifact.masked_pixels == 0
+        if !artifact.passthrough
+            && (artifact.changed_masked_pixels == 0
+                || artifact.changed_ratio < 0.01
+                || artifact.masked_pixels == 0)
         {
             bail!("clean stage did not reliably remove source text");
         }
@@ -1320,6 +1391,9 @@ impl Workflow {
                 "rendered_image_path": rendered_page,
                 "state": "rendered",
                 "bubbles": bubbles,
+                "removed_bubbles": [],
+                "render_dirty": false,
+                "rendered_state_revision": 0,
             }));
         }
         let mut state = json!({"schema_version": 1, "pages": pages});
@@ -1509,6 +1583,17 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
             bubble.insert("id".into(), serde_json::Value::String(bubble_id));
             if let Some(text) = request.get("text") {
                 bubble.insert("translation".into(), text.clone());
+            }
+            // Strict translation carries `needs_review` through the render
+            // sidecar. Surface it as an explicit, user-clearable flag unless
+            // the sidecar already records a later editor decision.
+            if !bubble.contains_key("flagged")
+                && request
+                    .get("needs_review")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            {
+                bubble.insert("flagged".into(), serde_json::Value::Bool(true));
             }
             if let Some(report) = reports.and_then(|items| items.get(index))
                 && let Some(report) = report.as_object()
@@ -2720,6 +2805,25 @@ mod tests {
             "page",
         );
         assert!(first_same.contains(translated[0]["id"].as_str().unwrap()));
+    }
+
+    #[test]
+    fn editor_bubbles_surface_needs_review_as_an_explicit_clearable_flag() {
+        let flagged = editor_bubbles(
+            &json!({
+                "request_bubbles": [{"id":"b1","bbox":{"x1":1,"y1":1,"x2":8,"y2":8},"text":"dịch","needs_review":true}]
+            }),
+            "page-1",
+        );
+        assert_eq!(flagged[0]["flagged"], true);
+
+        let cleared = editor_bubbles(
+            &json!({
+                "request_bubbles": [{"id":"b1","bbox":{"x1":1,"y1":1,"x2":8,"y2":8},"text":"dịch","needs_review":true,"flagged":false}]
+            }),
+            "page-1",
+        );
+        assert_eq!(cleared[0]["flagged"], false);
     }
 
     #[test]

@@ -70,6 +70,26 @@ impl Bubble {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TypesetPayload {
+    /// Stable editor/translation identity. Primitive clients may omit this;
+    /// managed render sidecars preserve it when supplied by the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Original OCR text retained for review and source-pixel restoration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_text: Option<String>,
+    /// Structural item class (for example `dialogue` or `unmatched_text`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Whether this item is preserved by strict-v1's default SFX policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve_by_default: Option<bool>,
+    /// Whether the translator marked this item as needing review. The editor
+    /// surfaces this as an explicit bubble flag that the user can clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_review: Option<bool>,
+    /// Explicit editor flag state, retained across a rerender/reopen cycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flagged: Option<bool>,
     pub bbox: Rect,
     /// Optional detector geometry. When valid, this is the containing speech
     /// bubble and takes precedence over `bbox` for the safe layout area.

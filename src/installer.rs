@@ -902,7 +902,7 @@ fn skill_contents(_client: Client) -> String {
 }
 
 fn workflow_context() -> &'static str {
-    "# Fukidashi workflow\n\nFukidashi is a local MCP server for comic processing. Prefer the strict-v1 two-call loop: fukidashi_translation_start -> fukidashi_translation_submit. The server owns page selection, analysis, clean, typeset, stage reuse, model release, and advancement. Never shell-read managed state, import/search for the Fukidashi package, invent artifact paths, or pass artifact paths to strict submit. After review-ready, call fukidashi_serve_editor and immediately fukidashi_wait_for_review; export only after explicit approval.\n"
+    "# Fukidashi workflow\n\nFukidashi is a local MCP server for comic processing. Prefer the strict-v1 two-call loop: fukidashi_translation_start -> fukidashi_translation_submit. The server owns page selection, analysis, clean, typeset, stage reuse, model release, and advancement. sfx_mode=preserve is the default: structurally unmatched text-* items are preserved and excluded from required translation, cleaning, and typesetting; preserve-mode covers and SFX-only pages receive an explicit pass-through clean/render stage; use sfx_mode=replace only explicitly. Never shell-read managed state, import/search for the Fukidashi package, invent artifact paths, or pass artifact paths to strict submit. After review-ready, call fukidashi_review_and_export with the exact returned job_id; it opens the editor and keeps one MCP call pending until review, returning fixes or exporting zip after approval. fukidashi_serve_editor and fukidashi_wait_for_review remain compatibility tools.\n"
 }
 
 fn load_manifest(path: &Path) -> Result<Option<Manifest>> {

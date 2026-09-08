@@ -75,6 +75,13 @@ pub struct TranslationHandoff {
 #[derive(Debug, Clone, Serialize)]
 pub struct TranslationItem {
     pub id: String,
+    /// Structural classification. `unmatched_text` means the detector found
+    /// text outside a dialogue bubble; it is not a semantic claim that the
+    /// text is definitely a sound effect.
+    pub kind: String,
+    /// Unmatched detector text is preserved by strict-v1 unless the caller
+    /// explicitly opts into replacing it.
+    pub preserve_by_default: bool,
     pub source_text: String,
     pub ocr_text: String,
     /// Recognition confidence remains available to non-vision clients.
@@ -89,16 +96,28 @@ pub struct TranslationItem {
 }
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
 impl TranslationItem {
+    #[allow(dead_code)]
     fn from_region(region: &OcrRegion) -> Self {
-        Self::from_region_with_correction(region, None)
+        Self::from_region_with_kind(region, None, "dialogue", false)
     }
+    #[allow(dead_code)]
     fn from_region_with_correction(region: &OcrRegion, corrected: Option<&str>) -> Self {
+        Self::from_region_with_kind(region, corrected, "dialogue", false)
+    }
+    fn from_region_with_kind(
+        region: &OcrRegion,
+        corrected: Option<&str>,
+        kind: &str,
+        preserve_by_default: bool,
+    ) -> Self {
         let (source_text, correction_applied) = effective_source_text(&region.text, corrected);
         let corrected_source_text = corrected
             .filter(|text| !text.trim().is_empty())
             .map(str::to_owned);
         Self {
             id: region.id.clone(),
+            kind: kind.to_owned(),
+            preserve_by_default,
             source_text,
             ocr_text: region.text.clone(),
             confidence: region.confidence,
@@ -1746,8 +1765,10 @@ impl Pipeline {
         }
         let items = bubbles
             .iter()
-            .chain(unmatched_text.iter())
-            .map(TranslationItem::from_region)
+            .map(|region| TranslationItem::from_region_with_kind(region, None, "dialogue", false))
+            .chain(unmatched_text.iter().map(|region| {
+                TranslationItem::from_region_with_kind(region, None, "unmatched_text", true)
+            }))
             .collect();
         let source_language = source
             .filter(|v| normalize_language(v) != "auto")

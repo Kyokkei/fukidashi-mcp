@@ -47,7 +47,7 @@ async fn executable_stdio_handshake_tools_and_eof_from_unrelated_cwd() {
             .as_array()
             .expect("tools list")
             .len(),
-        11
+        12
     );
     write_request(&mut input, serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fukidashi_analyze_page","arguments":{"image_path":"relative.png"}}})).await;
     let invalid = read_json(&mut output).await;

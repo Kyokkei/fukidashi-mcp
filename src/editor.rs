@@ -258,8 +258,8 @@ fn validate_review_feedback(session: &Session, state: &Value, item: &Value) -> R
         .get("origin")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("review feedback origin is required"))?;
-    if origin != "image-pixels" {
-        bail!("review feedback origin must be image-pixels");
+    if !matches!(origin, "image-pixels" | "bubble-flag") {
+        bail!("review feedback origin must be image-pixels or bubble-flag");
     }
     let issue_type = object
         .get("issue_type")
@@ -273,6 +273,7 @@ fn validate_review_feedback(session: &Session, state: &Value, item: &Value) -> R
             | "wrong_or_missing_bubble"
             | "damaged_artwork"
             | "font_or_layout"
+            | "flagged_bubble"
             | "custom"
     ) {
         bail!("unsupported review issue type");
@@ -290,6 +291,33 @@ fn validate_review_feedback(session: &Session, state: &Value, item: &Value) -> R
         .is_some_and(|text| text.len() > 4096)
     {
         bail!("corrected review text is too long");
+    }
+    let source_ocr = object
+        .get("source_ocr")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if source_ocr.as_deref().is_some_and(|text| text.len() > 4096) {
+        bail!("source OCR review text is too long");
+    }
+    let current_translation = object
+        .get("current_translation")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if current_translation
+        .as_deref()
+        .is_some_and(|text| text.len() > 4096)
+    {
+        bail!("current translation review text is too long");
+    }
+    let link_status = object
+        .get("link_status")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if link_status
+        .as_deref()
+        .is_some_and(|status| status.len() > 128)
+    {
+        bail!("review link status is too long");
     }
     let bbox = match object.get("bbox") {
         Some(value) => {
@@ -339,6 +367,9 @@ fn validate_review_feedback(session: &Session, state: &Value, item: &Value) -> R
         "issue_type": issue_type,
         "note": note,
         "corrected_text": corrected_text,
+        "source_ocr": source_ocr,
+        "current_translation": current_translation,
+        "link_status": link_status,
         "origin": origin,
         "artifact_paths": artifact_paths,
     }))
@@ -440,6 +471,13 @@ fn submit_review(session: &Session, request: &Value) -> Result<Value> {
             current.status = "fixes_requested".to_owned();
         }
         "approve_export" => {
+            let blockers = review_blockers(&project);
+            if !blockers.is_empty() {
+                bail!(
+                    "approve_export is blocked by unresolved review data: {}",
+                    serde_json::to_string(&blockers)?
+                );
+            }
             let approved = request
                 .get("approved_pages")
                 .and_then(Value::as_array)
@@ -554,6 +592,18 @@ pub fn export_gate(project_dir: &Path) -> Result<()> {
         && matches!(state.status.as_str(), "approved" | "consumed");
     if !approved {
         bail!("export is blocked until the latest review revision is explicitly approved");
+    }
+    let state_path = project_dir.join("project.json");
+    if state_path.is_file() {
+        let state: Value = serde_json::from_slice(&fs::read(&state_path)?)
+            .context("parse editor state before export")?;
+        let blockers = review_blockers(&state);
+        if !blockers.is_empty() {
+            bail!(
+                "export is blocked by unresolved review data: {}",
+                serde_json::to_string(&blockers)?
+            );
+        }
     }
     Ok(())
 }
@@ -712,11 +762,12 @@ fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
                     b"Project changed on disk; reload editor before saving",
                 );
             }
+            let mut value = value;
+            mark_render_dirty_changes(&current, &mut value);
             if validate_state(&value).is_err() || validate_project_paths(session, &value).is_err() {
                 return respond(&mut stream, 400, "text/plain", b"invalid editor state");
             }
             let next_revision = state_revision(&current).saturating_add(1);
-            let mut value = value;
             set_state_revision(&mut value, next_revision);
             if atomic_json_save(&session.state_path, &value).is_err() {
                 return respond(
@@ -908,6 +959,155 @@ fn bubble_count(state: &Value) -> usize {
         .unwrap_or(0)
 }
 
+fn removed_bubble_id(value: &Value) -> Option<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("id").and_then(Value::as_str))
+}
+
+fn page_render_signature(page: &Value) -> Value {
+    json!({
+        "bubbles": page.get("bubbles").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+        "removed_bubbles": page
+            .get("removed_bubbles")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+        "correction_strokes": page
+            .get("correction_strokes")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    })
+}
+
+fn mark_render_dirty_changes(current: &Value, incoming: &mut Value) {
+    let Some(current_pages) = current.get("pages").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(incoming_pages) = incoming.get_mut("pages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for (index, incoming_page) in incoming_pages.iter_mut().enumerate() {
+        let incoming_signature = page_render_signature(incoming_page);
+        let Some(incoming_object) = incoming_page.as_object_mut() else {
+            continue;
+        };
+        let incoming_id = incoming_object.get("id").and_then(Value::as_str);
+        let current_page = current_pages
+            .iter()
+            .find(|candidate| {
+                candidate
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .zip(incoming_id)
+                    .is_some_and(|(left, right)| left == right)
+            })
+            .or_else(|| current_pages.get(index));
+        let Some(current_page) = current_page else {
+            continue;
+        };
+        if page_render_signature(current_page) != incoming_signature
+            || current_page
+                .get("render_dirty")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            incoming_object.insert("render_dirty".to_owned(), Value::Bool(true));
+        }
+    }
+}
+
+fn review_blockers(state: &Value) -> Vec<Value> {
+    state
+        .get("pages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .flat_map(|(page_index, page)| {
+            let mut blockers = Vec::new();
+            if page
+                .get("render_dirty")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                blockers.push(json!({
+                    "page": page_index,
+                    "kind": "render_dirty",
+                    "origin": "server-state",
+                }));
+            }
+            if let Some(issues) = page.get("issues").and_then(Value::as_array) {
+                blockers.extend(issues.iter().enumerate().map(|(issue_index, issue)| {
+                    json!({
+                        "page": page_index,
+                        "kind": "issue",
+                        "issue_index": issue_index,
+                        "issue_type": issue.get("issue_type").cloned().unwrap_or(Value::String("custom".into())),
+                        "origin": issue.get("origin").cloned().unwrap_or(Value::String("image-pixels".into())),
+                    })
+                }));
+            }
+            if let Some(bubbles) = page.get("bubbles").and_then(Value::as_array) {
+                blockers.extend(
+                    bubbles
+                        .iter()
+                        .filter(|bubble| {
+                            let explicit_flag = bubble
+                                .get("flagged")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                                || bubble
+                                    .get("problem")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                            let has_source_text = bubble
+                                .get("source_text")
+                                .or_else(|| bubble.get("original_text"))
+                                .or_else(|| bubble.get("text"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.trim().is_empty());
+                            let missing_translation = bubble
+                                .get("translation")
+                                .and_then(Value::as_str)
+                                .is_none_or(|text| text.trim().is_empty());
+                            explicit_flag || (has_source_text && missing_translation)
+                        })
+                        .map(|bubble| {
+                            let explicit_flag = bubble
+                                .get("flagged")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                                || bubble
+                                    .get("problem")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false);
+                            let source_ocr = bubble
+                                .get("source_text")
+                                .or_else(|| bubble.get("original_text"))
+                                .or_else(|| bubble.get("text"))
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                            let current_translation = bubble
+                                .get("translation")
+                                .cloned()
+                                .unwrap_or_else(|| Value::String(String::new()));
+                            json!({
+                                "page": page_index,
+                                "kind": if explicit_flag { "flagged_bubble" } else { "missing_translation" },
+                                "bubble_id": bubble.get("id").cloned().unwrap_or(Value::Null),
+                                "bbox": bubble.get("bbox").cloned().unwrap_or(Value::Null),
+                                "source_ocr": source_ocr,
+                                "current_translation": current_translation,
+                                "origin": if explicit_flag { "bubble-flag" } else { "server-state" },
+                            })
+                        }),
+                );
+            }
+            blockers
+        })
+        .collect()
+}
+
 fn parse_page_index(route: &str, suffix: &str) -> Result<usize> {
     let prefix = "page/";
     let index = route
@@ -1063,11 +1263,24 @@ fn normalize_editor_state(mut state: Value) -> Result<Value> {
             .ok_or_else(|| anyhow!("editor page must be an object"))?;
         page.entry("id")
             .or_insert_with(|| Value::String(format!("page-{}", index + 1)));
-        for key in ["bubbles", "issues", "correction_strokes"] {
+        for key in ["bubbles", "issues", "correction_strokes", "removed_bubbles"] {
             page.entry(key).or_insert_with(|| Value::Array(Vec::new()));
             if !page.get(key).is_some_and(Value::is_array) {
                 bail!("editor page {key} must be an array");
             }
+        }
+        page.entry("render_dirty")
+            .or_insert_with(|| Value::Bool(false));
+        if !page.get("render_dirty").is_some_and(Value::is_boolean) {
+            bail!("editor page render_dirty must be a boolean");
+        }
+        page.entry("rendered_state_revision")
+            .or_insert_with(|| Value::from(0_u64));
+        if !page
+            .get("rendered_state_revision")
+            .is_some_and(Value::is_u64)
+        {
+            bail!("editor page rendered_state_revision must be a non-negative integer");
         }
     }
     Ok(state)
@@ -1113,6 +1326,35 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
         {
             base_object.insert("correction_strokes".to_owned(), strokes.clone());
         }
+        if let Some(render_dirty) = saved_object
+            .get("render_dirty")
+            .filter(|value| value.is_boolean())
+        {
+            base_object.insert("render_dirty".to_owned(), render_dirty.clone());
+        }
+        if let Some(rendered_revision) = saved_object
+            .get("rendered_state_revision")
+            .filter(|value| value.is_u64())
+        {
+            base_object.insert(
+                "rendered_state_revision".to_owned(),
+                rendered_revision.clone(),
+            );
+        }
+        let saved_removed_bubbles = saved_object
+            .get("removed_bubbles")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let removed_ids: std::collections::HashSet<String> = saved_removed_bubbles
+            .iter()
+            .filter_map(removed_bubble_id)
+            .map(str::to_owned)
+            .collect();
+        base_object.insert(
+            "removed_bubbles".to_owned(),
+            Value::Array(saved_removed_bubbles.clone()),
+        );
         let saved_bubbles = saved_object
             .get("bubbles")
             .and_then(Value::as_array)
@@ -1122,6 +1364,12 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
         else {
             continue;
         };
+        base_bubbles.retain(|bubble| {
+            bubble
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !removed_ids.contains(id))
+        });
         for base_bubble in base_bubbles.iter_mut() {
             let Some(base_bubble_object) = base_bubble.as_object_mut() else {
                 continue;
@@ -1161,7 +1409,10 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
             let Some(id) = saved_bubble.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            if !base_ids.contains(id) && saved_bubble.get("bbox").is_some() {
+            if !removed_ids.contains(id)
+                && !base_ids.contains(id)
+                && saved_bubble.get("bbox").is_some()
+            {
                 base_bubbles.push(saved_bubble);
             }
         }
@@ -1183,6 +1434,8 @@ fn translation_manifest(state: &Value) -> Value {
                     json!({
                         "id": page.get("id").and_then(Value::as_str).unwrap_or(""),
                         "image_path": page.get("image_path").and_then(Value::as_str).unwrap_or(""),
+                        "removed_bubbles": page.get("removed_bubbles").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+                        "render_dirty": page.get("render_dirty").cloned().unwrap_or(Value::Bool(false)),
                         "bubbles": page.get("bubbles").and_then(Value::as_array).map(|bubbles| bubbles.iter().map(|bubble| json!({
                             "id": bubble.get("id").and_then(Value::as_str).unwrap_or(""),
                             "translation": bubble.get("translation").cloned().unwrap_or(Value::Null),
@@ -1198,6 +1451,7 @@ fn translation_manifest(state: &Value) -> Value {
 
 fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> {
     let cleaned = page_image_path(session, state, index, "cleaned", true)?;
+    let source_image = page_image_path(session, state, index, "source", true)?;
     let jobs_root = session
         .root_dir
         .parent()
@@ -1214,6 +1468,11 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         .or_else(|| state.get("bubbles"))
         .and_then(Value::as_array)
         .map_or(&[][..], |bubbles| bubbles.as_slice());
+    let removed_bubbles = page
+        .and_then(|page| page.get("removed_bubbles"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
     let strokes = page
         .and_then(|page| page.get("correction_strokes"))
         .and_then(Value::as_array)
@@ -1237,14 +1496,30 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             "legacy page is missing saved translation payloads; import or recover its typeset data before applying brush and rendering"
         );
     }
-    let (source, corrected_cleaned) = if strokes.is_empty() {
+    let (source, corrected_cleaned) = if strokes.is_empty() && removed_bubbles.is_empty() {
         (cleaned.clone(), None)
     } else {
-        let corrected = apply_correction_strokes(&cleaned, &strokes)?;
+        let mut corrected = if strokes.is_empty() {
+            image::open(&cleaned)
+                .with_context(|| format!("read cleaned image {}", cleaned.display()))?
+                .to_rgb8()
+        } else {
+            apply_correction_strokes(&cleaned, &strokes)?
+        };
+        if !removed_bubbles.is_empty() {
+            let original = image::open(&source_image)
+                .with_context(|| format!("read source image {}", source_image.display()))?
+                .to_rgb8();
+            restore_source_bubbles(&mut corrected, &original, &removed_bubbles)?;
+        }
         let output = cleaned
             .parent()
             .unwrap_or(&session.root_dir)
-            .join("corrected-clean.png");
+            .join(format!("editor-clean-{}.png", state_revision(state)));
+        if output.exists() {
+            fs::remove_file(&output)
+                .with_context(|| format!("replace editor clean derivative {}", output.display()))?;
+        }
         let derived = workflow.write_derived_clean_artifact(&base_clean, &output, &corrected)?;
         (derived.cleaned_image, Some(output))
     };
@@ -1260,10 +1535,17 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         let text = bubble
             .get("translation")
             .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .or_else(|| bubble.get("text").and_then(Value::as_str))
-            .unwrap_or("")
-            .to_owned();
+            .ok_or_else(|| {
+                anyhow!(
+                    "bubble {bubble_index} has no translation; use Preserve original / remove translation box"
+                )
+            })?;
+        if text.trim().is_empty() {
+            bail!(
+                "bubble {bubble_index} has an empty translation; use Preserve original / remove translation box"
+            );
+        }
+        let text = text.to_owned();
         let font_path = bubble
             .get("font_path")
             .and_then(Value::as_str)
@@ -1275,6 +1557,19 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             .and_then(Value::as_f64)
             .map(|v| v as f32);
         payloads.push(TypesetPayload {
+            id: bubble.get("id").and_then(Value::as_str).map(str::to_owned),
+            source_text: bubble
+                .get("source_text")
+                .and_then(Value::as_str)
+                .or_else(|| bubble.get("text").and_then(Value::as_str))
+                .map(str::to_owned),
+            kind: bubble
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            preserve_by_default: bubble.get("preserve_by_default").and_then(Value::as_bool),
+            needs_review: bubble.get("needs_review").and_then(Value::as_bool),
+            flagged: bubble.get("flagged").and_then(Value::as_bool),
             bbox,
             bubble_bbox: bubble
                 .get("bubble_bbox")
@@ -1316,8 +1611,15 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
     workflow.register_render_locked(
         &output,
         &workflow.validate_clean_input(&source)?,
-        report.clone(),
-        json!({"editor_render": true, "correction_strokes": strokes.len()}),
+        json!({
+            "request_bubbles": payloads,
+            "report": report.clone(),
+        }),
+        json!({
+            "editor_render": true,
+            "correction_strokes": strokes.len(),
+            "removed_bubbles": removed_bubbles,
+        }),
     )?;
     let mut saved_state = state.clone();
     set_state_revision(&mut saved_state, state_revision(state).saturating_add(1));
@@ -1340,6 +1642,8 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 .display()
                 .to_string(),
         );
+        page["render_dirty"] = Value::Bool(false);
+        page["rendered_state_revision"] = Value::from(state_revision(state).saturating_add(1));
     }
     validate_state(&saved_state)?;
     atomic_json_save(&session.state_path, &saved_state)?;
@@ -1350,6 +1654,40 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
     Ok(
         json!({"saved": true, "page_index": index, "rendered_image_path": output, "typeset": report, "state": saved_state}),
     )
+}
+
+fn restore_source_bubbles(
+    output: &mut image::RgbImage,
+    source: &image::RgbImage,
+    removed_bubbles: &[Value],
+) -> Result<()> {
+    if output.dimensions() != source.dimensions() {
+        bail!("source and cleaned page dimensions do not match while restoring a bubble");
+    }
+    let (width, height) = output.dimensions();
+    for (index, removed) in removed_bubbles.iter().enumerate() {
+        let bbox: Rect = serde_json::from_value(
+            removed
+                .get("bbox")
+                .cloned()
+                .ok_or_else(|| anyhow!("removed bubble {index} has no bbox"))?,
+        )?;
+        let bbox = bbox
+            .validate()
+            .map_err(|error| anyhow!("removed bubble {index} has invalid bbox: {error}"))?
+            .clip(width as f32, height as f32)
+            .ok_or_else(|| anyhow!("removed bubble {index} bbox is outside the source image"))?;
+        let left = bbox.x1.floor().max(0.0) as u32;
+        let top = bbox.y1.floor().max(0.0) as u32;
+        let right = bbox.x2.ceil().min(width as f32) as u32;
+        let bottom = bbox.y2.ceil().min(height as f32) as u32;
+        for y in top..bottom {
+            for x in left..right {
+                *output.get_pixel_mut(x, y) = *source.get_pixel(x, y);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn apply_correction_strokes(cleaned: &Path, strokes: &[Value]) -> Result<image::RgbImage> {
@@ -1582,6 +1920,76 @@ mod tests {
         assert!(EDITOR_HTML.contains("id=\"reload\""));
         assert!(EDITOR_HTML.contains("if(dirty&&!stale)save()"));
         assert!(EDITOR_HTML.contains("e.status===409"));
+    }
+
+    #[test]
+    fn removed_bubble_tombstone_survives_reconstruction_and_blocks_approval() {
+        let bbox = json!({"x1": 1.0, "y1": 1.0, "x2": 8.0, "y2": 8.0});
+        let mut base = json!({
+            "state_revision": 0,
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{"id":"bubble-1","bbox":bbox.clone(),"text":"原文","translation":"Bản dịch"}]
+            }]
+        });
+        let saved = json!({
+            "state_revision": 2,
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{"id":"bubble-1","bbox":bbox,"text":"原文","translation":"Bản dịch"}],
+                "removed_bubbles": [{"id":"bubble-1","bbox":bbox,"source_text":"原文","translation":"Bản dịch"}],
+                "render_dirty": true
+            }]
+        });
+        base = normalize_editor_state(base).unwrap();
+        merge_saved_edits(&mut base, &saved);
+        assert!(base["pages"][0]["bubbles"].as_array().unwrap().is_empty());
+        assert_eq!(base["pages"][0]["removed_bubbles"][0]["id"], "bubble-1");
+        assert_eq!(base["pages"][0]["render_dirty"], true);
+        let blockers = review_blockers(&json!({
+            "pages": [{
+                "render_dirty": true,
+                "issues": [{"issue_type":"custom"}],
+                "bubbles": [{"id":"bubble-2","flagged":true,"bbox":bbox}]
+            }]
+        }));
+        assert_eq!(blockers.len(), 3);
+        assert!(blockers.iter().any(|item| item["kind"] == "render_dirty"));
+        assert!(blockers.iter().any(|item| item["kind"] == "issue"));
+        assert!(blockers.iter().any(|item| item["kind"] == "flagged_bubble"));
+        let flagged = blockers
+            .iter()
+            .find(|item| item["kind"] == "flagged_bubble")
+            .unwrap();
+        assert_eq!(flagged["source_ocr"], Value::Null);
+        assert_eq!(flagged["current_translation"], "");
+    }
+
+    #[test]
+    fn restoring_removed_bubble_copies_source_pixels_into_render_base() {
+        let mut cleaned = RgbImage::from_pixel(10, 10, Rgb([255, 255, 255]));
+        let source = RgbImage::from_pixel(10, 10, Rgb([20, 30, 40]));
+        restore_source_bubbles(
+            &mut cleaned,
+            &source,
+            &[json!({"id":"bubble-1","bbox":{"x1":2.0,"y1":3.0,"x2":5.0,"y2":6.0}})],
+        )
+        .unwrap();
+        assert_eq!(*cleaned.get_pixel(2, 3), Rgb([20, 30, 40]));
+        assert_eq!(*cleaned.get_pixel(4, 5), Rgb([20, 30, 40]));
+        assert_eq!(*cleaned.get_pixel(1, 3), Rgb([255, 255, 255]));
+    }
+
+    #[test]
+    fn editor_exposes_explicit_bubble_restore_and_actionable_flag_feedback() {
+        assert!(EDITOR_HTML.contains("Preserve original / remove translation box"));
+        assert!(EDITOR_HTML.contains("id=\"restoreBubble\""));
+        assert!(EDITOR_HTML.contains("issue_type:'flagged_bubble'"));
+        assert!(EDITOR_HTML.contains("source_ocr:b.source_text"));
+        assert!(!EDITOR_HTML.contains("b.confidence<.65"));
+        assert!(
+            EDITOR_HTML.contains("for(let i=0;i<pages().length;i++){if(pages()[i].render_dirty)")
+        );
     }
 
     #[test]

@@ -137,6 +137,7 @@ async fn rmcp_surface_lists_tools_and_reports_tool_errors() -> anyhow::Result<()
     assert!(names.contains(&"fukidashi_translation_submit"));
     assert!(names.contains(&"fukidashi_serve_editor"));
     assert!(names.contains(&"fukidashi_wait_for_review"));
+    assert!(names.contains(&"fukidashi_review_and_export"));
     assert!(names.contains(&"fukidashi_export"));
     for tool in &tools.tools {
         let schema = serde_json::to_value(&tool.input_schema)?;
@@ -161,6 +162,18 @@ async fn rmcp_surface_lists_tools_and_reports_tool_errors() -> anyhow::Result<()
     let strict_submit_schema = serde_json::to_value(strict_submit.input_schema.clone())?;
     assert!(strict_submit_schema["properties"]["work_token"].is_object());
     assert!(strict_submit_schema["properties"]["translations"].is_object());
+    let review_export_schema = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "fukidashi_review_and_export")
+        .expect("combined review tool schema")
+        .input_schema
+        .clone();
+    let review_export_schema = serde_json::to_value(review_export_schema)?;
+    assert_eq!(
+        review_export_schema["properties"]["format"]["default"],
+        "zip"
+    );
     let editor_request: EditorRequest = serde_json::from_value(serde_json::json!({
         "image_path": "C:/page.png",
         "json_data": {"schema_version": 1, "flags": [true, false], "nested": {"value": null}}
