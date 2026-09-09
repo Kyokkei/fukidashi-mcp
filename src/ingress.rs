@@ -320,11 +320,20 @@ impl MangaDexClient {
         let use_data_saver = Self::uses_data_saver(request);
         let at_home = self.at_home(&chapter.id).await?;
         let page_key = if use_data_saver { "dataSaver" } else { "data" };
-        let Some(file_names) = at_home.get(page_key).and_then(Value::as_array) else {
+        let chapter_payload = at_home.get("chapter").and_then(Value::as_object);
+        let Some(file_names) = chapter_payload
+            .and_then(|chapter| chapter.get(page_key))
+            .and_then(Value::as_array)
+        else {
+            let reason = if chapter_payload.is_none() {
+                "MangaDex at-home response has no chapter object".to_owned()
+            } else {
+                format!("MangaDex at-home response has no {page_key} page list")
+            };
             return Ok(unavailable_release_response(
                 &chapter,
                 Some(manga_title.as_deref().unwrap_or_default()),
-                format!("MangaDex at-home response has no {page_key} page list"),
+                reason,
             ));
         };
         if file_names.is_empty() {
@@ -345,7 +354,8 @@ impl MangaDexClient {
         validate_download_base(&base, self.allow_insecure_local)?;
         let hash = at_home
             .get("chapter")
-            .and_then(|value| value.get("hash"))
+            .and_then(Value::as_object)
+            .and_then(|chapter| chapter.get("hash"))
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
             .ok_or_else(|| anyhow!("MangaDex at-home response has no chapter hash"))?;
@@ -1065,7 +1075,13 @@ async fn pull_direct(
     }
     .await;
     let _ = std::fs::remove_dir_all(&staging);
-    result
+    result.map_err(direct_import_error)
+}
+
+fn direct_import_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow!(
+        "direct URL was not imported; supply another explicit supported http(s) URL if this URL is not extractable: {error}"
+    )
 }
 
 fn validate_search_request(request: &SearchMangaRequest) -> Result<()> {
@@ -1908,6 +1924,17 @@ mod tests {
     }
 
     #[test]
+    fn direct_helper_failure_explains_recovery_without_unbounded_output() {
+        let error = direct_import_error(anyhow::anyhow!(
+            "gallery-dl exited with failure: bounded helper output"
+        ));
+        let message = error.to_string();
+        assert!(message.contains("direct URL was not imported"));
+        assert!(message.contains("another explicit supported http(s) URL"));
+        assert!(message.contains("bounded helper output"));
+    }
+
+    #[test]
     fn native_download_budget_rejects_low_limit_without_large_allocation() {
         let used = AtomicU64::new(0);
         reserve_download_bytes(&used, 7, 10).unwrap();
@@ -2219,8 +2246,8 @@ mod tests {
                     200,
                     serde_json::to_vec(&json!({
                         "baseUrl": format!("{request_base}images/"),
-                        "chapter": {"hash": "latest-hash"},
-                        "data": ["page1.png"]
+                        "chapter": {"hash": "latest-hash", "data": ["page1.png"]},
+                        "data": ["top-level-decoy.png"]
                     }))
                     .unwrap(),
                 );
@@ -2350,9 +2377,13 @@ mod tests {
                     200,
                     serde_json::to_vec(&json!({
                         "baseUrl": format!("{request_base}images/"),
-                        "chapter": {"hash": "empty-hash"},
-                        "data": [],
-                        "dataSaver": ["page1.png"]
+                        "chapter": {
+                            "hash": "empty-hash",
+                            "data": [],
+                            "dataSaver": ["page1.png"]
+                        },
+                        "data": ["top-level-decoy.png"],
+                        "dataSaver": ["top-level-decoy-saver.png"]
                     }))
                     .unwrap(),
                 );
@@ -2395,6 +2426,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_at_home_chapter_returns_unavailable_without_using_top_level_decoys() {
+        let manga_id = "30303030-3030-3030-3030-303030303030";
+        let chapter_id = "31313131-3131-3131-3131-313131313131";
+        let chapter = chapter_json(chapter_id, manga_id, "3");
+        let feed = serde_json::to_vec(&json!({"data": [chapter]})).unwrap();
+        let (base, thread) = mock_server(3, move |path, request_base| {
+            if path.starts_with("/api/manga/30303030-3030-3030-3030-303030303030/feed?") {
+                return (200, feed.clone());
+            }
+            if path == "/api/manga/30303030-3030-3030-3030-303030303030" {
+                return (
+                    200,
+                    serde_json::to_vec(&json!({
+                        "data": {"id": manga_id, "attributes": {"title": {"en": "Missing Chapter"}}}
+                    }))
+                    .unwrap(),
+                );
+            }
+            if path == "/api/at-home/server/31313131-3131-3131-3131-313131313131" {
+                return (
+                    200,
+                    serde_json::to_vec(&json!({
+                        "baseUrl": format!("{request_base}images/"),
+                        "data": ["top-level-decoy.png"]
+                    }))
+                    .unwrap(),
+                );
+            }
+            panic!("unexpected MangaDex request path {path}");
+        });
+        let client = MangaDexClient::with_base_url(&base).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = Workflow::new(directory.path().join("jobs")).unwrap();
+        let response = client
+            .pull_mangadex(
+                &test_config(directory.path()),
+                &PullChapterRequest {
+                    source: "mangadex".into(),
+                    manga_id: Some(manga_id.into()),
+                    chapter_id: None,
+                    chapter: Some("3".into()),
+                    latest: false,
+                    translated_language: Some("en".into()),
+                    data_saver: "full".into(),
+                    url: None,
+                    job_name: None,
+                },
+                &workflow,
+            )
+            .await
+            .unwrap();
+        thread.join().unwrap();
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["imported"], false);
+        assert_eq!(response["chapter_id"], chapter_id);
+        assert!(
+            response["reason"]
+                .as_str()
+                .unwrap()
+                .contains("chapter object")
+        );
+        assert_eq!(std::fs::read_dir(workflow.root()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
     async fn at_home_pages_are_naturally_sorted_and_imported_as_pending_job() {
         let manga_id = "55555555-5555-5555-5555-555555555555";
         let chapter_id = "66666666-6666-6666-6666-666666666666";
@@ -2420,8 +2516,8 @@ mod tests {
                     200,
                     serde_json::to_vec(&json!({
                         "baseUrl": format!("{base}images/"),
-                        "chapter": {"hash": "hash"},
-                        "data": ["page10.png", "page2.png"]
+                        "chapter": {"hash": "hash", "data": ["page10.png", "page2.png"]},
+                        "data": ["top-level-decoy.png"]
                     }))
                     .unwrap(),
                 );
@@ -2501,9 +2597,13 @@ mod tests {
                     200,
                     serde_json::to_vec(&json!({
                         "baseUrl": format!("{base}images/"),
-                        "chapter": {"hash": "save-hash"},
-                        "data": ["page99.png"],
-                        "dataSaver": ["page3.png", "page1.png"]
+                        "chapter": {
+                            "hash": "save-hash",
+                            "data": ["page99.png"],
+                            "dataSaver": ["page3.png", "page1.png"]
+                        },
+                        "data": ["top-level-decoy.png"],
+                        "dataSaver": ["top-level-decoy-saver.png"]
                     }))
                     .unwrap(),
                 );
