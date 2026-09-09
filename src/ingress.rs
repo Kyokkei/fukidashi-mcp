@@ -88,7 +88,7 @@ pub struct PullChapterRequest {
     /// manga_id and cannot be combined with chapter_id or chapter.
     #[schemars(schema_with = "latest_schema")]
     pub latest: bool,
-    /// Exact translated language code used for MangaDex feed filtering.
+    /// Exact translated language code used for MangaDex chapter/feed filtering.
     #[serde(default)]
     pub translated_language: Option<String>,
     /// "full" selects MangaDex's data list; "data_saver" explicitly selects
@@ -460,26 +460,44 @@ impl MangaDexClient {
             .as_deref()
             .ok_or_else(|| anyhow!("manga_id or exact chapter_id is required"))?;
         let manga_id = validate_uuid(manga_id, "manga_id")?;
-        let mut url = self.endpoint(&format!("manga/{manga_id}/feed"))?;
-        {
+        let url = if let Some(chapter) = request.chapter.as_deref() {
+            let mut url = self.endpoint("chapter")?;
+            let mut query = url.query_pairs_mut();
+            query.append_pair("manga", &manga_id);
+            query.append_pair("chapter", chapter);
+            query.append_pair("limit", "100");
+            query.append_pair("offset", "0");
+            query.append_pair("includes[]", "scanlation_group");
+            if let Some(language) = request.translated_language.as_deref() {
+                validate_language(language)?;
+                query.append_pair("translatedLanguage[]", language);
+            }
+            drop(query);
+            url
+        } else {
+            let mut url = self.endpoint(&format!("manga/{manga_id}/feed"))?;
             let mut query = url.query_pairs_mut();
             query.append_pair("limit", "100");
             query.append_pair("offset", "0");
             query.append_pair("order[chapter]", "asc");
             query.append_pair("includes[]", "scanlation_group");
-            if let Some(chapter) = request.chapter.as_deref() {
-                query.append_pair("chapter[]", chapter);
-            }
             if let Some(language) = request.translated_language.as_deref() {
                 validate_language(language)?;
                 query.append_pair("translatedLanguage[]", language);
             }
-        }
+            drop(query);
+            url
+        };
+        let response_name = if request.chapter.is_some() {
+            "chapter"
+        } else {
+            "feed"
+        };
         let body = self.get_json(url).await?;
         let entries = body
             .get("data")
             .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("MangaDex feed response has no data array"))?;
+            .ok_or_else(|| anyhow!("MangaDex {response_name} response has no data array"))?;
         let mut chapters = entries
             .iter()
             .filter_map(|entry| parse_chapter(entry, Some(&manga_id)).ok())
@@ -1115,7 +1133,7 @@ fn validate_mangadex_request(request: &PullChapterRequest) -> Result<()> {
         bail!("manga_id or exact chapter_id is required for MangaDex ingress");
     }
     if request.chapter.is_some() && request.chapter_id.is_none() && request.manga_id.is_none() {
-        bail!("chapter requires manga_id so the MangaDex feed can be resolved exactly");
+        bail!("chapter requires manga_id so the MangaDex chapter endpoint can be resolved exactly");
     }
     if request
         .chapter
@@ -2147,18 +2165,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_chapter_filter_uses_the_mangadex_array_query_key() {
+    async fn exact_chapter_filter_uses_the_global_chapter_endpoint() {
         let manga_id = "abababab-abab-abab-abab-abababababab";
         let chapter_id = "bcbcbcbc-bcbc-bcbc-bcbc-bcbcbcbcbcbc";
         let chapter = chapter_json(chapter_id, manga_id, "178");
         let body = serde_json::to_vec(&json!({"data": [chapter]})).unwrap();
         let (base, thread) = mock_server(1, move |path, _base| {
-            assert!(path.starts_with("/api/manga/abababab-abab-abab-abab-abababababab/feed?"));
+            assert!(path.starts_with("/api/chapter?"));
+            assert!(!path.starts_with("/api/manga/") && !path.contains("/feed?"));
+            assert!(path.contains("manga=abababab-abab-abab-abab-abababababab"));
             assert!(
-                path.contains("chapter%5B%5D=178") || path.contains("chapter[]=178"),
-                "expected encoded chapter[] filter in {path}"
+                path.contains("chapter=178"),
+                "expected singular chapter filter in {path}"
             );
-            assert!(!path.contains("chapter=178"));
+            assert!(!path.contains("chapter%5B%5D") && !path.contains("chapter[]"));
+            assert!(path.contains("limit=100"));
+            assert!(path.contains("offset=0"));
+            assert!(
+                path.contains("includes%5B%5D=scanlation_group")
+                    || path.contains("includes[]=scanlation_group")
+            );
+            assert!(
+                path.contains("translatedLanguage%5B%5D=en")
+                    || path.contains("translatedLanguage[]=en")
+            );
             (200, body.clone())
         });
         let client = MangaDexClient::with_base_url(&base).unwrap();
@@ -2179,6 +2209,43 @@ mod tests {
         thread.join().unwrap();
         assert_eq!(resolved["chapter_id"], chapter_id);
         assert_eq!(resolved["chapter"], "178");
+    }
+
+    #[tokio::test]
+    async fn exact_chapter_keeps_ambiguous_global_matches_ambiguous() {
+        let manga_id = "bdbdbdbd-bdbd-bdbd-bdbd-bdbdbdbdbdbd";
+        let first_id = "cececece-cece-cece-cece-cececececece";
+        let second_id = "dededede-dede-dede-dede-dededededede";
+        let first = chapter_json(first_id, manga_id, "178");
+        let second = chapter_json(second_id, manga_id, "178");
+        let body = serde_json::to_vec(&json!({"data": [first, second]})).unwrap();
+        let (base, thread) = mock_server(1, move |path, _base| {
+            assert!(path.starts_with("/api/chapter?"));
+            assert!(path.contains("manga=bdbdbdbd-bdbd-bdbd-bdbd-bdbdbdbdbdbd"));
+            assert!(path.contains("chapter=178"));
+            assert!(!path.contains("chapter%5B%5D") && !path.contains("chapter[]"));
+            (200, body.clone())
+        });
+        let client = MangaDexClient::with_base_url(&base).unwrap();
+        let error = client
+            .resolve_chapter(&PullChapterRequest {
+                source: "mangadex".into(),
+                manga_id: Some(manga_id.into()),
+                chapter_id: None,
+                chapter: Some("178".into()),
+                latest: false,
+                translated_language: None,
+                data_saver: "full".into(),
+                url: None,
+                job_name: None,
+            })
+            .await
+            .unwrap_err();
+        thread.join().unwrap();
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"));
+        assert!(message.contains(first_id));
+        assert!(message.contains(second_id));
     }
 
     #[tokio::test]
@@ -2467,7 +2534,13 @@ mod tests {
         let chapter = chapter_json(chapter_id, manga_id, "3");
         let feed = serde_json::to_vec(&json!({"data": [chapter]})).unwrap();
         let (base, thread) = mock_server(3, move |path, request_base| {
-            if path.starts_with("/api/manga/30303030-3030-3030-3030-303030303030/feed?") {
+            if path.starts_with("/api/chapter?") {
+                assert!(path.contains("manga=30303030-3030-3030-3030-303030303030"));
+                assert!(path.contains("chapter=3"));
+                assert!(
+                    path.contains("translatedLanguage%5B%5D=en")
+                        || path.contains("translatedLanguage[]=en")
+                );
                 return (200, feed.clone());
             }
             if path == "/api/manga/30303030-3030-3030-3030-303030303030" {
@@ -2534,7 +2607,13 @@ mod tests {
         let image_two = png_bytes([20, 30, 40]);
         let image_ten = png_bytes([50, 60, 70]);
         let (base, thread) = mock_server(5, move |path, base| {
-            if path.starts_with("/api/manga/55555555-5555-5555-5555-555555555555/feed?") {
+            if path.starts_with("/api/chapter?") {
+                assert!(path.contains("manga=55555555-5555-5555-5555-555555555555"));
+                assert!(path.contains("chapter=1"));
+                assert!(
+                    path.contains("translatedLanguage%5B%5D=en")
+                        || path.contains("translatedLanguage[]=en")
+                );
                 return (200, feed.clone());
             }
             if path == "/api/manga/55555555-5555-5555-5555-555555555555" {
@@ -2615,7 +2694,13 @@ mod tests {
         let image_one = png_bytes([80, 90, 100]);
         let image_three = png_bytes([110, 120, 130]);
         let (base, thread) = mock_server(5, move |path, base| {
-            if path.starts_with("/api/manga/77777777-7777-7777-7777-777777777777/feed?") {
+            if path.starts_with("/api/chapter?") {
+                assert!(path.contains("manga=77777777-7777-7777-7777-777777777777"));
+                assert!(path.contains("chapter=2"));
+                assert!(
+                    path.contains("translatedLanguage%5B%5D=en")
+                        || path.contains("translatedLanguage[]=en")
+                );
                 return (200, feed.clone());
             }
             if path == "/api/manga/77777777-7777-7777-7777-777777777777" {
