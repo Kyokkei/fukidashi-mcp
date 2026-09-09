@@ -468,7 +468,7 @@ impl MangaDexClient {
             query.append_pair("order[chapter]", "asc");
             query.append_pair("includes[]", "scanlation_group");
             if let Some(chapter) = request.chapter.as_deref() {
-                query.append_pair("chapter", chapter);
+                query.append_pair("chapter[]", chapter);
             }
             if let Some(language) = request.translated_language.as_deref() {
                 validate_language(language)?;
@@ -2144,6 +2144,41 @@ mod tests {
         assert!(message.contains("translated_language mismatch"));
         assert!(message.contains("requested \"en\""));
         assert!(message.contains("\"ja\""));
+    }
+
+    #[tokio::test]
+    async fn exact_chapter_filter_uses_the_mangadex_array_query_key() {
+        let manga_id = "abababab-abab-abab-abab-abababababab";
+        let chapter_id = "bcbcbcbc-bcbc-bcbc-bcbc-bcbcbcbcbcbc";
+        let chapter = chapter_json(chapter_id, manga_id, "178");
+        let body = serde_json::to_vec(&json!({"data": [chapter]})).unwrap();
+        let (base, thread) = mock_server(1, move |path, _base| {
+            assert!(path.starts_with("/api/manga/abababab-abab-abab-abab-abababababab/feed?"));
+            assert!(
+                path.contains("chapter%5B%5D=178") || path.contains("chapter[]=178"),
+                "expected encoded chapter[] filter in {path}"
+            );
+            assert!(!path.contains("chapter=178"));
+            (200, body.clone())
+        });
+        let client = MangaDexClient::with_base_url(&base).unwrap();
+        let resolved = client
+            .resolve_chapter(&PullChapterRequest {
+                source: "mangadex".into(),
+                manga_id: Some(manga_id.into()),
+                chapter_id: None,
+                chapter: Some("178".into()),
+                latest: false,
+                translated_language: Some("en".into()),
+                data_saver: "full".into(),
+                url: None,
+                job_name: None,
+            })
+            .await
+            .unwrap();
+        thread.join().unwrap();
+        assert_eq!(resolved["chapter_id"], chapter_id);
+        assert_eq!(resolved["chapter"], "178");
     }
 
     #[tokio::test]
