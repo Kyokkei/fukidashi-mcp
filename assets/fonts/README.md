@@ -4,15 +4,23 @@ The MCP embeds these unmodified TTF files with `include_bytes!` in
 `src/fonts.rs`. A typeset request with no explicit `font_path` uses Comic Neue
 Regular and copies it atomically into the managed job's `fonts/` directory.
 Caller fallbacks retain precedence; the built-in fallback order then uses
-Patrick Hand Regular for glyph coverage (including Vietnamese) and Comic Neue
-Bold for an available heavier face. Configured and platform font discovery
-remains the final fallback for scripts these three faces do not contain.
+Patrick Hand Regular for glyph coverage (including Vietnamese), Noto Sans
+Symbols 2 for symbols such as U+2764, and Comic Neue Bold for an available
+heavier face. Font selection is per grapheme cluster, so a symbol fallback
+never replaces a whole Vietnamese sentence. Configured and platform font
+discovery remains the final fallback for scripts these faces do not contain.
 
 The files were downloaded from the authoritative Google Fonts repository at
 commit `5e35378e6bda803962ee6fd257e444a7d459660`:
 
 - [Comic Neue directory](https://github.com/google/fonts/tree/5e35378e6bda803962ee6fd257e444a7d459660/ofl/comicneue)
 - [Patrick Hand directory](https://github.com/google/fonts/tree/5e35378e6bda803962ee6fd257e444a7d459660/ofl/patrickhand)
+
+Noto Sans Symbols 2 Regular is pinned to commit
+`9e4615157244fde4413fa7a297b1e1380e674ebb` from the upstream
+[notofonts/NotoSansSymbols2 repository](https://github.com/notofonts/NotoSansSymbols2).
+Its unmodified SIL Open Font License text is retained as
+`NotoSansSymbols2-OFL.txt`.
 
 `ComicNeue-OFL.txt` and `PatrickHand-OFL.txt` are the upstream SIL Open Font
 License 1.1 texts. `ComicNeue-METADATA.pb` and `PatrickHand-METADATA.pb` are
@@ -33,6 +41,7 @@ SHA-256 hashes of the vendored TTFs:
 | `ComicNeue-Regular.ttf` | `a0ee5a37c8b27c4db0700137d928598b1e23b0089e1546a8961909176b779360` |
 | `ComicNeue-Bold.ttf` | `3e7e5fccfd7e0788f317b43312151c1bd5cf058c9697a8d83eac3939050bd61e` |
 | `PatrickHand-Regular.ttf` | `0f173b3e6cb6d1af25babf7f0057c5ac4ee11f9992b0469bb817e967ef4ad0fc` |
+| `NotoSansSymbols2-Regular.ttf` | `41bf5d61b91184df45013e616b34e963a31036e04eed4aad673cc713a5e59133` |
 
 Patrick Hand Regular's official metadata declares the `vietnamese` subset.
 The repository test also checks the Vietnamese base letters ă, â, đ, ê, ô, ơ,
@@ -41,6 +50,6 @@ Neue's official metadata declares the smaller `latin` subset, so Vietnamese
 grapheme clusters deliberately reach Patrick Hand through per-grapheme
 fallback while supported ASCII clusters stay in Comic Neue.
 
-When distributing a binary, retain the two OFL texts and this attribution with
+When distributing a binary, retain the three OFL texts and this attribution with
 the release notices. The binary itself contains the font bytes; it does not
 read this directory at runtime and does not download fonts.

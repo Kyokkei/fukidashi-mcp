@@ -79,7 +79,7 @@ struct Shaper<'a> {
 }
 
 trait TextShaper {
-    fn metrics(&self) -> Metrics;
+    fn metrics_for_text(&self, text: &str) -> Metrics;
     fn shape(&self, text: &str) -> Result<ShapedLine>;
 }
 
@@ -207,7 +207,7 @@ impl<'a> Shaper<'a> {
 }
 
 impl TextShaper for Shaper<'_> {
-    fn metrics(&self) -> Metrics {
+    fn metrics_for_text(&self, _text: &str) -> Metrics {
         self.metrics
     }
 
@@ -223,25 +223,41 @@ struct MultiShaper<'a> {
 }
 
 impl<'a> MultiShaper<'a> {
-    fn new(fonts: &'a [FontCandidate<'a>], size: f32) -> Result<Self> {
+    fn new(
+        fonts: &'a [FontCandidate<'a>],
+        size: f32,
+        active_font_indices: &[usize],
+    ) -> Result<Self> {
         if fonts.is_empty() {
             bail!("at least one font candidate is required");
         }
         if !size.is_finite() || size <= 0.0 {
             bail!("font size must be finite and positive");
         }
-        let primary = Face::from_slice(fonts[0].bytes, 0)
-            .ok_or_else(|| anyhow!("unable to parse primary font {}", fonts[0].id))?;
-        let upem = primary.units_per_em() as f32;
-        if upem <= 0.0 {
-            bail!("font has invalid units_per_em");
+        // Validate every candidate up front. A later text edit may exercise a
+        // fallback that the original render did not use, so the full ordered
+        // candidate list must remain usable across rerenders.
+        for candidate in fonts {
+            let face = Face::from_slice(candidate.bytes, 0)
+                .ok_or_else(|| anyhow!("unable to parse font {}", candidate.id))?;
+            if face.units_per_em() == 0 {
+                bail!("font {} has invalid units_per_em", candidate.id);
+            }
         }
+        let active_font_indices = if active_font_indices.is_empty() {
+            &[0][..]
+        } else {
+            active_font_indices
+        };
         let mut metrics = Metrics {
             ascent: 0.0,
             descent: 0.0,
             leading: 0.0,
         };
-        for candidate in fonts {
+        for &index in active_font_indices {
+            let candidate = fonts
+                .get(index)
+                .ok_or_else(|| anyhow!("font candidate index {index} is out of range"))?;
             let face = Face::from_slice(candidate.bytes, 0)
                 .ok_or_else(|| anyhow!("unable to parse font {}", candidate.id))?;
             let candidate_upem = face.units_per_em() as f32;
@@ -264,50 +280,6 @@ impl<'a> MultiShaper<'a> {
             size,
             metrics,
         })
-    }
-
-    fn choose_font(&self, cluster: &str) -> Result<usize> {
-        let required = cluster
-            .chars()
-            .filter(|character| requires_font_glyph(*character))
-            .collect::<Vec<_>>();
-        if required.is_empty() {
-            return Ok(0);
-        }
-        let mut missing_by_font = Vec::new();
-        for (index, candidate) in self.fonts.iter().enumerate() {
-            let face = Face::from_slice(candidate.bytes, 0)
-                .ok_or_else(|| anyhow!("unable to parse font {}", candidate.id))?;
-            let missing = required
-                .iter()
-                .copied()
-                .filter(|character| {
-                    face.glyph_index(*character)
-                        .is_none_or(|glyph| glyph.0 == 0)
-                })
-                .collect::<Vec<_>>();
-            if missing.is_empty() {
-                return Ok(index);
-            }
-            missing_by_font.push((candidate.id, missing));
-        }
-        let details = missing_by_font
-            .iter()
-            .map(|(font, missing)| {
-                format!(
-                    "{font}: {}",
-                    missing
-                        .iter()
-                        .map(|character| format!("U+{:04X}", u32::from(*character)))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        bail!(
-            "grapheme cluster {cluster:?} has no single font covering it; missing code points by candidate: {details}"
-        )
     }
 
     fn shape_run(
@@ -389,7 +361,7 @@ impl<'a> MultiShaper<'a> {
 }
 
 impl TextShaper for MultiShaper<'_> {
-    fn metrics(&self) -> Metrics {
+    fn metrics_for_text(&self, _text: &str) -> Metrics {
         self.metrics
     }
 
@@ -409,7 +381,7 @@ impl TextShaper for MultiShaper<'_> {
         }
         let mut runs = Vec::<(usize, String)>::new();
         for cluster in UnicodeSegmentation::graphemes(text, true) {
-            let index = self.choose_font(cluster)?;
+            let index = choose_font_index(self.fonts, cluster)?;
             if let Some((last_index, last_text)) = runs.last_mut()
                 && *last_index == index
             {
@@ -453,6 +425,64 @@ impl TextShaper for MultiShaper<'_> {
             bottom,
         })
     }
+}
+
+fn active_font_indices(fonts: &[FontCandidate<'_>], text: &str) -> Result<Vec<usize>> {
+    let mut active = Vec::new();
+    for cluster in UnicodeSegmentation::graphemes(text, true) {
+        let index = choose_font_index(fonts, cluster)?;
+        if !active.contains(&index) {
+            active.push(index);
+        }
+    }
+    if active.is_empty() {
+        active.push(0);
+    }
+    Ok(active)
+}
+
+fn choose_font_index(fonts: &[FontCandidate<'_>], cluster: &str) -> Result<usize> {
+    let required = cluster
+        .chars()
+        .filter(|character| requires_font_glyph(*character))
+        .collect::<Vec<_>>();
+    if required.is_empty() {
+        return Ok(0);
+    }
+    let mut missing_by_font = Vec::new();
+    for (index, candidate) in fonts.iter().enumerate() {
+        let face = Face::from_slice(candidate.bytes, 0)
+            .ok_or_else(|| anyhow!("unable to parse font {}", candidate.id))?;
+        let missing = required
+            .iter()
+            .copied()
+            .filter(|character| {
+                face.glyph_index(*character)
+                    .is_none_or(|glyph| glyph.0 == 0)
+            })
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return Ok(index);
+        }
+        missing_by_font.push((candidate.id, missing));
+    }
+    let details = missing_by_font
+        .iter()
+        .map(|(font, missing)| {
+            format!(
+                "{font}: {}",
+                missing
+                    .iter()
+                    .map(|character| format!("U+{:04X}", u32::from(*character)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!(
+        "grapheme cluster {cluster:?} has no single font covering it; missing code points by candidate: {details}"
+    )
 }
 
 fn requires_font_glyph(character: char) -> bool {
@@ -536,6 +566,11 @@ pub fn fit_text_with_font_candidates(
     if fonts.is_empty() {
         bail!("at least one font candidate is required");
     }
+    // Font coverage is independent of point size. Resolve the complete text
+    // once so each size candidate computes line metrics from the faces that
+    // actually participate in this text, rather than every available
+    // fallback face.
+    let active_font_indices = active_font_indices(fonts, text)?;
     fit_text_with_factory(
         bbox,
         bubble_bbox,
@@ -545,7 +580,7 @@ pub fn fit_text_with_font_candidates(
         max_font_size,
         padding,
         text,
-        |size| MultiShaper::new(fonts, size),
+        |size| MultiShaper::new(fonts, size, &active_font_indices),
     )
 }
 
@@ -651,6 +686,7 @@ fn fit_at_size(
     shape: &str,
     placement_center: (f32, f32),
 ) -> Result<Option<Vec<ShapedLine>>> {
+    let metrics = shaper.metrics_for_text(text);
     let tokens = UnicodeSegmentation::graphemes(text, true)
         .map(str::to_owned)
         .collect::<Vec<_>>();
@@ -681,7 +717,6 @@ fn fit_at_size(
     let min_lines = 1;
     let max_lines = n.saturating_add(1).clamp(1, 256);
     for line_count in min_lines..=max_lines {
-        let metrics = shaper.metrics();
         let block_height = line_count as f32 * (metrics.ascent + metrics.descent)
             + (line_count.saturating_sub(1) as f32) * metrics.leading;
         if block_height > 2.0 * b + 1e-3 {

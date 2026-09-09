@@ -19,6 +19,9 @@ pub enum BundledFontRole {
     Emphasis,
     /// Handwritten text and glyph coverage fallback, including Vietnamese.
     HandwritingAndVietnameseFallback,
+    /// Compact symbol coverage used only for graphemes absent from the
+    /// requested primary and earlier fallback faces.
+    SymbolFallback,
 }
 
 /// Metadata and bytes for one embedded TTF.
@@ -86,16 +89,37 @@ pub static PATRICK_HAND_REGULAR: BundledFont = BundledFont {
     sha256: "0f173b3e6cb6d1af25babf7f0057c5ac4ee11f9992b0469bb817e967ef4ad0fc",
 };
 
+/// Noto Sans Symbols 2 supplies cross-platform symbols such as U+2764. It
+/// is ordered after Patrick Hand so ordinary Vietnamese dialogue keeps its
+/// intended face and only unsupported graphemes use this compact fallback.
+pub static NOTO_SANS_SYMBOLS2_REGULAR: BundledFont = BundledFont {
+    id: "noto-sans-symbols2-regular",
+    file_name: "NotoSansSymbols2-Regular.ttf",
+    role: BundledFontRole::SymbolFallback,
+    bytes: include_bytes!("../assets/fonts/NotoSansSymbols2-Regular.ttf"),
+    sha256: "41bf5d61b91184df45013e616b34e963a31036e04eed4aad673cc713a5e59133",
+};
+
 /// All faces shipped with the release, in their default preference order.
-pub fn bundled_fonts() -> [&'static BundledFont; 3] {
-    [&COMIC_NEUE_REGULAR, &COMIC_NEUE_BOLD, &PATRICK_HAND_REGULAR]
+pub fn bundled_fonts() -> [&'static BundledFont; 4] {
+    [
+        &COMIC_NEUE_REGULAR,
+        &COMIC_NEUE_BOLD,
+        &PATRICK_HAND_REGULAR,
+        &NOTO_SANS_SYMBOLS2_REGULAR,
+    ]
 }
 
 /// Per-grapheme fallbacks appended after caller-supplied fallbacks. Patrick
 /// Hand comes first because its official Vietnamese subset covers the common
-/// precomposed and combining forms that Comic Neue's latin subset does not.
-pub fn bundled_fallbacks() -> [&'static BundledFont; 2] {
-    [&PATRICK_HAND_REGULAR, &COMIC_NEUE_BOLD]
+/// precomposed and combining forms that Comic Neue's Latin subset does not;
+/// Noto Sans Symbols 2 is reached only for symbol graphemes such as U+2764.
+pub fn bundled_fallbacks() -> [&'static BundledFont; 3] {
+    [
+        &PATRICK_HAND_REGULAR,
+        &NOTO_SANS_SYMBOLS2_REGULAR,
+        &COMIC_NEUE_BOLD,
+    ]
 }
 
 #[cfg(test)]
@@ -147,5 +171,11 @@ mod tests {
             PATRICK_HAND_REGULAR.role,
             BundledFontRole::HandwritingAndVietnameseFallback
         );
+        assert_eq!(
+            NOTO_SANS_SYMBOLS2_REGULAR.role,
+            BundledFontRole::SymbolFallback
+        );
+        assert!(NOTO_SANS_SYMBOLS2_REGULAR.covers("❤"));
+        assert!(!COMIC_NEUE_REGULAR.covers("❤"));
     }
 }

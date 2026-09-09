@@ -1801,7 +1801,7 @@ impl FukidashiServer {
 
     #[tool(
         name = "fukidashi_pull_chapter",
-        description = "Import a chapter into a new server-owned Fukidashi job. MangaDex mode accepts only an exact manga_id or chapter_id plus optional exact chapter/language filters and reports ambiguity instead of guessing; data_saver='full' selects full data by default (legacy booleans are accepted). Direct mode accepts one explicit http(s) url and invokes an already installed gallery-dl helper with bounded, transactional staging. The response includes job_id/job_path/page_count/source metadata and the exact fukidashi_translation_start next step; do not shell-read or invent paths."
+        description = "Import a chapter into a new server-owned Fukidashi job. MangaDex mode accepts only an exact manga_id or chapter_id plus optional exact chapter/language filters and reports ambiguity instead of guessing; data_saver='full' selects full data by default (legacy booleans are accepted). Direct mode accepts one explicit http(s) url, an optional bounded job_name label, and invokes an already installed gallery-dl helper with bounded, transactional staging. Imported job prefixes use the canonical manga title/chapter or a conservative URL label; labels never choose paths. The response includes job_id/job_path/page_count/source metadata and the exact fukidashi_translation_start next step; do not shell-read or invent paths."
     )]
     pub async fn pull_chapter(
         &self,
@@ -3673,17 +3673,22 @@ mod tests {
             std::fs::read(&default).unwrap(),
             crate::fonts::COMIC_NEUE_REGULAR.bytes
         );
-        assert_eq!(fallbacks.len(), 2);
+        assert_eq!(fallbacks.len(), 3);
         assert_eq!(
             std::fs::read(&fallbacks[0]).unwrap(),
             crate::fonts::PATRICK_HAND_REGULAR.bytes
         );
         assert_eq!(
             std::fs::read(&fallbacks[1]).unwrap(),
+            crate::fonts::NOTO_SANS_SYMBOLS2_REGULAR.bytes
+        );
+        assert_eq!(
+            std::fs::read(&fallbacks[2]).unwrap(),
             crate::fonts::COMIC_NEUE_BOLD.bytes
         );
         assert!(std::path::Path::new(&fallbacks[0]).starts_with(&job));
         assert!(std::path::Path::new(&fallbacks[1]).starts_with(&job));
+        assert!(std::path::Path::new(&fallbacks[2]).starts_with(&job));
 
         let second = materialize_bundled_typeset_fonts(&workflow, &job, &mut bubbles).unwrap();
         assert_eq!(second, fallbacks);

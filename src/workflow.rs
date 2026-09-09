@@ -5,13 +5,13 @@
 //! artifact gets a small sidecar whose source path and hashes form a chain.
 
 use anyhow::{Context, Result, anyhow, bail};
-use image::{GenericImageView, GrayImage, RgbImage};
+use image::{GenericImageView, GrayImage, ImageFormat, RgbImage};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -22,6 +22,11 @@ const CLEAN_SIDECAR_SUFFIX: &str = ".fukidashi-clean.json";
 const RENDER_SIDECAR_SUFFIX: &str = ".fukidashi-render.json";
 const LEGACY_MANIFEST_NAME: &str = ".fukidashi-job.json";
 const MANIFEST_NAME: &str = "job.json";
+const MAX_INGRESS_PAGES: usize = 500;
+const MAX_INGRESS_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_INGRESS_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_INGRESS_IMAGE_DIMENSION: u32 = 12_000;
+const MAX_INGRESS_IMAGE_PIXELS: u64 = 100_000_000;
 
 #[derive(Debug, Clone)]
 struct PageArtifacts {
@@ -115,6 +120,15 @@ pub struct Registration {
     pub job_dir: PathBuf,
     pub expected_pages: Vec<PathBuf>,
     pub page_state: String,
+}
+
+/// One image already staged by an ingress provider. The workflow validates
+/// that the path is inside the provider-owned staging directory, decodes one
+/// file at a time, and publishes a fresh managed job atomically.
+#[derive(Debug, Clone)]
+pub struct IngressPageFile {
+    pub original_name: String,
+    pub path: PathBuf,
 }
 
 /// The first page in a managed job that has not reached a verified render.
@@ -335,18 +349,175 @@ impl Workflow {
         Ok(job)
     }
 
-    /// Publish a brand-new managed job from pages obtained by an ingress
-    /// provider.  The caller supplies decoded images only; paths and the
-    /// manifest are created here so imported content follows the same V2
-    /// layout as a locally registered source.  The staging directory is
-    /// owned by this operation and is the only path removed on failure.
+    /// Publish a brand-new managed job from image files obtained by an
+    /// ingress provider. Files remain in the provider-owned staging tree
+    /// until they are validated and copied one at a time into the new V2
+    /// job. The workflow never retains a complete chapter in memory and the
+    /// only path removed on failure is its own unpublished job staging tree.
+    pub fn import_ingress_files(
+        &self,
+        slug: &str,
+        staging_root: &Path,
+        pages: Vec<IngressPageFile>,
+        provenance: serde_json::Value,
+    ) -> Result<Registration> {
+        if pages.is_empty() {
+            bail!("ingress returned no pages");
+        }
+        if pages.len() > MAX_INGRESS_PAGES {
+            bail!("ingress page count exceeds {MAX_INGRESS_PAGES}");
+        }
+
+        reject_symlink_ancestors(staging_root)
+            .with_context(|| format!("inspect ingress staging root {}", staging_root.display()))?;
+        let staging_root = canonical_path(staging_root)
+            .with_context(|| format!("resolve ingress staging root {}", staging_root.display()))?;
+        let root_metadata = fs::symlink_metadata(&staging_root)
+            .with_context(|| format!("inspect ingress staging root {}", staging_root.display()))?;
+        if !root_metadata.is_dir()
+            || root_metadata.file_type().is_symlink()
+            || is_reparse_point(&root_metadata)
+        {
+            bail!(
+                "ingress staging root is not a regular directory: {}",
+                staging_root.display()
+            );
+        }
+
+        let mut names = std::collections::HashSet::new();
+        let mut total_bytes = 0_u64;
+        for page in &pages {
+            validate_ingress_page_name(&page.original_name)?;
+            if !names.insert(page.original_name.to_ascii_lowercase()) {
+                bail!("ingress page names must be unique: {}", page.original_name);
+            }
+            if !page.path.is_absolute() {
+                bail!(
+                    "ingress page path must be absolute: {}",
+                    page.path.display()
+                );
+            }
+            reject_symlink_ancestors(&page.path)?;
+            let metadata = fs::symlink_metadata(&page.path)
+                .with_context(|| format!("inspect staged ingress page {}", page.path.display()))?;
+            if metadata.file_type().is_symlink()
+                || is_reparse_point(&metadata)
+                || !metadata.is_file()
+            {
+                bail!(
+                    "ingress page is not a regular file without links: {}",
+                    page.path.display()
+                );
+            }
+            let canonical = canonical_path(&page.path)?;
+            if !path_starts_with(&canonical, &staging_root) {
+                bail!(
+                    "ingress page escaped its staging directory: {}",
+                    page.path.display()
+                );
+            }
+            if metadata.len() == 0 || metadata.len() > MAX_INGRESS_FILE_BYTES {
+                bail!(
+                    "ingress page {} exceeds the per-page byte limit",
+                    page.original_name
+                );
+            }
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            if total_bytes > MAX_INGRESS_TOTAL_BYTES {
+                bail!("ingress pages exceed the total image byte limit");
+            }
+        }
+
+        let slug = sanitize_ingress_slug(slug);
+        let stage = self
+            .root
+            .join(format!(".ingress-staging-{}", Uuid::new_v4().simple()));
+        let job = self
+            .root
+            .join(format!("{}--{}", slug, Uuid::new_v4().simple()));
+        let result = (|| -> Result<Registration> {
+            create_dir_all_owned(&stage, &self.root)?;
+            create_job_layout(&stage, None)?;
+            let source_dir = job.join("source");
+            let expected_pages = pages
+                .iter()
+                .enumerate()
+                .map(|(index, _)| source_dir.join(format!("{:04}.png", index + 1)))
+                .collect::<Vec<_>>();
+            let mut page_records = std::collections::BTreeMap::new();
+            let mut provenance_pages = Vec::with_capacity(pages.len());
+            for (index, page) in pages.into_iter().enumerate() {
+                let canonical = canonical_path(&page.path)?;
+                validate_ingress_image_file(&canonical, &page.original_name)?;
+                let image = image::ImageReader::open(&canonical)
+                    .with_context(|| format!("open staged ingress page {}", canonical.display()))?
+                    .with_guessed_format()
+                    .with_context(|| {
+                        format!("identify staged ingress page {}", canonical.display())
+                    })?
+                    .decode()
+                    .with_context(|| format!("decode staged ingress page {}", canonical.display()))?
+                    .to_rgb8();
+                let staged = stage.join("source").join(format!("{:04}.png", index + 1));
+                save_image_atomic_owned(&staged, image)
+                    .with_context(|| format!("stage ingress page {}", page.original_name))?;
+                let final_source = &expected_pages[index];
+                page_records.insert(
+                    page_key(final_source),
+                    PageManifest {
+                        source_image: final_source.clone(),
+                        state: "pending".into(),
+                        source_sha256: sha256_file(&staged)?,
+                        cleaned_image: None,
+                        rendered_image: None,
+                    },
+                );
+                provenance_pages.push(json!({
+                    "page_number": index + 1,
+                    "original_name": page.original_name,
+                    "source_image": final_source,
+                }));
+            }
+            let manifest = JobManifest {
+                stage: "ingress".into(),
+                source_dir,
+                pages: page_records,
+                expected_pages: expected_pages.clone(),
+            };
+            create_page_layouts(&stage, &manifest)?;
+            save_manifest(&stage, &manifest)?;
+            atomic_json(
+                &stage.join("ingress.json"),
+                &json!({
+                    "schema": "fukidashi-ingress/v1",
+                    "source": provenance,
+                    "pages": provenance_pages,
+                }),
+            )?;
+            fs::rename(&stage, &job)
+                .with_context(|| format!("publish imported job {}", job.display()))?;
+            Ok(Registration {
+                job_dir: job.clone(),
+                expected_pages,
+                page_state: "pending".into(),
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&stage);
+        }
+        result
+    }
+
+    /// Test-only compatibility helper for older in-memory fixtures. Production
+    /// ingress uses `import_ingress_files` so a whole chapter is never held as
+    /// decoded images.
+    #[cfg(test)]
     pub fn import_ingress_pages(
         &self,
         slug: &str,
         pages: Vec<(String, RgbImage)>,
         provenance: serde_json::Value,
     ) -> Result<Registration> {
-        const MAX_INGRESS_PAGES: usize = 500;
         if pages.is_empty() {
             bail!("ingress returned no pages");
         }
@@ -1711,8 +1882,12 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                     // Older sidecars contain explicit JSON nulls for optional
                     // geometry. Treat those as absent so the concrete layout
                     // produced by the renderer is available to editor
-                    // rerenders.
-                    if bubble.get(key).is_none_or(serde_json::Value::is_null) {
+                    // rerenders. A current report's full fallback list also
+                    // supersedes a request's used-only legacy list.
+                    let replace_fallback_list = key == "fallback_font_paths" && value.is_array();
+                    if replace_fallback_list
+                        || bubble.get(key).is_none_or(serde_json::Value::is_null)
+                    {
                         bubble.insert(key.clone(), value.clone());
                     }
                 }
@@ -1861,9 +2036,9 @@ fn reject_symlink_ancestors(path: &Path) -> Result<()> {
     let mut current = lexical_normalize(&absolute);
     loop {
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata.file_type().is_symlink() || is_reparse_point(&metadata) => {
                 bail!(
-                    "path component is a symlink or junction: {}",
+                    "path component is a symlink, junction, or reparse point: {}",
                     current.display()
                 )
             }
@@ -1880,6 +2055,17 @@ fn reject_symlink_ancestors(path: &Path) -> Result<()> {
         current = parent.to_path_buf();
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_: &fs::Metadata) -> bool {
+    false
 }
 
 fn create_dir_all_owned(path: &Path, boundary: &Path) -> Result<()> {
@@ -2373,9 +2559,18 @@ fn lock_owner_is_alive(path: &Path) -> bool {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let mut hasher = Sha256::new();
-    hasher.update(bytes);
+    let mut file = fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -2395,6 +2590,10 @@ fn atomic_json(path: &Path, value: &serde_json::Value) -> Result<()> {
 }
 
 fn save_image_atomic(path: &Path, image: &RgbImage) -> Result<()> {
+    save_image_atomic_owned(path, image.clone())
+}
+
+fn save_image_atomic_owned(path: &Path, image: RgbImage) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("image has no parent directory"))?;
@@ -2402,8 +2601,7 @@ fn save_image_atomic(path: &Path, image: &RgbImage) -> Result<()> {
     fs::create_dir_all(parent)?;
     reject_symlink_ancestors(parent)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    image::DynamicImage::ImageRgb8(image.clone())
-        .write_to(temp.as_file_mut(), image::ImageFormat::Png)?;
+    image::DynamicImage::ImageRgb8(image).write_to(temp.as_file_mut(), image::ImageFormat::Png)?;
     temp.as_file().sync_all()?;
     temp.persist(path)
         .map(|_| ())
@@ -2424,6 +2622,67 @@ fn save_gray_image_atomic(path: &Path, image: &GrayImage) -> Result<()> {
     temp.persist(path)
         .map(|_| ())
         .map_err(|error| anyhow!("promote mask: {}", error.error))
+}
+
+fn sanitize_ingress_slug(raw: &str) -> String {
+    let slug = raw
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if slug.is_empty() {
+        "ingress".to_owned()
+    } else {
+        slug.chars().take(48).collect()
+    }
+}
+
+fn validate_ingress_page_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > 240
+        || name.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        })
+    {
+        bail!("ingress page name is not a safe single filename: {name:?}");
+    }
+    Ok(())
+}
+
+fn validate_ingress_image_file(path: &Path, name: &str) -> Result<()> {
+    let reader = image::ImageReader::open(path)
+        .with_context(|| format!("open ingress image {name}"))?
+        .with_guessed_format()
+        .with_context(|| format!("identify ingress image {name}"))?;
+    let format = reader
+        .format()
+        .ok_or_else(|| anyhow!("ingress image {name} has no recognized format"))?;
+    if !matches!(
+        format,
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
+    ) {
+        bail!("ingress image format must be PNG, JPEG, or WebP: {name}");
+    }
+    let (width, height) = reader
+        .into_dimensions()
+        .with_context(|| format!("read dimensions for ingress image {name}"))?;
+    if width == 0
+        || height == 0
+        || width > MAX_INGRESS_IMAGE_DIMENSION
+        || height > MAX_INGRESS_IMAGE_DIMENSION
+        || u64::from(width) * u64::from(height) > MAX_INGRESS_IMAGE_PIXELS
+    {
+        bail!("ingress image dimensions exceed configured limits: {name}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2955,6 +3214,28 @@ mod tests {
             "page-1",
         );
         assert_eq!(cleared[0]["flagged"], false);
+    }
+
+    #[test]
+    fn editor_bubbles_round_trip_the_reported_full_fallback_candidate_list() {
+        let bubbles = editor_bubbles(
+            &json!({
+                "request_bubbles": [{
+                    "id": "b1",
+                    "bbox": {"x1":1,"y1":1,"x2":8,"y2":8},
+                    "text": "Hello"
+                }],
+                "report": {"bubbles": [{
+                    "fallback_font_paths": ["primary-used.ttf", "symbol-unused.ttf"],
+                    "fallback_fonts_used": ["primary-used.ttf"]
+                }]}
+            }),
+            "page-1",
+        );
+        assert_eq!(
+            bubbles[0]["fallback_font_paths"],
+            json!(["primary-used.ttf", "symbol-unused.ttf"])
+        );
     }
 
     #[test]

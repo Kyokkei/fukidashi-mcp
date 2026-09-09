@@ -127,6 +127,11 @@ pub fn typeset_page_with_fallbacks(
             .filter(|(candidate_index, _)| *candidate_index > 0 && used.contains(candidate_index))
             .map(|(_, candidate)| candidate.id.to_owned())
             .collect::<Vec<_>>();
+        let fallback_font_paths = candidates
+            .iter()
+            .skip(1)
+            .map(|candidate| candidate.id.to_owned())
+            .collect::<Vec<_>>();
         let primary_used = used.contains(&0);
         reports.push(json!({
             "index": index,
@@ -152,7 +157,10 @@ pub fn typeset_page_with_fallbacks(
             } else {
                 requested_font_path.clone()
             },
-            "fallback_font_paths": fallback_fonts_used.clone(),
+            // Keep every validated fallback candidate in preference order.
+            // `fallback_fonts_used` remains the subset used by this render;
+            // editor rerenders need the complete list after a later text edit.
+            "fallback_font_paths": fallback_font_paths,
             "fallback_fonts_used": fallback_fonts_used,
             "font_fallback_used": !fallback_fonts_used.is_empty(),
             "mixed_font_fallback_used": primary_used && !fallback_fonts_used.is_empty(),
@@ -429,9 +437,9 @@ mod tests {
     fn per_grapheme_fallback_keeps_primary_and_uses_fallback_for_missing_cluster() {
         let directory = tempfile::tempdir().unwrap();
         let requested = directory.path().join("ComicNeue-Regular.ttf");
-        let fallback = directory.path().join("PatrickHand-Regular.ttf");
+        let fallback = directory.path().join("NotoSansSymbols2-Regular.ttf");
         fs::write(&requested, crate::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
-        fs::write(&fallback, crate::fonts::PATRICK_HAND_REGULAR.bytes).unwrap();
+        fs::write(&fallback, crate::fonts::NOTO_SANS_SYMBOLS2_REGULAR.bytes).unwrap();
         let requested_bytes = fs::read(&requested).unwrap();
         let fallback_bytes = fs::read(&fallback).unwrap();
         let requested_font =
@@ -454,7 +462,7 @@ mod tests {
         ];
         let layout = fit_text_with_font_candidates(
             &candidates,
-            "Hello ♥",
+            "Hello ❤",
             Rect {
                 x1: 0.0,
                 y1: 0.0,
@@ -477,6 +485,124 @@ mod tests {
                 .glyphs
                 .iter()
                 .any(|glyph| glyph.font_index == 1)
+        );
+    }
+
+    #[test]
+    fn unused_fallback_does_not_change_primary_metrics() {
+        let primary_bytes = crate::fonts::COMIC_NEUE_REGULAR.bytes;
+        let fallback_bytes = crate::fonts::NOTO_SANS_SYMBOLS2_REGULAR.bytes;
+        let primary_font =
+            fontdue::Font::from_bytes(primary_bytes, fontdue::FontSettings::default()).unwrap();
+        let fallback_font =
+            fontdue::Font::from_bytes(fallback_bytes, fontdue::FontSettings::default()).unwrap();
+        let primary_only = [FontCandidate {
+            id: "primary",
+            bytes: primary_bytes,
+            font: &primary_font,
+        }];
+        let with_unused_fallback = [
+            primary_only[0],
+            FontCandidate {
+                id: "symbols",
+                bytes: fallback_bytes,
+                font: &fallback_font,
+            },
+        ];
+        let bbox = Rect {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 320.0,
+            y2: 100.0,
+        };
+        let first = fit_text_with_font_candidates(
+            &primary_only,
+            "A normal Vietnamese sentence",
+            bbox,
+            None,
+            None,
+            "rectangle",
+            8.0,
+            32.0,
+            None,
+        )
+        .unwrap();
+        let second = fit_text_with_font_candidates(
+            &with_unused_fallback,
+            "A normal Vietnamese sentence",
+            bbox,
+            None,
+            None,
+            "rectangle",
+            8.0,
+            32.0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first.font_size, second.font_size);
+        assert_eq!(first.lines.len(), second.lines.len());
+        for (left, right) in first.lines.iter().zip(second.lines.iter()) {
+            assert!((left.advance_width - right.advance_width).abs() < f32::EPSILON);
+            assert!((left.top - right.top).abs() < f32::EPSILON);
+            assert!((left.bottom - right.bottom).abs() < f32::EPSILON);
+            assert!(right.glyphs.iter().all(|glyph| glyph.font_index == 0));
+        }
+    }
+
+    #[test]
+    fn report_retains_full_fallback_list_for_later_symbol_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.png");
+        let first_output = directory.path().join("first.png");
+        let second_output = directory.path().join("second.png");
+        image::RgbaImage::from_pixel(500, 140, image::Rgba([255, 255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let primary = directory.path().join("ComicNeue-Regular.ttf");
+        let symbols = directory.path().join("NotoSansSymbols2-Regular.ttf");
+        fs::write(&primary, crate::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+        fs::write(&symbols, crate::fonts::NOTO_SANS_SYMBOLS2_REGULAR.bytes).unwrap();
+        let payload = |text: &str| TypesetPayload {
+            id: Some("bubble-1".into()),
+            source_text: Some("source".into()),
+            kind: Some("dialogue".into()),
+            preserve_by_default: Some(false),
+            needs_review: None,
+            flagged: None,
+            preserve_source: None,
+            fallback_font_paths: vec![symbols.display().to_string()],
+            bbox: Rect {
+                x1: 20.0,
+                y1: 20.0,
+                x2: 480.0,
+                y2: 120.0,
+            },
+            bubble_bbox: None,
+            text_bbox: None,
+            padding: None,
+            text: text.into(),
+            font_path: Some(primary.display().to_string()),
+            min_font_size: Some(8.0),
+            max_font_size: Some(28.0),
+            shape: Some("rectangle".into()),
+        };
+        let first =
+            typeset_page_with_fallbacks(&source, &[payload("Hello")], &[], &first_output).unwrap();
+        let report = &first["bubbles"][0];
+        let retained_fallbacks = report["fallback_font_paths"].clone();
+        assert_eq!(retained_fallbacks[0], symbols.display().to_string());
+        assert!(!retained_fallbacks.as_array().unwrap().is_empty());
+        assert_eq!(report["fallback_fonts_used"], json!([]));
+        let second =
+            typeset_page_with_fallbacks(&source, &[payload("Hello ❤")], &[], &second_output)
+                .unwrap();
+        assert_eq!(
+            second["bubbles"][0]["fallback_font_paths"],
+            retained_fallbacks
+        );
+        assert_eq!(
+            second["bubbles"][0]["fallback_fonts_used"],
+            json!([symbols.display().to_string()])
         );
     }
 }

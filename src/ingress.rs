@@ -8,7 +8,6 @@
 use std::{
     cmp::Ordering,
     ffi::OsString,
-    io::Cursor,
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -16,10 +15,13 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
 use image::{ImageFormat, RgbImage};
 use reqwest::{Client, Url, redirect::Policy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+#[cfg(test)]
+use std::io::Cursor;
 use tokio::{
     io::AsyncReadExt,
     process::Command,
@@ -30,20 +32,24 @@ use uuid::Uuid;
 
 use crate::{
     config::Config,
-    workflow::{Registration, Workflow},
+    workflow::{IngressPageFile, Registration, Workflow},
 };
 
 const MANGADEX_BASE_URL: &str = "https://api.mangadex.org/";
 const USER_AGENT: &str = "fukidashi-mcp/0.1 manga-ingress";
 const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_TOTAL_IMAGE_BYTES: usize = 1024 * 1024 * 1024;
+#[cfg(test)]
 const MAX_IMAGE_PIXELS: u64 = 100_000_000;
+#[cfg(test)]
 const MAX_IMAGE_DIMENSION: u32 = 12_000;
 const MAX_PAGES: usize = 500;
 const MAX_RETRIES: usize = 3;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
-const DIRECT_TIMEOUT: Duration = Duration::from_secs(120);
+// A large gallery-dl chapter may legitimately take many minutes on a
+// constrained connection. Keep a finite ceiling while still killing the
+// helper and cleaning its owned staging directory on timeout.
+const DIRECT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SearchMangaRequest {
@@ -87,6 +93,11 @@ pub struct PullChapterRequest {
     /// Explicit http(s) URL for the gallery-dl mode.
     #[serde(default, alias = "direct_url")]
     pub url: Option<String>,
+    /// Optional human-readable label for a direct import. It is sanitized by
+    /// the workflow and never controls an output path.
+    #[serde(default, alias = "title")]
+    #[schemars(length(max = 96))]
+    pub job_name: Option<String>,
 }
 
 fn default_auto_source() -> String {
@@ -232,6 +243,7 @@ impl MangaDexClient {
         validate_mangadex_request(request)?;
         let chapter = self.resolve_chapter_record(request).await?;
         let use_data_saver = Self::uses_data_saver(request);
+        let manga_title = self.manga_title(&chapter.manga_id).await?;
         let at_home = self.at_home(&chapter.id).await?;
         let file_names = at_home
             .get(if use_data_saver { "dataSaver" } else { "data" })
@@ -274,21 +286,31 @@ impl MangaDexClient {
                 let mut segments = url
                     .path_segments_mut()
                     .map_err(|_| anyhow!("MangaDex at-home URL cannot carry path segments"))?;
-                segments.push(hash).push(file_name);
+                segments
+                    .push(if use_data_saver { "data-saver" } else { "data" })
+                    .push(hash)
+                    .push(file_name);
             }
             page_urls.push((file_name.to_owned(), url));
         }
         page_urls.sort_by(|left, right| natural_cmp(&left.0, &right.0));
-        let downloads = self.download_pages(page_urls).await?;
-        let mut total_bytes = 0_usize;
-        let mut pages = Vec::with_capacity(downloads.len());
-        for (name, bytes) in downloads {
-            total_bytes = total_bytes.saturating_add(bytes.len());
-            if total_bytes > MAX_TOTAL_IMAGE_BYTES {
-                bail!("MangaDex chapter exceeds the total image byte limit");
-            }
-            pages.push((name, decode_page(&bytes)?));
-        }
+        let staging = tempfile::tempdir().context("create MangaDex ingress staging")?;
+        let pages = self
+            .download_pages_to_staging(page_urls, staging.path())
+            .await?;
+        let chapter_label = chapter
+            .chapter
+            .as_deref()
+            .or(chapter.title.as_deref())
+            .unwrap_or("unknown")
+            .trim();
+        let title_label = manga_title.as_deref().unwrap_or(&chapter.manga_id);
+        let job_name = request.job_name.as_deref().unwrap_or("").trim();
+        let slug = if job_name.is_empty() {
+            format!("{title_label}-ch-{chapter_label}")
+        } else {
+            job_name.to_owned()
+        };
         let provenance = json!({
             "provider": "mangadex",
             "manga_id": chapter.manga_id,
@@ -297,9 +319,11 @@ impl MangaDexClient {
             "translated_language": request.translated_language,
             "data_saver": request.data_saver,
             "title": chapter.title,
+            "manga_title": manga_title,
+            "job_name": slug,
         });
         let registration =
-            workflow.import_ingress_pages(&chapter.slug, pages, provenance.clone())?;
+            workflow.import_ingress_files(&slug, staging.path(), pages, provenance.clone())?;
         imported_response("mangadex", registration, provenance)
     }
 
@@ -392,19 +416,48 @@ impl MangaDexClient {
             .await
     }
 
-    async fn download_pages(&self, pages: Vec<(String, Url)>) -> Result<Vec<(String, Vec<u8>)>> {
+    async fn manga_title(&self, manga_id: &str) -> Result<Option<String>> {
+        let body = self
+            .get_json(self.endpoint(&format!("manga/{manga_id}"))?)
+            .await?;
+        let attributes = body
+            .get("data")
+            .and_then(|data| data.get("attributes"))
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow!("MangaDex manga response has no attributes"))?;
+        Ok(attributes
+            .get("title")
+            .and_then(Value::as_object)
+            .and_then(pick_title))
+    }
+
+    async fn download_pages_to_staging(
+        &self,
+        pages: Vec<(String, Url)>,
+        staging_root: &Path,
+    ) -> Result<Vec<IngressPageFile>> {
         let semaphore = Arc::new(Semaphore::new(4));
         let mut set = tokio::task::JoinSet::new();
-        for (name, url) in pages {
+        for (index, (name, url)) in pages.into_iter().enumerate() {
             let permit = semaphore.clone();
             let client = self.clone();
+            let staging_path = staging_root.join(format!("{index:04}-{name}"));
             set.spawn(async move {
                 let _permit = permit
                     .acquire_owned()
                     .await
                     .map_err(|_| anyhow!("download concurrency gate closed"))?;
                 let bytes = client.get_bytes(url, MAX_IMAGE_BYTES).await?;
-                Ok::<_, anyhow::Error>((name, bytes))
+                tokio::fs::write(&staging_path, &bytes)
+                    .await
+                    .with_context(|| format!("stage downloaded page {}", staging_path.display()))?;
+                Ok::<_, anyhow::Error>((
+                    index,
+                    IngressPageFile {
+                        original_name: name,
+                        path: staging_path,
+                    },
+                ))
             });
         }
         let mut result = Vec::new();
@@ -421,8 +474,8 @@ impl MangaDexClient {
                 }
             }
         }
-        result.sort_by(|left, right| natural_cmp(&left.0, &right.0));
-        Ok(result)
+        result.sort_by_key(|(index, _)| *index);
+        Ok(result.into_iter().map(|(_, page)| page).collect())
     }
 
     fn endpoint(&self, path: &str) -> Result<Url> {
@@ -481,7 +534,6 @@ struct ResolvedChapter {
     manga_id: String,
     chapter: Option<String>,
     title: Option<String>,
-    slug: String,
     summary: Value,
 }
 
@@ -571,17 +623,11 @@ fn parse_chapter(value: &Value, expected_manga_id: Option<&str>) -> Result<Resol
         .get("title")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let slug = title
-        .as_deref()
-        .or(chapter.as_deref())
-        .unwrap_or("manga")
-        .to_owned();
     Ok(ResolvedChapter {
         id: id.to_owned(),
         manga_id: manga_id.to_owned(),
         chapter: chapter.clone(),
         title: title.clone(),
-        slug,
         summary: json!({
             "chapter_id": id,
             "manga_id": manga_id,
@@ -640,27 +686,38 @@ async fn pull_direct(
         if files.is_empty() {
             bail!("gallery-dl completed without image files");
         }
-        let mut total = 0_usize;
-        let mut pages = Vec::with_capacity(files.len());
-        for file in files {
-            let bytes = std::fs::read(&file)
-                .with_context(|| format!("read gallery-dl output {}", file.display()))?;
-            total = total.saturating_add(bytes.len());
-            if total > MAX_TOTAL_IMAGE_BYTES {
-                bail!("gallery-dl output exceeds the total image byte limit");
-            }
-            let name = file
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| anyhow!("gallery-dl output has an invalid filename"))?;
-            pages.push((name.to_owned(), decode_page(&bytes)?));
-        }
+        let pages = files
+            .into_iter()
+            .map(|file| {
+                let name = file
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| anyhow!("gallery-dl output has an invalid filename"))?;
+                Ok(IngressPageFile {
+                    original_name: name.to_owned(),
+                    path: file,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let job_name = request
+            .job_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| direct_job_label(&url));
         let provenance = json!({
             "provider": "direct",
             "url": url.as_str(),
             "helper": helper,
+            "job_name": job_name,
         });
-        let registration = workflow.import_ingress_pages("direct", pages, provenance.clone())?;
+        let registration = workflow.import_ingress_files(
+            &job_name,
+            staging.as_path(),
+            pages,
+            provenance.clone(),
+        )?;
         imported_response("direct", registration, provenance)
     }
     .await;
@@ -706,6 +763,7 @@ fn validate_mangadex_request(request: &PullChapterRequest) -> Result<()> {
         "full" | "data_saver" => {}
         _ => bail!("data_saver must be full or data_saver"),
     }
+    validate_job_name(request.job_name.as_deref())?;
     Ok(())
 }
 
@@ -719,6 +777,24 @@ fn validate_direct_request(request: &PullChapterRequest) -> Result<()> {
     }
     if request.url.is_none() {
         bail!("source=direct requires an explicit url");
+    }
+    validate_job_name(request.job_name.as_deref())?;
+    Ok(())
+}
+
+fn validate_job_name(job_name: Option<&str>) -> Result<()> {
+    let Some(job_name) = job_name else {
+        return Ok(());
+    };
+    let trimmed = job_name.trim();
+    if trimmed.is_empty() || trimmed.len() > 96 {
+        bail!("job_name must contain between 1 and 96 bytes");
+    }
+    if trimmed
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '/' | '\\'))
+    {
+        bail!("job_name must be a label without path separators or control characters");
     }
     Ok(())
 }
@@ -775,17 +851,32 @@ fn validate_direct_url(raw: &str) -> Result<Url> {
     Ok(url)
 }
 
+fn direct_job_label(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("direct");
+    let path_label = url
+        .path_segments()
+        .into_iter()
+        .flatten()
+        .rfind(|segment| !segment.is_empty())
+        .unwrap_or("gallery");
+    format!("{host}-{path_label}")
+}
+
 fn validate_page_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "."
         || name == ".."
-        || name.chars().any(|ch| matches!(ch, '/' | '\\'))
+        || name.len() > 240
+        || name.chars().any(|ch| {
+            ch.is_control() || matches!(ch, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+        })
     {
         bail!("remote page name is not a safe single filename: {name:?}");
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_page(bytes: &[u8]) -> Result<RgbImage> {
     if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
         bail!("image file exceeds the per-page byte limit");
@@ -1271,6 +1362,7 @@ mod tests {
                 translated_language: Some("en".into()),
                 data_saver: "full".into(),
                 url: None,
+                job_name: None,
             })
             .await
             .unwrap_err();
@@ -1291,9 +1383,18 @@ mod tests {
         let feed = serde_json::to_vec(&json!({"data": [chapter]})).unwrap();
         let image_two = png_bytes([20, 30, 40]);
         let image_ten = png_bytes([50, 60, 70]);
-        let (base, thread) = mock_server(4, move |path, base| {
+        let (base, thread) = mock_server(5, move |path, base| {
             if path.starts_with("/api/manga/55555555-5555-5555-5555-555555555555/feed?") {
                 return (200, feed.clone());
+            }
+            if path == "/api/manga/55555555-5555-5555-5555-555555555555" {
+                return (
+                    200,
+                    serde_json::to_vec(&json!({
+                        "data": {"id": manga_id, "attributes": {"title": {"en": "One Piece"}}}
+                    }))
+                    .unwrap(),
+                );
             }
             if path == "/api/at-home/server/66666666-6666-6666-6666-666666666666" {
                 return (
@@ -1306,10 +1407,10 @@ mod tests {
                     .unwrap(),
                 );
             }
-            if path == "/api/images/hash/page2.png" {
+            if path == "/api/images/data/hash/page2.png" {
                 return (200, image_two.clone());
             }
-            if path == "/api/images/hash/page10.png" {
+            if path == "/api/images/data/hash/page10.png" {
                 return (200, image_ten.clone());
             }
             (404, b"missing".to_vec())
@@ -1327,6 +1428,7 @@ mod tests {
                     translated_language: Some("en".into()),
                     data_saver: "full".into(),
                     url: None,
+                    job_name: None,
                 },
                 &workflow,
             )
@@ -1343,5 +1445,167 @@ mod tests {
         assert_eq!(provenance["pages"][0]["original_name"], "page2.png");
         assert_eq!(provenance["pages"][1]["original_name"], "page10.png");
         assert!(job.join("source/0001.png").is_file());
+        assert!(
+            job.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("One_Piece-ch-1--")
+        );
+    }
+
+    #[tokio::test]
+    async fn at_home_data_saver_uses_official_data_saver_route_and_order() {
+        let manga_id = "77777777-7777-7777-7777-777777777777";
+        let chapter_id = "88888888-8888-8888-8888-888888888888";
+        let chapter = chapter_json(chapter_id, manga_id, "2");
+        let feed = serde_json::to_vec(&json!({"data": [chapter]})).unwrap();
+        let image_one = png_bytes([80, 90, 100]);
+        let image_three = png_bytes([110, 120, 130]);
+        let (base, thread) = mock_server(5, move |path, base| {
+            if path.starts_with("/api/manga/77777777-7777-7777-7777-777777777777/feed?") {
+                return (200, feed.clone());
+            }
+            if path == "/api/manga/77777777-7777-7777-7777-777777777777" {
+                return (
+                    200,
+                    serde_json::to_vec(&json!({
+                        "data": {"id": manga_id, "attributes": {"title": {"en": "Chainsaw Title"}}}
+                    }))
+                    .unwrap(),
+                );
+            }
+            if path == "/api/at-home/server/88888888-8888-8888-8888-888888888888" {
+                return (
+                    200,
+                    serde_json::to_vec(&json!({
+                        "baseUrl": format!("{base}images/"),
+                        "chapter": {"hash": "save-hash"},
+                        "data": ["page99.png"],
+                        "dataSaver": ["page3.png", "page1.png"]
+                    }))
+                    .unwrap(),
+                );
+            }
+            if path == "/api/images/data-saver/save-hash/page1.png" {
+                return (200, image_one.clone());
+            }
+            if path == "/api/images/data-saver/save-hash/page3.png" {
+                return (200, image_three.clone());
+            }
+            panic!("unexpected MangaDex request path {path}");
+        });
+        let client = MangaDexClient::with_base_url(&base).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = Workflow::new(directory.path().join("jobs")).unwrap();
+        let response = client
+            .pull_mangadex(
+                &PullChapterRequest {
+                    source: "mangadex".into(),
+                    manga_id: Some(manga_id.into()),
+                    chapter_id: None,
+                    chapter: Some("2".into()),
+                    translated_language: Some("en".into()),
+                    data_saver: "data_saver".into(),
+                    url: None,
+                    job_name: None,
+                },
+                &workflow,
+            )
+            .await
+            .unwrap();
+        thread.join().unwrap();
+        let job = PathBuf::from(response["job_path"].as_str().unwrap());
+        let provenance: Value =
+            serde_json::from_slice(&std::fs::read(job.join("ingress.json")).unwrap()).unwrap();
+        assert_eq!(provenance["pages"][0]["original_name"], "page1.png");
+        assert_eq!(provenance["pages"][1]["original_name"], "page3.png");
+        assert!(
+            job.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("Chainsaw_Title-ch-2--")
+        );
+    }
+
+    #[test]
+    fn file_import_publishes_readable_distinct_labels_and_cleans_failed_jobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = Workflow::new(directory.path().join("jobs")).unwrap();
+        let first_stage = tempfile::tempdir().unwrap();
+        let first_page = first_stage.path().join("page-1.png");
+        std::fs::write(&first_page, png_bytes([1, 2, 3])).unwrap();
+        let first = workflow
+            .import_ingress_files(
+                "One Piece - Chapter 1",
+                first_stage.path(),
+                vec![IngressPageFile {
+                    original_name: "page-1.png".into(),
+                    path: first_page,
+                }],
+                json!({"provider": "test"}),
+            )
+            .unwrap();
+        let second_stage = tempfile::tempdir().unwrap();
+        let second_page = second_stage.path().join("page-1.png");
+        std::fs::write(&second_page, png_bytes([4, 5, 6])).unwrap();
+        let second = workflow
+            .import_ingress_files(
+                "Chainsaw Man - Chapter 1",
+                second_stage.path(),
+                vec![IngressPageFile {
+                    original_name: "page-1.png".into(),
+                    path: second_page,
+                }],
+                json!({"provider": "test"}),
+            )
+            .unwrap();
+        let first_name = first.job_dir.file_name().unwrap().to_string_lossy();
+        let second_name = second.job_dir.file_name().unwrap().to_string_lossy();
+        assert!(
+            first_name.starts_with("One_Piece_-_Chapter_1--"),
+            "actual first job name: {first_name}"
+        );
+        assert!(
+            second_name.starts_with("Chainsaw_Man_-_Chapter_1--"),
+            "actual second job name: {second_name}"
+        );
+        assert_ne!(first_name, second_name);
+
+        let failed_stage = tempfile::tempdir().unwrap();
+        let good_page = failed_stage.path().join("good.png");
+        let bad_page = failed_stage.path().join("bad.png");
+        std::fs::write(&good_page, png_bytes([7, 8, 9])).unwrap();
+        std::fs::write(&bad_page, b"not an image").unwrap();
+        assert!(
+            workflow
+                .import_ingress_files(
+                    "Broken Gallery",
+                    failed_stage.path(),
+                    vec![
+                        IngressPageFile {
+                            original_name: "good.png".into(),
+                            path: good_page,
+                        },
+                        IngressPageFile {
+                            original_name: "bad.png".into(),
+                            path: bad_page,
+                        },
+                    ],
+                    json!({"provider": "test"}),
+                )
+                .is_err()
+        );
+        let published = std::fs::read_dir(workflow.root())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .collect::<Vec<_>>();
+        assert_eq!(published.len(), 2);
+        assert!(published.iter().all(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("Broken_Gallery")
+        }));
     }
 }
