@@ -10,8 +10,11 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering as AtomicOrdering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -22,12 +25,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 #[cfg(test)]
 use std::io::Cursor;
-use tokio::{
-    io::AsyncReadExt,
-    process::Command,
-    sync::Semaphore,
-    time::{sleep, timeout},
-};
+use tempfile::{Builder as TempDirBuilder, TempDir};
+use tokio::{io::AsyncReadExt, process::Command, sync::Semaphore, time::sleep};
 use uuid::Uuid;
 
 use crate::{
@@ -46,6 +45,10 @@ const MAX_IMAGE_DIMENSION: u32 = 12_000;
 const MAX_PAGES: usize = 500;
 const MAX_RETRIES: usize = 3;
 const MAX_STDERR_BYTES: usize = 64 * 1024;
+const MAX_TOTAL_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_DIRECT_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_DIRECT_OUTPUT_FILES: usize = 500;
+const OUTPUT_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 // A large gallery-dl chapter may legitimately take many minutes on a
 // constrained connection. Keep a finite ceiling while still killing the
 // helper and cleaning its owned staging directory on timeout.
@@ -183,7 +186,16 @@ impl MangaDexClient {
             bail!("MangaDex API and image hosts must use HTTPS");
         }
         let http = Client::builder()
-            .redirect(Policy::limited(3))
+            .redirect(Policy::custom(move |attempt| {
+                if attempt.previous().len() >= 3 {
+                    return attempt.stop();
+                }
+                if validate_download_base(attempt.url(), allow_insecure_local).is_ok() {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(45))
             .user_agent(USER_AGENT)
@@ -237,6 +249,7 @@ impl MangaDexClient {
 
     pub async fn pull_mangadex(
         &self,
+        config: &Config,
         request: &PullChapterRequest,
         workflow: &Workflow,
     ) -> Result<Value> {
@@ -294,7 +307,7 @@ impl MangaDexClient {
             page_urls.push((file_name.to_owned(), url));
         }
         page_urls.sort_by(|left, right| natural_cmp(&left.0, &right.0));
-        let staging = tempfile::tempdir().context("create MangaDex ingress staging")?;
+        let staging = create_provider_staging(config)?;
         let pages = self
             .download_pages_to_staging(page_urls, staging.path())
             .await?;
@@ -339,12 +352,7 @@ impl MangaDexClient {
                 .as_deref()
                 .map(|manga_id| validate_uuid(manga_id, "manga_id"))
                 .transpose()?;
-            let mut url = self.endpoint(&format!("chapter/{id}"))?;
-            if let Some(language) = request.translated_language.as_deref() {
-                validate_language(language)?;
-                url.query_pairs_mut()
-                    .append_pair("translatedLanguage[]", language);
-            }
+            let url = self.endpoint(&format!("chapter/{id}"))?;
             let body = self.get_json(url).await?;
             let data = body
                 .get("data")
@@ -355,6 +363,14 @@ impl MangaDexClient {
             {
                 bail!(
                     "chapter_id {id} does not have the exact requested chapter string {expected:?}"
+                );
+            }
+            if let Some(expected) = request.translated_language.as_deref()
+                && chapter.translated_language.as_deref() != Some(expected)
+            {
+                bail!(
+                    "chapter_id {id} translated_language mismatch: requested {expected:?}, MangaDex returned {:?}",
+                    chapter.translated_language
                 );
             }
             return Ok(chapter);
@@ -436,11 +452,23 @@ impl MangaDexClient {
         pages: Vec<(String, Url)>,
         staging_root: &Path,
     ) -> Result<Vec<IngressPageFile>> {
+        self.download_pages_to_staging_with_limit(pages, staging_root, MAX_TOTAL_IMAGE_BYTES)
+            .await
+    }
+
+    async fn download_pages_to_staging_with_limit(
+        &self,
+        pages: Vec<(String, Url)>,
+        staging_root: &Path,
+        total_limit: u64,
+    ) -> Result<Vec<IngressPageFile>> {
         let semaphore = Arc::new(Semaphore::new(4));
+        let total_bytes = Arc::new(AtomicU64::new(0));
         let mut set = tokio::task::JoinSet::new();
         for (index, (name, url)) in pages.into_iter().enumerate() {
             let permit = semaphore.clone();
             let client = self.clone();
+            let total_bytes = total_bytes.clone();
             let staging_path = staging_root.join(format!("{index:04}-{name}"));
             set.spawn(async move {
                 let _permit = permit
@@ -448,6 +476,7 @@ impl MangaDexClient {
                     .await
                     .map_err(|_| anyhow!("download concurrency gate closed"))?;
                 let bytes = client.get_bytes(url, MAX_IMAGE_BYTES).await?;
+                reserve_download_bytes(&total_bytes, bytes.len(), total_limit)?;
                 tokio::fs::write(&staging_path, &bytes)
                     .await
                     .with_context(|| format!("stage downloaded page {}", staging_path.display()))?;
@@ -499,6 +528,8 @@ impl MangaDexClient {
                 .send()
                 .await
                 .with_context(|| format!("request {}", url))?;
+            validate_download_base(response.url(), self.allow_insecure_local)
+                .context("validate final MangaDex response URL")?;
             let status = response.status();
             if status.is_success() {
                 return read_response_limited(response, max_bytes).await;
@@ -534,6 +565,7 @@ struct ResolvedChapter {
     manga_id: String,
     chapter: Option<String>,
     title: Option<String>,
+    translated_language: Option<String>,
     summary: Value,
 }
 
@@ -623,11 +655,16 @@ fn parse_chapter(value: &Value, expected_manga_id: Option<&str>) -> Result<Resol
         .get("title")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let translated_language = attributes
+        .get("translatedLanguage")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     Ok(ResolvedChapter {
         id: id.to_owned(),
         manga_id: manga_id.to_owned(),
         chapter: chapter.clone(),
         title: title.clone(),
+        translated_language,
         summary: json!({
             "chapter_id": id,
             "manga_id": manga_id,
@@ -651,7 +688,7 @@ pub async fn pull_chapter(
     match source {
         "mangadex" => {
             MangaDexClient::new()?
-                .pull_mangadex(&request, workflow)
+                .pull_mangadex(config, &request, workflow)
                 .await
         }
         "direct" => pull_direct(config, workflow, &request).await,
@@ -840,6 +877,40 @@ fn validate_download_base(url: &Url, allow_insecure_local: bool) -> Result<()> {
     Ok(())
 }
 
+fn create_provider_staging(config: &Config) -> Result<TempDir> {
+    config.ensure_runtime_dirs()?;
+    TempDirBuilder::new()
+        .prefix(".fukidashi-mangadex-")
+        .tempdir_in(config.temp_dir())
+        .context("create MangaDex ingress staging in configured temp")
+}
+
+fn reserve_download_bytes(counter: &AtomicU64, amount: usize, limit: u64) -> Result<()> {
+    let amount = u64::try_from(amount).context("download byte count exceeds u64")?;
+    loop {
+        let current = counter.load(AtomicOrdering::Relaxed);
+        let next = current
+            .checked_add(amount)
+            .ok_or_else(|| anyhow!("MangaDex chapter download byte count overflowed"))?;
+        if next > limit {
+            bail!(
+                "MangaDex chapter downloads exceed the configured total byte limit ({limit} bytes)"
+            );
+        }
+        if counter
+            .compare_exchange_weak(
+                current,
+                next,
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+            )
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+}
+
 fn validate_direct_url(raw: &str) -> Result<Url> {
     let url = Url::parse(raw).context("parse direct ingress URL")?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
@@ -991,10 +1062,79 @@ fn imported_response(provider: &str, registration: Registration, source: Value) 
 pub fn gallery_dl_args(staging: &Path, url: &Url) -> Vec<OsString> {
     vec![
         OsString::from("--config-ignore"),
+        OsString::from("--no-input"),
+        OsString::from("--windows-filenames"),
         OsString::from("--directory"),
         staging.as_os_str().to_owned(),
         OsString::from(url.as_str()),
     ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StagingUsage {
+    bytes: u64,
+    files: usize,
+}
+
+fn staging_usage_exceeded(
+    usage: StagingUsage,
+    max_bytes: u64,
+    max_files: usize,
+) -> Option<&'static str> {
+    if usage.bytes > max_bytes {
+        Some("gallery-dl staging exceeds the configured byte limit")
+    } else if usage.files > max_files {
+        Some("gallery-dl staging exceeds the configured file-count limit")
+    } else {
+        None
+    }
+}
+
+fn scan_staging_usage(root: &Path) -> Result<StagingUsage> {
+    reject_link_or_reparse(root)
+        .with_context(|| format!("inspect gallery-dl staging root {}", root.display()))?;
+    if !std::fs::metadata(root)?.is_dir() {
+        bail!(
+            "gallery-dl staging root is not a directory: {}",
+            root.display()
+        );
+    }
+    let mut usage = StagingUsage { bytes: 0, files: 0 };
+    scan_staging_usage_inner(root, &mut usage)?;
+    Ok(usage)
+}
+
+fn scan_staging_usage_inner(directory: &Path, usage: &mut StagingUsage) -> Result<()> {
+    reject_link_or_reparse(directory)?;
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+            bail!(
+                "gallery-dl staging contains a symlink or reparse point: {}",
+                path.display()
+            );
+        }
+        if metadata.is_dir() {
+            scan_staging_usage_inner(&path, usage)?;
+        } else if metadata.is_file() {
+            usage.files = usage
+                .files
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("gallery-dl staging file count overflowed"))?;
+            usage.bytes = usage
+                .bytes
+                .checked_add(metadata.len())
+                .ok_or_else(|| anyhow!("gallery-dl staging byte count overflowed"))?;
+        } else {
+            bail!(
+                "gallery-dl staging contains a non-regular file: {}",
+                path.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run_gallery_dl(helper: &Path, staging: &Path, url: &Url) -> Result<()> {
@@ -1009,20 +1149,41 @@ async fn run_gallery_dl(helper: &Path, staging: &Path, url: &Url) -> Result<()> 
         .spawn()
         .with_context(|| format!("start gallery-dl helper {}", helper.display()))?;
     let stderr = child.stderr.take();
-    let stderr_task = tokio::spawn(read_child_stderr(stderr));
-    let status = match timeout(DIRECT_TIMEOUT, child.wait()).await {
-        Ok(status) => status.context("wait for gallery-dl")?,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = stderr_task.await;
+    let mut stderr_task = Some(tokio::spawn(read_child_stderr(stderr)));
+    let deadline = Instant::now() + DIRECT_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll gallery-dl")? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            terminate_gallery_child(&mut child, &mut stderr_task).await;
             bail!(
                 "gallery-dl timed out after {} seconds",
                 DIRECT_TIMEOUT.as_secs()
             );
         }
+        sleep(OUTPUT_SCAN_INTERVAL).await;
+        let scan_root = staging.to_owned();
+        let usage = tokio::task::spawn_blocking(move || scan_staging_usage(&scan_root))
+            .await
+            .map_err(|error| anyhow!("gallery-dl output watcher failed: {error}"))?;
+        let usage = match usage {
+            Ok(usage) => usage,
+            Err(error) => {
+                terminate_gallery_child(&mut child, &mut stderr_task).await;
+                return Err(error.context("inspect gallery-dl output while it was running"));
+            }
+        };
+        if let Some(reason) =
+            staging_usage_exceeded(usage, MAX_DIRECT_OUTPUT_BYTES, MAX_DIRECT_OUTPUT_FILES)
+        {
+            terminate_gallery_child(&mut child, &mut stderr_task).await;
+            bail!("{reason}");
+        }
     };
     let stderr = stderr_task
+        .take()
+        .expect("gallery-dl stderr task is present until process exit")
         .await
         .map_err(|error| anyhow!("gallery-dl stderr reader failed: {error}"))?;
     if !status.success() {
@@ -1032,6 +1193,17 @@ async fn run_gallery_dl(helper: &Path, staging: &Path, url: &Url) -> Result<()> 
         );
     }
     Ok(())
+}
+
+async fn terminate_gallery_child(
+    child: &mut tokio::process::Child,
+    stderr_task: &mut Option<tokio::task::JoinHandle<Vec<u8>>>,
+) {
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    if let Some(task) = stderr_task.take() {
+        let _ = task.await;
+    }
 }
 
 async fn read_child_stderr(stderr: Option<tokio::process::ChildStderr>) -> Vec<u8> {
@@ -1226,6 +1398,25 @@ mod tests {
         bytes.into_inner()
     }
 
+    fn test_config(root: &Path) -> Config {
+        Config {
+            storage_root: root.to_owned(),
+            models_dir: root.join("models"),
+            ort_dylib: None,
+            config_file: root.join("config.toml"),
+            configured_jobs_dir: None,
+            configured_cache_dir: None,
+            configured_temp_dir: Some(root.join("configured-temp")),
+            configured_runtime_dir: None,
+            configured_exports_dir: None,
+            configured_font_dirs: Vec::new(),
+            configured_provider: None,
+            storage_source: "test".to_owned(),
+            models_source: "test".to_owned(),
+            ort_source: "test".to_owned(),
+        }
+    }
+
     #[test]
     fn source_and_url_validation_are_explicit() {
         assert!(validate_direct_url("file:///tmp/manga").is_err());
@@ -1260,12 +1451,81 @@ mod tests {
     fn gallery_arguments_keep_url_as_one_argument() {
         let url = validate_direct_url("https://example.test/gallery?a=1&b=2").unwrap();
         let args = gallery_dl_args(Path::new("C:/owned/stage"), &url);
-        assert_eq!(args.len(), 4);
+        assert_eq!(args.len(), 6);
         assert_eq!(
-            args[3],
+            args[5],
             OsString::from("https://example.test/gallery?a=1&b=2")
         );
         assert_eq!(args[0], OsString::from("--config-ignore"));
+        assert!(args.contains(&OsString::from("--no-input")));
+        assert!(args.contains(&OsString::from("--windows-filenames")));
+    }
+
+    #[test]
+    fn native_download_budget_rejects_low_limit_without_large_allocation() {
+        let used = AtomicU64::new(0);
+        reserve_download_bytes(&used, 7, 10).unwrap();
+        let error = reserve_download_bytes(&used, 4, 10).unwrap_err();
+        assert!(error.to_string().contains("total byte limit"));
+        assert_eq!(used.load(AtomicOrdering::Relaxed), 7);
+    }
+
+    #[test]
+    fn provider_staging_is_created_under_configured_temp() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = test_config(directory.path());
+        let staging = create_provider_staging(&config).unwrap();
+        assert!(staging.path().starts_with(config.temp_dir()));
+        assert!(
+            staging
+                .path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".fukidashi-mangadex-")
+        );
+    }
+
+    #[test]
+    fn staging_usage_counts_partial_files_and_enforces_watcher_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging = directory.path().join("stage");
+        create_owned_staging(&staging, directory.path()).unwrap();
+        std::fs::write(staging.join("page-001.png.part"), [1_u8, 2, 3]).unwrap();
+        std::fs::create_dir(staging.join("nested")).unwrap();
+        std::fs::write(staging.join("nested/page-002.webp"), [4_u8, 5]).unwrap();
+        let usage = scan_staging_usage(&staging).unwrap();
+        assert_eq!(usage, StagingUsage { bytes: 5, files: 2 });
+        assert_eq!(
+            staging_usage_exceeded(usage, 4, 2),
+            Some("gallery-dl staging exceeds the configured byte limit")
+        );
+        assert_eq!(
+            staging_usage_exceeded(StagingUsage { bytes: 5, files: 3 }, 100, 2),
+            Some("gallery-dl staging exceeds the configured file-count limit")
+        );
+    }
+
+    #[test]
+    fn native_urls_require_https_and_reject_credentials() {
+        assert!(
+            validate_download_base(&Url::parse("http://example.test/image.png").unwrap(), false)
+                .is_err()
+        );
+        assert!(
+            validate_download_base(
+                &Url::parse("https://user:pass@example.test/image.png").unwrap(),
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            validate_download_base(
+                &Url::parse("http://127.0.0.1:1234/image.png").unwrap(),
+                true
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1376,6 +1636,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_chapter_id_validates_language_without_querying_the_endpoint() {
+        let manga_id = "99999999-9999-9999-9999-999999999999";
+        let chapter_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let mut chapter = chapter_json(chapter_id, manga_id, "7");
+        chapter["attributes"]["translatedLanguage"] = Value::String("ja".to_owned());
+        let body = serde_json::to_vec(&json!({"data": chapter})).unwrap();
+        let (base, thread) = mock_server(1, move |path, _base| {
+            assert_eq!(path, "/api/chapter/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+            (200, body.clone())
+        });
+        let client = MangaDexClient::with_base_url(&base).unwrap();
+        let error = client
+            .resolve_chapter(&PullChapterRequest {
+                source: "mangadex".into(),
+                manga_id: Some(manga_id.into()),
+                chapter_id: Some(chapter_id.into()),
+                chapter: None,
+                translated_language: Some("en".into()),
+                data_saver: "full".into(),
+                url: None,
+                job_name: None,
+            })
+            .await
+            .unwrap_err();
+        thread.join().unwrap();
+        let message = error.to_string();
+        assert!(message.contains("translated_language mismatch"));
+        assert!(message.contains("requested \"en\""));
+        assert!(message.contains("\"ja\""));
+    }
+
+    #[tokio::test]
     async fn at_home_pages_are_naturally_sorted_and_imported_as_pending_job() {
         let manga_id = "55555555-5555-5555-5555-555555555555";
         let chapter_id = "66666666-6666-6666-6666-666666666666";
@@ -1418,8 +1710,10 @@ mod tests {
         let client = MangaDexClient::with_base_url(&base).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let workflow = Workflow::new(directory.path().join("jobs")).unwrap();
+        let config = test_config(directory.path());
         let response = client
             .pull_mangadex(
+                &config,
                 &PullChapterRequest {
                     source: "mangadex".into(),
                     manga_id: Some(manga_id.into()),
@@ -1497,8 +1791,10 @@ mod tests {
         let client = MangaDexClient::with_base_url(&base).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let workflow = Workflow::new(directory.path().join("jobs")).unwrap();
+        let config = test_config(directory.path());
         let response = client
             .pull_mangadex(
+                &config,
                 &PullChapterRequest {
                     source: "mangadex".into(),
                     manga_id: Some(manga_id.into()),
