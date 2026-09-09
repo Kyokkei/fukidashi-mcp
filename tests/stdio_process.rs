@@ -42,13 +42,14 @@ async fn executable_stdio_handshake_tools_and_eof_from_unrelated_cwd() {
     )
     .await;
     let listed = read_json(&mut output).await;
-    assert_eq!(
-        listed["result"]["tools"]
-            .as_array()
-            .expect("tools list")
-            .len(),
-        12
-    );
+    let tools = listed["result"]["tools"].as_array().expect("tools list");
+    assert!(tools.len() >= 14);
+    let tool_names = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"fukidashi_search_manga"));
+    assert!(tool_names.contains(&"fukidashi_pull_chapter"));
     write_request(&mut input, serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fukidashi_analyze_page","arguments":{"image_path":"relative.png"}}})).await;
     let invalid = read_json(&mut output).await;
     assert_eq!(invalid["result"]["isError"], true);

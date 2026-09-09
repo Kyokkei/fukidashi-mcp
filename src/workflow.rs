@@ -335,6 +335,126 @@ impl Workflow {
         Ok(job)
     }
 
+    /// Publish a brand-new managed job from pages obtained by an ingress
+    /// provider.  The caller supplies decoded images only; paths and the
+    /// manifest are created here so imported content follows the same V2
+    /// layout as a locally registered source.  The staging directory is
+    /// owned by this operation and is the only path removed on failure.
+    pub fn import_ingress_pages(
+        &self,
+        slug: &str,
+        pages: Vec<(String, RgbImage)>,
+        provenance: serde_json::Value,
+    ) -> Result<Registration> {
+        const MAX_INGRESS_PAGES: usize = 500;
+        if pages.is_empty() {
+            bail!("ingress returned no pages");
+        }
+        if pages.len() > MAX_INGRESS_PAGES {
+            bail!("ingress page count exceeds {MAX_INGRESS_PAGES}");
+        }
+        let mut names = std::collections::HashSet::new();
+        for (name, image) in &pages {
+            if name.is_empty()
+                || name == "."
+                || name == ".."
+                || name.chars().any(|ch| matches!(ch, '/' | '\\'))
+            {
+                bail!("ingress page name is not a single safe filename: {name:?}");
+            }
+            if !names.insert(name.to_ascii_lowercase()) {
+                bail!("ingress page names must be unique: {name}");
+            }
+            let (width, height) = image.dimensions();
+            if width == 0 || height == 0 {
+                bail!("ingress page {name} has empty dimensions");
+            }
+        }
+
+        let raw_slug = slug.trim();
+        let slug = raw_slug
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        let slug = if slug.is_empty() {
+            "ingress".to_owned()
+        } else {
+            slug.chars().take(48).collect()
+        };
+        let stage = self
+            .root
+            .join(format!(".ingress-staging-{}", Uuid::new_v4().simple()));
+        let job = self
+            .root
+            .join(format!("{}--{}", slug, Uuid::new_v4().simple()));
+        let result = (|| -> Result<Registration> {
+            create_dir_all_owned(&stage, &self.root)?;
+            create_job_layout(&stage, None)?;
+            let source_dir = job.join("source");
+            let expected_pages = pages
+                .iter()
+                .enumerate()
+                .map(|(index, _)| source_dir.join(format!("{:04}.png", index + 1)))
+                .collect::<Vec<_>>();
+            let mut page_records = std::collections::BTreeMap::new();
+            let mut provenance_pages = Vec::with_capacity(pages.len());
+            for (index, (original_name, image)) in pages.into_iter().enumerate() {
+                let staged = stage.join("source").join(format!("{:04}.png", index + 1));
+                save_image_atomic(&staged, &image)
+                    .with_context(|| format!("stage ingress page {original_name}"))?;
+                let final_source = &expected_pages[index];
+                page_records.insert(
+                    page_key(final_source),
+                    PageManifest {
+                        source_image: final_source.clone(),
+                        state: "pending".into(),
+                        source_sha256: sha256_file(&staged)?,
+                        cleaned_image: None,
+                        rendered_image: None,
+                    },
+                );
+                provenance_pages.push(json!({
+                    "page_number": index + 1,
+                    "original_name": original_name,
+                    "source_image": final_source,
+                }));
+            }
+            let manifest = JobManifest {
+                stage: "ingress".into(),
+                source_dir,
+                pages: page_records,
+                expected_pages: expected_pages.clone(),
+            };
+            create_page_layouts(&stage, &manifest)?;
+            save_manifest(&stage, &manifest)?;
+            atomic_json(
+                &stage.join("ingress.json"),
+                &json!({
+                    "schema": "fukidashi-ingress/v1",
+                    "source": provenance,
+                    "pages": provenance_pages,
+                }),
+            )?;
+            fs::rename(&stage, &job)
+                .with_context(|| format!("publish imported job {}", job.display()))?;
+            Ok(Registration {
+                job_dir: job.clone(),
+                expected_pages,
+                page_state: "pending".into(),
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&stage);
+        }
+        result
+    }
+
     pub fn acquire_render_lock(&self, job: &Path) -> Result<RenderLock> {
         let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
         let lease = acquire_lock_file(
@@ -1601,7 +1721,10 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 // that resolved face separately so a brush-only editor
                 // rerender uses the same metrics and cannot fail a previously
                 // valid layout merely because fallback selection is omitted.
-                if let Some(font_path) = report.get("font_path").and_then(serde_json::Value::as_str)
+                if let Some(font_path) = report
+                    .get("resolved_font_path")
+                    .or_else(|| report.get("font_path"))
+                    .and_then(serde_json::Value::as_str)
                 {
                     bubble.insert(
                         "rendered_font_path".into(),

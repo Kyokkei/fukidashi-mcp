@@ -1592,6 +1592,22 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         (derived.cleaned_image, Some(output))
     };
     let global_font = state.get("font_path").and_then(Value::as_str);
+    let mut fallback_font_paths = Vec::new();
+    for bubble in bubbles {
+        if let Some(paths) = bubble.get("fallback_font_paths").and_then(Value::as_array) {
+            fallback_font_paths.extend(paths.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+        if let Some(path) = bubble.get("rendered_font_path").and_then(Value::as_str) {
+            fallback_font_paths.push(path.to_owned());
+        }
+    }
+    let mut unique_fallback_font_paths = Vec::with_capacity(fallback_font_paths.len());
+    for path in fallback_font_paths {
+        if !unique_fallback_font_paths.iter().any(|seen| seen == &path) {
+            unique_fallback_font_paths.push(path);
+        }
+    }
+    let fallback_font_paths = unique_fallback_font_paths;
     let mut payloads = Vec::with_capacity(bubbles.len());
     for (bubble_index, bubble) in bubbles.iter().enumerate() {
         let bubble_id = bubble.get("id").and_then(Value::as_str);
@@ -1626,6 +1642,17 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 needs_review: bubble.get("needs_review").and_then(Value::as_bool),
                 flagged: bubble.get("flagged").and_then(Value::as_bool),
                 preserve_source: Some(true),
+                fallback_font_paths: bubble
+                    .get("fallback_font_paths")
+                    .and_then(Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 bbox,
                 bubble_bbox: bubble
                     .get("bubble_bbox")
@@ -1660,9 +1687,9 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             );
         }
         let font_path = bubble
-            .get("rendered_font_path")
+            .get("font_path")
             .and_then(Value::as_str)
-            .or_else(|| bubble.get("font_path").and_then(Value::as_str))
+            .or_else(|| bubble.get("rendered_font_path").and_then(Value::as_str))
             .or(global_font)
             .ok_or_else(|| anyhow!("bubble {bubble_index} has no project font_path"))?;
         let font_path = safe_project_path(&session.root_dir, font_path)?;
@@ -1685,6 +1712,17 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             needs_review: bubble.get("needs_review").and_then(Value::as_bool),
             flagged: bubble.get("flagged").and_then(Value::as_bool),
             preserve_source: Some(false),
+            fallback_font_paths: bubble
+                .get("fallback_font_paths")
+                .and_then(Value::as_array)
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
             bbox,
             bubble_bbox: bubble
                 .get("bubble_bbox")
@@ -1724,7 +1762,12 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         .parent()
         .unwrap_or(&session.root_dir)
         .join("rendered.png");
-    let report = crate::typeset::typeset_page(&source, &payloads, &output)?;
+    let report = crate::typeset::typeset_page_with_fallbacks(
+        &source,
+        &payloads,
+        &fallback_font_paths,
+        &output,
+    )?;
     workflow.register_render_locked(
         &output,
         &workflow.validate_clean_input(&source)?,

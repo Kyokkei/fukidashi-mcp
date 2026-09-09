@@ -5,6 +5,7 @@ pub mod editor;
 pub mod error;
 pub mod export;
 pub mod fonts;
+pub mod ingress;
 pub mod installer;
 pub mod legacy;
 pub mod mcp;

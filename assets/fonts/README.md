@@ -38,7 +38,8 @@ Patrick Hand Regular's official metadata declares the `vietnamese` subset.
 The repository test also checks the Vietnamese base letters ă, â, đ, ê, ô, ơ,
 ư, their uppercase forms, precomposed tone forms, and combining marks. Comic
 Neue's official metadata declares the smaller `latin` subset, so Vietnamese
-text deliberately reaches Patrick Hand through whole-font fallback.
+grapheme clusters deliberately reach Patrick Hand through per-grapheme
+fallback while supported ASCII clusters stay in Comic Neue.
 
 When distributing a binary, retain the two OFL texts and this attribution with
 the release notices. The binary itself contains the font bytes; it does not

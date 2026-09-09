@@ -77,7 +77,7 @@ pub static COMIC_NEUE_BOLD: BundledFont = BundledFont {
 };
 
 /// Patrick Hand Regular contains the Vietnamese subset and is the bundled
-/// whole-font fallback when Comic Neue lacks a required glyph.
+/// grapheme fallback when Comic Neue lacks a required glyph.
 pub static PATRICK_HAND_REGULAR: BundledFont = BundledFont {
     id: "patrick-hand-regular",
     file_name: "PatrickHand-Regular.ttf",
@@ -91,7 +91,7 @@ pub fn bundled_fonts() -> [&'static BundledFont; 3] {
     [&COMIC_NEUE_REGULAR, &COMIC_NEUE_BOLD, &PATRICK_HAND_REGULAR]
 }
 
-/// Whole-font fallbacks appended after caller-supplied fallbacks. Patrick
+/// Per-grapheme fallbacks appended after caller-supplied fallbacks. Patrick
 /// Hand comes first because its official Vietnamese subset covers the common
 /// precomposed and combining forms that Comic Neue's latin subset does not.
 pub fn bundled_fallbacks() -> [&'static BundledFont; 2] {

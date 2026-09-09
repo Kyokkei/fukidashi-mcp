@@ -488,6 +488,7 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
         needs_review: Some(false),
         flagged: Some(false),
         preserve_source: Some(false),
+        fallback_font_paths: Vec::new(),
         bbox: Rect {
             x1: 1.0,
             y1: 1.0,
@@ -511,6 +512,7 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
         needs_review: Some(false),
         flagged: Some(false),
         preserve_source: Some(false),
+        fallback_font_paths: Vec::new(),
         bbox: Rect {
             x1: 15.0,
             y1: 15.0,
@@ -669,6 +671,7 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
         needs_review: Some(false),
         flagged: Some(false),
         preserve_source: Some(false),
+        fallback_font_paths: vec![resolved_fallback.display().to_string()],
         bbox: Rect {
             x1: 8.0,
             y1: 8.0,
@@ -692,6 +695,7 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
         needs_review: Some(false),
         flagged: Some(false),
         preserve_source: Some(true),
+        fallback_font_paths: Vec::new(),
         bbox: Rect {
             x1: 82.0,
             y1: 22.0,
@@ -716,8 +720,16 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
     .unwrap();
     assert_eq!(initial_report["bubbles"][1]["skipped"], true);
     assert_eq!(
-        initial_report["bubbles"][0]["font_path"],
+        initial_report["bubbles"][0]["requested_primary_font"],
+        requested_font.display().to_string()
+    );
+    assert_eq!(
+        initial_report["bubbles"][0]["fallback_fonts_used"][0],
         resolved_fallback.display().to_string()
+    );
+    assert_eq!(
+        initial_report["bubbles"][0]["mixed_font_fallback_used"],
+        true
     );
     let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
     workflow
@@ -750,7 +762,11 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
     let mut edited: serde_json::Value =
         serde_json::from_slice(&fs::read(persisted_path).unwrap()).unwrap();
     assert_eq!(
-        edited["pages"][0]["bubbles"][0]["rendered_font_path"],
+        edited["pages"][0]["bubbles"][0]["font_path"],
+        requested_font.display().to_string()
+    );
+    assert_eq!(
+        edited["pages"][0]["bubbles"][0]["fallback_font_paths"][0],
         resolved_fallback.display().to_string()
     );
     edited["pages"][0]["correction_strokes"] = json!([{

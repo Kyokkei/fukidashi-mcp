@@ -47,6 +47,7 @@ fn narrow_tall_comic_bubble_fits_vietnamese_dialogue() {
             needs_review: None,
             flagged: None,
             preserve_source: None,
+            fallback_font_paths: Vec::new(),
             bbox,
             bubble_bbox: None,
             text_bbox: None,
@@ -177,6 +178,7 @@ fn raster_output_is_png_and_does_not_modify_source() {
         needs_review: None,
         flagged: None,
         preserve_source: None,
+        fallback_font_paths: Vec::new(),
         bbox: Rect {
             x1: 20.0,
             y1: 20.0,
@@ -226,10 +228,11 @@ fn preserved_and_empty_payloads_skip_layout_fitting() {
                 id: Some("text-sfx".into()),
                 source_text: Some("クス".into()),
                 kind: Some("unmatched_text".into()),
-                preserve_by_default: Some(true),
+                preserve_by_default: None,
                 needs_review: None,
                 flagged: None,
                 preserve_source: None,
+                fallback_font_paths: Vec::new(),
                 bbox: Rect {
                     x1: 20.0,
                     y1: 10.0,
@@ -253,6 +256,7 @@ fn preserved_and_empty_payloads_skip_layout_fitting() {
                 needs_review: None,
                 flagged: None,
                 preserve_source: Some(false),
+                fallback_font_paths: Vec::new(),
                 bbox: Rect {
                     x1: 0.0,
                     y1: 0.0,

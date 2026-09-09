@@ -20,6 +20,7 @@ use crate::{
     config::{Config, ConfigureRequest},
     domain::{Rect, TypesetPayload},
     error::FukidashiError,
+    ingress::{PullChapterRequest, SearchMangaRequest},
     workflow::{PendingPage, ScopeSpec, Workflow},
 };
 
@@ -91,7 +92,8 @@ pub struct TypesetRequest {
     pub max_font_size: Option<f32>,
     #[serde(default)]
     pub shape: Option<String>,
-    /// Ordered whole-font fallbacks used when the selected font lacks glyphs.
+    /// Ordered per-grapheme fallbacks used when the primary face lacks a
+    /// complete grapheme cluster.
     #[serde(default)]
     pub fallback_font_paths: Vec<String>,
 }
@@ -1237,6 +1239,7 @@ impl FukidashiServer {
                 // or problem is an approval blocker.
                 flagged: None,
                 preserve_source: Some(keep_source),
+                fallback_font_paths: Vec::new(),
                 bbox,
                 bubble_bbox: None,
                 text_bbox: None,
@@ -1777,6 +1780,46 @@ impl FukidashiServer {
     }
 
     #[tool(
+        name = "fukidashi_search_manga",
+        description = "Search native MangaDex titles only. source=auto resolves to MangaDex; no aggregator or guessed provider is used. Returns stable manga_id values, display/original language/status metadata, and alternate titles. Use an exact returned manga_id when calling fukidashi_pull_chapter."
+    )]
+    pub async fn search_manga(
+        &self,
+        Parameters(req): Parameters<SearchMangaRequest>,
+    ) -> CallToolResult {
+        match crate::ingress::search_manga(req).await {
+            Ok(value) => json_result(&value, false),
+            Err(error) => json_result(
+                &serde_json::json!({
+                    "error": error.to_string(),
+                    "next_step": "retry with source=auto or source=mangadex and a bounded query"
+                }),
+                true,
+            ),
+        }
+    }
+
+    #[tool(
+        name = "fukidashi_pull_chapter",
+        description = "Import a chapter into a new server-owned Fukidashi job. MangaDex mode accepts only an exact manga_id or chapter_id plus optional exact chapter/language filters and reports ambiguity instead of guessing; data_saver='full' selects full data by default (legacy booleans are accepted). Direct mode accepts one explicit http(s) url and invokes an already installed gallery-dl helper with bounded, transactional staging. The response includes job_id/job_path/page_count/source metadata and the exact fukidashi_translation_start next step; do not shell-read or invent paths."
+    )]
+    pub async fn pull_chapter(
+        &self,
+        Parameters(req): Parameters<PullChapterRequest>,
+    ) -> CallToolResult {
+        match crate::ingress::pull_chapter(&self.config, &self.workflow, req).await {
+            Ok(value) => json_result(&value, false),
+            Err(error) => json_result(
+                &serde_json::json!({
+                    "error": error.to_string(),
+                    "next_step": "provide exact MangaDex identifiers or an explicit http(s) URL as required"
+                }),
+                true,
+            ),
+        }
+    }
+
+    #[tool(
         name = "fukidashi_get_config",
         description = "Show effective Fukidashi storage, model, job, cache, runtime, font and device configuration. Paths come from explicit CLI, environment, saved user config, then platform defaults. This is read-only."
     )]
@@ -2272,6 +2315,25 @@ impl FukidashiServer {
                 }
             }
         }
+        for (index, bubble) in bubbles.iter_mut().enumerate() {
+            let requested = std::mem::take(&mut bubble.fallback_font_paths);
+            let mut materialized = Vec::with_capacity(requested.len());
+            for font in requested {
+                match workflow.materialize_font_path(&job_root, std::path::Path::new(&font)) {
+                    Ok(managed) => materialized.push(managed.display().to_string()),
+                    Err(error) => {
+                        return json_result(
+                            &serde_json::json!({
+                                "error": format!("bubble {index} fallback font {font:?} is not usable: {error}"),
+                                "next_step": "use a validated TTF/OTF/TTC from Windows Fonts or a managed job fonts directory"
+                            }),
+                            true,
+                        );
+                    }
+                }
+            }
+            bubble.fallback_font_paths = materialized;
+        }
         let requested_fallbacks = fallback_font_paths;
         let mut fallback_font_paths =
             Vec::with_capacity(requested_fallbacks.len() + bundled_fallback_paths.len());
@@ -2290,6 +2352,12 @@ impl FukidashiServer {
             }
         }
         fallback_font_paths.extend(bundled_fallback_paths);
+        for bubble in &mut bubbles {
+            let mut effective = bubble.fallback_font_paths.clone();
+            effective.extend(fallback_font_paths.iter().cloned());
+            effective.dedup();
+            bubble.fallback_font_paths = effective;
+        }
         let output_path = parent.join("rendered.png");
         let render_lock = match workflow.acquire_render_lock(&job_root) {
             Ok(lock) => lock,
@@ -2847,7 +2915,10 @@ impl ServerHandler for FukidashiServer {
                 fukidashi_serve_editor and fukidashi_wait_for_review remain compatibility tools. Primitive \
                 fukidashi_analyze_page, fukidashi_clean_page, and fukidashi_typeset tools remain available for \
                 compatibility; pass their exact server-returned paths and stable IDs. Use \
-                fukidashi_release_models between bounded legacy batches on memory-constrained machines.",
+                fukidashi_release_models between bounded legacy batches on memory-constrained machines. For \
+                acquisition, fukidashi_search_manga searches native MangaDex only and fukidashi_pull_chapter \
+                accepts exact MangaDex identifiers or one explicit http(s) URL for a provisioned gallery-dl \
+                helper; follow its returned fukidashi_translation_start next step.",
             )
     }
 }
@@ -2884,14 +2955,24 @@ mod tests {
         let server = FukidashiServer::new(config).unwrap();
         let info = server.get_info();
         let instructions = info.instructions.unwrap();
+        let tool_names = server
+            .tool_router
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect::<BTreeSet<_>>();
 
         assert_eq!(info.server_info.name, "fukidashi-mcp");
+        assert!(tool_names.contains("fukidashi_search_manga"));
+        assert!(tool_names.contains("fukidashi_pull_chapter"));
         assert!(instructions.contains("fukidashi_translation_start"));
         assert!(instructions.contains("fukidashi_translation_submit"));
         assert!(instructions.contains("fukidashi_review_and_export"));
         assert!(instructions.contains("sfx_mode=preserve"));
         assert!(instructions.contains("fukidashi_analyze_page"));
         assert!(instructions.contains("fukidashi_wait_for_review"));
+        assert!(instructions.contains("fukidashi_search_manga"));
+        assert!(instructions.contains("fukidashi_pull_chapter"));
         assert!(instructions.contains("after approval"));
     }
 
@@ -3524,6 +3605,7 @@ mod tests {
                 needs_review: None,
                 flagged: None,
                 preserve_source: None,
+                fallback_font_paths: Vec::new(),
                 bbox,
                 bubble_bbox: None,
                 text_bbox: None,
@@ -3573,6 +3655,7 @@ mod tests {
             needs_review: None,
             flagged: None,
             preserve_source: None,
+            fallback_font_paths: Vec::new(),
             bbox,
             bubble_bbox: None,
             text_bbox: None,

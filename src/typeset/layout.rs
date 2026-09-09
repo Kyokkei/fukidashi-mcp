@@ -8,6 +8,10 @@ use crate::domain::Rect;
 #[derive(Clone, Debug)]
 pub struct ShapedGlyph {
     pub glyph_id: u32,
+    /// Index into the font candidates supplied to the shaper.
+    pub font_index: usize,
+    /// Stable font identity retained for render/report consumers.
+    pub font_id: String,
     pub x: f32,
     pub y: f32,
     pub advance: f32,
@@ -21,12 +25,31 @@ pub struct ShapedGlyph {
 pub struct ShapedLine {
     pub text: String,
     pub glyphs: Vec<ShapedGlyph>,
+    /// Adjacent grapheme clusters using the same face are coalesced here.
+    pub font_runs: Vec<FontRun>,
     pub advance_width: f32,
     pub ink_left: f32,
     pub ink_right: f32,
     pub baseline: f32,
     pub top: f32,
     pub bottom: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct FontRun {
+    pub font_index: usize,
+    pub font_id: String,
+    pub text: String,
+}
+
+/// Font bytes and raster face borrowed by the per-grapheme shaper. The
+/// `bytes` slice is used to construct a rustybuzz face on demand while the
+/// fontdue face is retained for rasterization.
+#[derive(Clone, Copy, Debug)]
+pub struct FontCandidate<'a> {
+    pub id: &'a str,
+    pub bytes: &'a [u8],
+    pub font: &'a fontdue::Font,
 }
 
 #[derive(Clone, Debug)]
@@ -53,6 +76,11 @@ struct Shaper<'a> {
     size: f32,
     scale: f32,
     metrics: Metrics,
+}
+
+trait TextShaper {
+    fn metrics(&self) -> Metrics;
+    fn shape(&self, text: &str) -> Result<ShapedLine>;
 }
 
 impl<'a> Shaper<'a> {
@@ -138,6 +166,8 @@ impl<'a> Shaper<'a> {
             bottom = bottom.max(ink_bottom);
             glyphs.push(ShapedGlyph {
                 glyph_id: gid,
+                font_index: 0,
+                font_id: "primary".to_owned(),
                 x: gx,
                 y: gy,
                 advance: pos.x_advance as f32 * self.scale,
@@ -157,6 +187,15 @@ impl<'a> Shaper<'a> {
         Ok(ShapedLine {
             text: text.to_owned(),
             glyphs,
+            font_runs: if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![FontRun {
+                    font_index: 0,
+                    font_id: "primary".to_owned(),
+                    text: text.to_owned(),
+                }]
+            },
             advance_width: x,
             ink_left: left,
             ink_right: right,
@@ -165,6 +204,263 @@ impl<'a> Shaper<'a> {
             bottom,
         })
     }
+}
+
+impl TextShaper for Shaper<'_> {
+    fn metrics(&self) -> Metrics {
+        self.metrics
+    }
+
+    fn shape(&self, text: &str) -> Result<ShapedLine> {
+        Shaper::shape(self, text)
+    }
+}
+
+struct MultiShaper<'a> {
+    fonts: &'a [FontCandidate<'a>],
+    size: f32,
+    metrics: Metrics,
+}
+
+impl<'a> MultiShaper<'a> {
+    fn new(fonts: &'a [FontCandidate<'a>], size: f32) -> Result<Self> {
+        if fonts.is_empty() {
+            bail!("at least one font candidate is required");
+        }
+        if !size.is_finite() || size <= 0.0 {
+            bail!("font size must be finite and positive");
+        }
+        let primary = Face::from_slice(fonts[0].bytes, 0)
+            .ok_or_else(|| anyhow!("unable to parse primary font {}", fonts[0].id))?;
+        let upem = primary.units_per_em() as f32;
+        if upem <= 0.0 {
+            bail!("font has invalid units_per_em");
+        }
+        let mut metrics = Metrics {
+            ascent: 0.0,
+            descent: 0.0,
+            leading: 0.0,
+        };
+        for candidate in fonts {
+            let face = Face::from_slice(candidate.bytes, 0)
+                .ok_or_else(|| anyhow!("unable to parse font {}", candidate.id))?;
+            let candidate_upem = face.units_per_em() as f32;
+            if candidate_upem <= 0.0 {
+                bail!("font {} has invalid units_per_em", candidate.id);
+            }
+            let candidate_scale = size / candidate_upem;
+            metrics.ascent = metrics
+                .ascent
+                .max(f32::from(face.ascender()) * candidate_scale);
+            metrics.descent = metrics
+                .descent
+                .max((-f32::from(face.descender()) * candidate_scale).max(0.0));
+            metrics.leading = metrics
+                .leading
+                .max((f32::from(face.line_gap()) * candidate_scale).max(0.0));
+        }
+        Ok(Self {
+            fonts,
+            size,
+            metrics,
+        })
+    }
+
+    fn choose_font(&self, cluster: &str) -> Result<usize> {
+        let required = cluster
+            .chars()
+            .filter(|character| requires_font_glyph(*character))
+            .collect::<Vec<_>>();
+        if required.is_empty() {
+            return Ok(0);
+        }
+        let mut missing_by_font = Vec::new();
+        for (index, candidate) in self.fonts.iter().enumerate() {
+            let face = Face::from_slice(candidate.bytes, 0)
+                .ok_or_else(|| anyhow!("unable to parse font {}", candidate.id))?;
+            let missing = required
+                .iter()
+                .copied()
+                .filter(|character| {
+                    face.glyph_index(*character)
+                        .is_none_or(|glyph| glyph.0 == 0)
+                })
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                return Ok(index);
+            }
+            missing_by_font.push((candidate.id, missing));
+        }
+        let details = missing_by_font
+            .iter()
+            .map(|(font, missing)| {
+                format!(
+                    "{font}: {}",
+                    missing
+                        .iter()
+                        .map(|character| format!("U+{:04X}", u32::from(*character)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!(
+            "grapheme cluster {cluster:?} has no single font covering it; missing code points by candidate: {details}"
+        )
+    }
+
+    fn shape_run(
+        &self,
+        font_index: usize,
+        text: &str,
+        x_offset: f32,
+    ) -> Result<(Vec<ShapedGlyph>, f32, f32, f32, f32, f32)> {
+        let candidate = self
+            .fonts
+            .get(font_index)
+            .ok_or_else(|| anyhow!("font candidate index {font_index} is out of range"))?;
+        let face = Face::from_slice(candidate.bytes, 0)
+            .ok_or_else(|| anyhow!("unable to parse font {}", candidate.id))?;
+        let upem = face.units_per_em() as f32;
+        let scale = self.size / upem;
+        let mut buffer = UnicodeBuffer::new();
+        buffer.push_str(text);
+        let glyph_buffer = rustybuzz::shape(&face, &[], buffer);
+        let infos = glyph_buffer.glyph_infos();
+        let positions = glyph_buffer.glyph_positions();
+        let mut x = 0.0;
+        let mut glyphs = Vec::with_capacity(infos.len());
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for (info, pos) in infos.iter().zip(positions.iter()) {
+            let gid = info.glyph_id;
+            let gx = x_offset + x + pos.x_offset as f32 * scale;
+            let gy = pos.y_offset as f32 * scale;
+            let (ink_left, ink_right, ink_top, ink_bottom) = if let Some(ext) = face
+                .glyph_bounding_box(rustybuzz::ttf_parser::GlyphId(
+                    u16::try_from(gid).map_err(|_| anyhow!("glyph id exceeds font range"))?,
+                )) {
+                (
+                    gx + f32::from(ext.x_min) * scale,
+                    gx + f32::from(ext.x_max) * scale,
+                    gy - f32::from(ext.y_max) * scale,
+                    gy - f32::from(ext.y_min) * scale,
+                )
+            } else {
+                let raster_gid = u16::try_from(gid)
+                    .map_err(|_| anyhow!("glyph id exceeds raster font range"))?;
+                let (metrics, _) = candidate.font.rasterize_indexed(raster_gid, self.size);
+                (
+                    gx + metrics.xmin as f32,
+                    gx + metrics.xmin as f32 + metrics.width as f32,
+                    -metrics.ymin as f32 - metrics.height as f32 + gy,
+                    -metrics.ymin as f32 + gy,
+                )
+            };
+            left = left.min(ink_left);
+            right = right.max(ink_right);
+            top = top.min(ink_top);
+            bottom = bottom.max(ink_bottom);
+            glyphs.push(ShapedGlyph {
+                glyph_id: gid,
+                font_index,
+                font_id: candidate.id.to_owned(),
+                x: gx,
+                y: gy,
+                advance: pos.x_advance as f32 * scale,
+                ink_left,
+                ink_right,
+                ink_top,
+                ink_bottom,
+            });
+            x += pos.x_advance as f32 * scale;
+        }
+        if glyphs.is_empty() {
+            left = 0.0;
+            right = 0.0;
+            top = -self.metrics.ascent;
+            bottom = self.metrics.descent;
+        }
+        Ok((glyphs, x, left, right, top, bottom))
+    }
+}
+
+impl TextShaper for MultiShaper<'_> {
+    fn metrics(&self) -> Metrics {
+        self.metrics
+    }
+
+    fn shape(&self, text: &str) -> Result<ShapedLine> {
+        if text.is_empty() {
+            return Ok(ShapedLine {
+                text: String::new(),
+                glyphs: Vec::new(),
+                font_runs: Vec::new(),
+                advance_width: 0.0,
+                ink_left: 0.0,
+                ink_right: 0.0,
+                baseline: 0.0,
+                top: -self.metrics.ascent,
+                bottom: self.metrics.descent,
+            });
+        }
+        let mut runs = Vec::<(usize, String)>::new();
+        for cluster in UnicodeSegmentation::graphemes(text, true) {
+            let index = self.choose_font(cluster)?;
+            if let Some((last_index, last_text)) = runs.last_mut()
+                && *last_index == index
+            {
+                last_text.push_str(cluster);
+            } else {
+                runs.push((index, cluster.to_owned()));
+            }
+        }
+        let mut glyphs = Vec::new();
+        let mut font_runs = Vec::with_capacity(runs.len());
+        let mut advance_width = 0.0;
+        let mut left = f32::INFINITY;
+        let mut right = f32::NEG_INFINITY;
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for (font_index, run_text) in runs {
+            let (mut run_glyphs, run_advance, run_left, run_right, run_top, run_bottom) =
+                self.shape_run(font_index, &run_text, advance_width)?;
+            glyphs.append(&mut run_glyphs);
+            let font_id = self.fonts[font_index].id.to_owned();
+            font_runs.push(FontRun {
+                font_index,
+                font_id,
+                text: run_text,
+            });
+            advance_width += run_advance;
+            left = left.min(run_left);
+            right = right.max(run_right);
+            top = top.min(run_top);
+            bottom = bottom.max(run_bottom);
+        }
+        Ok(ShapedLine {
+            text: text.to_owned(),
+            glyphs,
+            font_runs,
+            advance_width,
+            ink_left: left,
+            ink_right: right,
+            baseline: 0.0,
+            top,
+            bottom,
+        })
+    }
+}
+
+fn requires_font_glyph(character: char) -> bool {
+    !character.is_control()
+        && !matches!(
+            character,
+            '\u{200C}' | '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'
+        )
 }
 
 /// Fit a complete string in a rectangle or ellipse using actual glyph shaping.
@@ -208,6 +504,67 @@ pub fn fit_text_with_geometry(
     max_font_size: f32,
     padding: Option<f32>,
 ) -> Result<LayoutResult> {
+    fit_text_with_factory(
+        bbox,
+        bubble_bbox,
+        text_bbox,
+        shape,
+        min_font_size,
+        max_font_size,
+        padding,
+        text,
+        |size| Shaper::new(face, font, size),
+    )
+}
+
+/// Fit text with a primary font followed by per-grapheme fallback candidates.
+/// Each Unicode grapheme is assigned to one candidate, so combining marks and
+/// variation selectors never get split across faces. Adjacent assignments are
+/// shaped as one run for stable advances and ligatures.
+#[allow(clippy::too_many_arguments)]
+pub fn fit_text_with_font_candidates(
+    fonts: &[FontCandidate<'_>],
+    text: &str,
+    bbox: Rect,
+    bubble_bbox: Option<Rect>,
+    text_bbox: Option<Rect>,
+    shape: &str,
+    min_font_size: f32,
+    max_font_size: f32,
+    padding: Option<f32>,
+) -> Result<LayoutResult> {
+    if fonts.is_empty() {
+        bail!("at least one font candidate is required");
+    }
+    fit_text_with_factory(
+        bbox,
+        bubble_bbox,
+        text_bbox,
+        shape,
+        min_font_size,
+        max_font_size,
+        padding,
+        text,
+        |size| MultiShaper::new(fonts, size),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_text_with_factory<F, S>(
+    bbox: Rect,
+    bubble_bbox: Option<Rect>,
+    text_bbox: Option<Rect>,
+    shape: &str,
+    min_font_size: f32,
+    max_font_size: f32,
+    padding: Option<f32>,
+    text: &str,
+    factory: F,
+) -> Result<LayoutResult>
+where
+    F: Fn(f32) -> Result<S>,
+    S: TextShaper,
+{
     if !bbox.x1.is_finite()
         || !bbox.y1.is_finite()
         || !bbox.x2.is_finite()
@@ -248,7 +605,7 @@ pub fn fit_text_with_geometry(
         size = max_font_size;
     }
     while size + 1e-4 >= floor {
-        let shaper = Shaper::new(face, font, size)?;
+        let shaper = factory(size)?;
         if let Some(lines) = fit_at_size(&shaper, text, safe_bbox, shape, placement_center)? {
             return Ok(LayoutResult {
                 font_size: size,
@@ -288,7 +645,7 @@ fn inset_rect(rect: Rect, padding: f32) -> Result<Rect> {
 }
 
 fn fit_at_size(
-    shaper: &Shaper<'_>,
+    shaper: &impl TextShaper,
     text: &str,
     bbox: Rect,
     shape: &str,
@@ -324,12 +681,13 @@ fn fit_at_size(
     let min_lines = 1;
     let max_lines = n.saturating_add(1).clamp(1, 256);
     for line_count in min_lines..=max_lines {
-        let block_height = line_count as f32 * (shaper.metrics.ascent + shaper.metrics.descent)
-            + (line_count.saturating_sub(1) as f32) * shaper.metrics.leading;
+        let metrics = shaper.metrics();
+        let block_height = line_count as f32 * (metrics.ascent + metrics.descent)
+            + (line_count.saturating_sub(1) as f32) * metrics.leading;
         if block_height > 2.0 * b + 1e-3 {
             continue;
         }
-        let first_baseline = cy - block_height * 0.5 + shaper.metrics.ascent;
+        let first_baseline = cy - block_height * 0.5 + metrics.ascent;
         let mut memo = HashMap::<(usize, usize), SolveResult>::new();
         if let Some((_, mut chosen)) = solve_lines(
             shaper,
@@ -339,9 +697,9 @@ fn fit_at_size(
             0,
             line_count,
             first_baseline,
-            shaper.metrics.ascent,
-            shaper.metrics.descent,
-            shaper.metrics.leading,
+            metrics.ascent,
+            metrics.descent,
+            metrics.leading,
             cx,
             cy,
             a,
@@ -353,8 +711,7 @@ fn fit_at_size(
             let mut lines = chosen.into_iter().map(|(_, line)| line).collect::<Vec<_>>();
             for (i, line) in lines.iter_mut().enumerate() {
                 let baseline = first_baseline
-                    + i as f32
-                        * (shaper.metrics.ascent + shaper.metrics.descent + shaper.metrics.leading);
+                    + i as f32 * (metrics.ascent + metrics.descent + metrics.leading);
                 line.baseline = baseline;
                 line.top += baseline;
                 line.bottom += baseline;
@@ -367,7 +724,7 @@ fn fit_at_size(
 
 #[allow(clippy::too_many_arguments)]
 fn solve_lines(
-    shaper: &Shaper<'_>,
+    shaper: &impl TextShaper,
     tokens: &[String],
     legal: &[bool],
     line: usize,

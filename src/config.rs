@@ -27,6 +27,8 @@ pub const ENV_GPU_MEMORY_LIMIT_MIB: &str = "FUKIDASHI_GPU_MEMORY_LIMIT_MIB";
 pub const ENV_RETAIN_STAGE_SESSIONS: &str = "FUKIDASHI_RETAIN_STAGE_SESSIONS";
 pub const ENV_FONT_DIRS: &str = "FUKIDASHI_FONT_DIRS";
 pub const ENV_FONT_PATH: &str = "FUKIDASHI_FONT_PATH";
+/// Optional absolute path to a provisioned gallery-dl executable.
+pub const ENV_GALLERY_DL: &str = "FUKIDASHI_GALLERY_DL";
 
 const DEFAULT_SESSION_RECYCLE_PAGES: usize = 1;
 const DEFAULT_GPU_MEMORY_LIMIT_MIB: usize = 2_048;
@@ -98,6 +100,7 @@ pub struct ConfigReport {
     pub restart_fields: Vec<String>,
     pub missing_model_files: Vec<PathBuf>,
     pub runtime_library: Option<PathBuf>,
+    pub gallery_dl_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
@@ -382,7 +385,39 @@ impl Config {
             restart_fields: Vec::new(),
             missing_model_files,
             runtime_library: self.ort_dylib.clone(),
+            gallery_dl_path: self.gallery_dl_path(),
         }
+    }
+
+    /// Locate the optional direct-URL ingress helper without downloading or
+    /// modifying it.  An explicit environment path wins, followed by the
+    /// managed storage bin directory and then the user's PATH.
+    pub fn gallery_dl_path(&self) -> Option<PathBuf> {
+        let mut candidates = Vec::new();
+        if let Some(path) = env_path(ENV_GALLERY_DL) {
+            candidates.push(path);
+        }
+        let executable = if cfg!(windows) {
+            "gallery-dl.exe"
+        } else {
+            "gallery-dl"
+        };
+        candidates.push(self.storage_root.join("bin").join(executable));
+        if cfg!(windows) {
+            candidates.push(self.storage_root.join("bin").join("gallery-dl"));
+        }
+        if let Some(path) = env::var_os("PATH") {
+            for directory in env::split_paths(&path) {
+                candidates.push(directory.join(executable));
+                if cfg!(windows) {
+                    candidates.push(directory.join("gallery-dl"));
+                }
+            }
+        }
+        candidates
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .map(|candidate| absolute_lossy(&candidate))
     }
 
     pub fn configure_user(&self, request: &ConfigureRequest) -> Result<ConfigReport> {
@@ -443,7 +478,7 @@ impl Config {
     }
 
     pub fn doctor(&self) -> Vec<String> {
-        [
+        let mut lines = [
             self.detector_model(),
             self.lama_model(),
             self.db_model(),
@@ -481,7 +516,12 @@ impl Config {
                 if p.is_file() { "present" } else { "missing" }
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+        lines.push(match self.gallery_dl_path() {
+            Some(path) => format!("gallery-dl: {}: present", path.display()),
+            None => "gallery-dl: not found (optional for direct-URL ingress)".to_owned(),
+        });
+        lines
     }
 }
 
@@ -837,6 +877,45 @@ mod tests {
         assert_eq!(
             root.file_name().and_then(|name| name.to_str()),
             Some("Fukidashi")
+        );
+    }
+
+    #[test]
+    fn gallery_dl_discovery_prefers_the_managed_storage_bin() {
+        if env::var_os(ENV_GALLERY_DL).is_some() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let config = Config {
+            storage_root: temp.path().join("storage"),
+            models_dir: temp.path().join("storage/models"),
+            ort_dylib: None,
+            config_file: temp.path().join("config.json"),
+            configured_jobs_dir: None,
+            configured_cache_dir: None,
+            configured_temp_dir: None,
+            configured_runtime_dir: None,
+            configured_exports_dir: None,
+            configured_font_dirs: Vec::new(),
+            configured_provider: None,
+            storage_source: "test".into(),
+            models_source: "test".into(),
+            ort_source: "test".into(),
+        };
+        let name = if cfg!(windows) {
+            "gallery-dl.exe"
+        } else {
+            "gallery-dl"
+        };
+        let helper = config.storage_root.join("bin").join(name);
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        fs::write(&helper, b"fixture").unwrap();
+        assert_eq!(config.gallery_dl_path(), Some(helper));
+        assert!(
+            config
+                .doctor()
+                .iter()
+                .any(|line| line.contains("gallery-dl") && line.contains("present"))
         );
     }
 

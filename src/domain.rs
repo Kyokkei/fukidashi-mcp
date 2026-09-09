@@ -96,6 +96,10 @@ pub struct TypesetPayload {
     /// unmatched text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preserve_source: Option<bool>,
+    /// Ordered fallback faces retained by managed render sidecars so an
+    /// editor rerender can reproduce the original primary/fallback set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallback_font_paths: Vec<String>,
     pub bbox: Rect,
     /// Optional detector geometry. When valid, this is the containing speech
     /// bubble and takes precedence over `bbox` for the safe layout area.

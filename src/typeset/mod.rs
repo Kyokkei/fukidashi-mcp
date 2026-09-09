@@ -2,20 +2,31 @@
 
 mod layout;
 
-pub use layout::{LayoutResult, ShapedGlyph, ShapedLine, fit_text, fit_text_with_geometry};
+pub use layout::{
+    FontCandidate, FontRun, LayoutResult, ShapedGlyph, ShapedLine, fit_text,
+    fit_text_with_font_candidates, fit_text_with_geometry,
+};
 
 use anyhow::{Context, Result, anyhow};
 use image::{DynamicImage, Rgba};
-use rustybuzz::Face;
 use serde_json::json;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
 use crate::domain::TypesetPayload;
 use crate::workflow::CleanArtifact;
 
-/// Render translated text over a page image using the same font face for shaping
-/// and rasterization.  Text is never truncated: an unfit bubble is an error.
+#[derive(Debug)]
+struct FontAsset {
+    path: String,
+    bytes: Vec<u8>,
+    font: fontdue::Font,
+}
+
+/// Render translated text over a page image using the requested primary face
+/// plus ordered per-grapheme fallbacks. Text is never truncated: an unfit
+/// bubble is an error.
 pub fn typeset_page(
     image_path: &Path,
     bubbles: &[TypesetPayload],
@@ -24,8 +35,9 @@ pub fn typeset_page(
     typeset_page_with_fallbacks(image_path, bubbles, &[], output_path)
 }
 
-/// Render a page with ordered whole-font fallbacks. A fallback is selected
-/// only when the requested font cannot represent every non-control character.
+/// Render a page with an ordered primary/fallback font set. Each grapheme is
+/// assigned independently, while adjacent graphemes using one face are shaped
+/// as a single run.
 pub fn typeset_page_with_fallbacks(
     image_path: &Path,
     bubbles: &[TypesetPayload],
@@ -67,36 +79,24 @@ pub fn typeset_page_with_fallbacks(
             }));
             continue;
         }
-        let rect = payload.bbox;
-        if !rect.x1.is_finite()
-            || !rect.y1.is_finite()
-            || !rect.x2.is_finite()
-            || !rect.y2.is_finite()
-            || rect.x2 <= rect.x1
-            || rect.y2 <= rect.y1
-        {
-            return Err(anyhow!("bubble {index} has an invalid bounding box"));
-        }
         let requested_font_path = payload.font_path.as_ref().ok_or_else(|| {
             anyhow!("bubble {index} has no font_path; a real font is required for typesetting")
         })?;
-        let (font_path, font_bytes) = select_font(
-            requested_font_path,
-            fallback_font_paths,
-            &payload.text,
-            index,
-        )?;
-        let face = Face::from_slice(&font_bytes, 0)
-            .ok_or_else(|| anyhow!("unable to parse font {font_path}"))?;
-        let font =
-            fontdue::Font::from_bytes(font_bytes.as_slice(), fontdue::FontSettings::default())
-                .map_err(|e| anyhow!("unable to parse raster font {font_path}: {e}"))?;
+        let assets = load_font_assets(payload, fallback_font_paths, index)?;
+        let candidates = assets
+            .iter()
+            .map(|asset| FontCandidate {
+                id: &asset.path,
+                bytes: &asset.bytes,
+                font: &asset.font,
+            })
+            .collect::<Vec<_>>();
+        let rect = payload.bbox;
         let min = payload.min_font_size.unwrap_or(8.0);
         let max = payload.max_font_size.unwrap_or(72.0);
         let shape = payload.shape.as_deref().unwrap_or("ellipse");
-        let layout = fit_text_with_geometry(
-            &face,
-            &font,
+        let layout = fit_text_with_font_candidates(
+            &candidates,
             &payload.text,
             rect,
             payload.bubble_bbox,
@@ -107,8 +107,27 @@ pub fn typeset_page_with_fallbacks(
             payload.padding,
         )
         .with_context(|| format!("fit text for bubble {index}"))?;
-        raster_layout(&mut image, &font, &layout)?;
+        raster_layout(&mut image, &candidates, &layout)?;
         let ink_bbox = layout_ink_bbox(&layout);
+        let mut used = HashSet::new();
+        let mut font_runs = Vec::new();
+        for line in &layout.lines {
+            for run in &line.font_runs {
+                used.insert(run.font_index);
+                font_runs.push(json!({
+                    "font_index": run.font_index,
+                    "font_id": run.font_id,
+                    "text": run.text,
+                }));
+            }
+        }
+        let fallback_fonts_used = candidates
+            .iter()
+            .enumerate()
+            .filter(|(candidate_index, _)| *candidate_index > 0 && used.contains(candidate_index))
+            .map(|(_, candidate)| candidate.id.to_owned())
+            .collect::<Vec<_>>();
+        let primary_used = used.contains(&0);
         reports.push(json!({
             "index": index,
             "input_bbox": rect,
@@ -123,8 +142,21 @@ pub fn typeset_page_with_fallbacks(
             "ink_bbox": ink_bbox,
             "shape": shape,
             "requested_font_path": requested_font_path,
-            "font_path": font_path,
-            "font_fallback_used": font_path != *requested_font_path,
+            "requested_primary_font": requested_font_path,
+            // `font_path` remains the requested primary for sidecar/editor
+            // compatibility; `resolved_font_path` identifies the sole face
+            // only when a page happens to use fallback glyphs exclusively.
+            "font_path": requested_font_path,
+            "resolved_font_path": if !primary_used && fallback_fonts_used.len() == 1 {
+                fallback_fonts_used[0].clone()
+            } else {
+                requested_font_path.clone()
+            },
+            "fallback_font_paths": fallback_fonts_used.clone(),
+            "fallback_fonts_used": fallback_fonts_used,
+            "font_fallback_used": !fallback_fonts_used.is_empty(),
+            "mixed_font_fallback_used": primary_used && !fallback_fonts_used.is_empty(),
+            "font_runs": font_runs,
         }));
     }
 
@@ -165,6 +197,77 @@ fn payload_skip_reason(payload: &TypesetPayload) -> Option<&'static str> {
         return Some("structural_unmatched_text");
     }
     None
+}
+
+fn load_font_assets(
+    payload: &TypesetPayload,
+    fallback_font_paths: &[String],
+    bubble_index: usize,
+) -> Result<Vec<FontAsset>> {
+    let requested = payload.font_path.as_ref().ok_or_else(|| {
+        anyhow!("bubble {bubble_index} has no font_path; a real font is required for typesetting")
+    })?;
+    let mut paths =
+        Vec::with_capacity(1 + payload.fallback_font_paths.len() + fallback_font_paths.len() + 8);
+    paths.push(requested.clone());
+    paths.extend(payload.fallback_font_paths.iter().cloned());
+    paths.extend(fallback_font_paths.iter().cloned());
+    paths.extend(
+        crate::workflow::configured_font_paths()
+            .into_iter()
+            .map(|path| path.display().to_string()),
+    );
+    let common_names = [
+        "segoeui.ttf",
+        "arial.ttf",
+        "calibri.ttf",
+        "seguisym.ttf",
+        "DejaVuSans.ttf",
+        "NotoSans-Regular.ttf",
+    ];
+    for directory in crate::workflow::font_search_dirs() {
+        for name in common_names {
+            paths.push(directory.join(name).display().to_string());
+        }
+    }
+    paths.dedup();
+
+    let mut assets = Vec::with_capacity(paths.len());
+    for (candidate_index, path) in paths.into_iter().enumerate() {
+        let Ok(bytes) = fs::read(&path) else {
+            if candidate_index == 0 {
+                return Err(anyhow!("read font for bubble {bubble_index}: {path}"));
+            }
+            continue;
+        };
+        let font =
+            match fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default()) {
+                Ok(font) => font,
+                Err(error) => {
+                    if candidate_index == 0 {
+                        return Err(anyhow!(
+                            "unable to parse raster font {path} for bubble {bubble_index}: {error}"
+                        ));
+                    }
+                    continue;
+                }
+            };
+        if rustybuzz::Face::from_slice(&bytes, 0).is_none() {
+            if candidate_index == 0 {
+                return Err(anyhow!(
+                    "unable to parse font {path} for bubble {bubble_index}"
+                ));
+            }
+            continue;
+        }
+        assets.push(FontAsset { path, bytes, font });
+    }
+    if assets.is_empty() {
+        return Err(anyhow!(
+            "no usable font candidates remain for bubble {bubble_index}"
+        ));
+    }
+    Ok(assets)
 }
 
 /// Deterministic checks that run after rasterization and before the artifact is
@@ -254,81 +357,6 @@ pub fn post_render_qa(
     }))
 }
 
-fn select_font(
-    requested: &str,
-    configured_fallbacks: &[String],
-    text: &str,
-    bubble_index: usize,
-) -> Result<(String, Vec<u8>)> {
-    let mut candidates = Vec::with_capacity(configured_fallbacks.len() + 6);
-    candidates.push(requested.to_owned());
-    candidates.extend(configured_fallbacks.iter().cloned());
-    candidates.extend(
-        crate::workflow::configured_font_paths()
-            .into_iter()
-            .map(|path| path.display().to_string()),
-    );
-    let common_names = [
-        "segoeui.ttf",
-        "arial.ttf",
-        "calibri.ttf",
-        "seguisym.ttf",
-        "DejaVuSans.ttf",
-        "NotoSans-Regular.ttf",
-    ];
-    for directory in crate::workflow::font_search_dirs() {
-        for name in common_names {
-            candidates.push(directory.join(name).display().to_string());
-        }
-    }
-    candidates.dedup();
-
-    let mut requested_missing = Vec::new();
-    for (candidate_index, candidate) in candidates.into_iter().enumerate() {
-        let Ok(bytes) = fs::read(&candidate) else {
-            if candidate_index == 0 {
-                return Err(anyhow!("read font for bubble {bubble_index}: {candidate}"));
-            }
-            continue;
-        };
-        let Some(face) = Face::from_slice(&bytes, 0) else {
-            if candidate_index == 0 {
-                return Err(anyhow!("unable to parse font {candidate}"));
-            }
-            continue;
-        };
-        let missing = missing_characters(&face, text);
-        if missing.is_empty() {
-            return Ok((candidate, bytes));
-        }
-        if candidate_index == 0 {
-            requested_missing = missing;
-        }
-    }
-    let missing = requested_missing
-        .into_iter()
-        .map(|character| format!("U+{:04X}", u32::from(character)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(anyhow!(
-        "bubble {bubble_index} has no font covering required glyphs: {missing}; configure FUKIDASHI_FONT_PATH or FUKIDASHI_FONT_DIRS with a Unicode-capable TTF/OTF/TTC"
-    ))
-}
-
-fn missing_characters(face: &Face<'_>, text: &str) -> Vec<char> {
-    let mut missing = text
-        .chars()
-        .filter(|character| !character.is_control())
-        .filter(|character| {
-            face.glyph_index(*character)
-                .is_none_or(|glyph| glyph.0 == 0)
-        })
-        .collect::<Vec<_>>();
-    missing.sort_unstable();
-    missing.dedup();
-    missing
-}
-
 fn layout_ink_bbox(layout: &crate::typeset::LayoutResult) -> Option<crate::domain::Rect> {
     let mut x1 = f32::INFINITY;
     let mut y1 = f32::INFINITY;
@@ -347,7 +375,7 @@ fn layout_ink_bbox(layout: &crate::typeset::LayoutResult) -> Option<crate::domai
 
 fn raster_layout(
     image: &mut image::RgbaImage,
-    font: &fontdue::Font,
+    fonts: &[FontCandidate<'_>],
     layout: &LayoutResult,
 ) -> Result<()> {
     let cx = layout.placement_center.0;
@@ -355,6 +383,10 @@ fn raster_layout(
     for line in &layout.lines {
         let origin_x = cx - (line.ink_left + line.ink_right) * 0.5;
         for glyph in &line.glyphs {
+            let font = fonts
+                .get(glyph.font_index)
+                .ok_or_else(|| anyhow!("glyph font index {} is out of range", glyph.font_index))?
+                .font;
             let gid = u16::try_from(glyph.glyph_id)
                 .map_err(|_| anyhow!("glyph id exceeds fontdue range"))?;
             let (metrics, bitmap) = font.rasterize_indexed(gid, layout.font_size);
@@ -391,25 +423,60 @@ fn raster_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Rect;
 
     #[test]
-    fn whole_font_fallback_selects_patrick_hand_for_vietnamese() {
+    fn per_grapheme_fallback_keeps_primary_and_uses_fallback_for_missing_cluster() {
         let directory = tempfile::tempdir().unwrap();
         let requested = directory.path().join("ComicNeue-Regular.ttf");
         let fallback = directory.path().join("PatrickHand-Regular.ttf");
         fs::write(&requested, crate::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
         fs::write(&fallback, crate::fonts::PATRICK_HAND_REGULAR.bytes).unwrap();
-        let fallback_paths = vec![fallback.display().to_string()];
-
-        let (selected, bytes) = select_font(
-            &requested.display().to_string(),
-            &fallback_paths,
-            "Tiếng Việt: ă â đ ê ô ơ ư",
-            0,
+        let requested_bytes = fs::read(&requested).unwrap();
+        let fallback_bytes = fs::read(&fallback).unwrap();
+        let requested_font =
+            fontdue::Font::from_bytes(requested_bytes.as_slice(), fontdue::FontSettings::default())
+                .unwrap();
+        let fallback_font =
+            fontdue::Font::from_bytes(fallback_bytes.as_slice(), fontdue::FontSettings::default())
+                .unwrap();
+        let candidates = vec![
+            FontCandidate {
+                id: requested.to_str().unwrap(),
+                bytes: &requested_bytes,
+                font: &requested_font,
+            },
+            FontCandidate {
+                id: fallback.to_str().unwrap(),
+                bytes: &fallback_bytes,
+                font: &fallback_font,
+            },
+        ];
+        let layout = fit_text_with_font_candidates(
+            &candidates,
+            "Hello ♥",
+            Rect {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 240.0,
+                y2: 80.0,
+            },
+            None,
+            None,
+            "rectangle",
+            8.0,
+            24.0,
+            None,
         )
         .unwrap();
-
-        assert_eq!(selected, fallback.display().to_string());
-        assert_eq!(bytes, crate::fonts::PATRICK_HAND_REGULAR.bytes);
+        assert!(layout.lines[0].font_runs.len() >= 2);
+        assert_eq!(layout.lines[0].font_runs[0].font_index, 0);
+        assert_eq!(layout.lines[0].font_runs[1].font_index, 1);
+        assert!(
+            layout.lines[0]
+                .glyphs
+                .iter()
+                .any(|glyph| glyph.font_index == 1)
+        );
     }
 }
