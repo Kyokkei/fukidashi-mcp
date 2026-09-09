@@ -90,6 +90,12 @@ pub struct TypesetPayload {
     /// Explicit editor flag state, retained across a rerender/reopen cycle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flagged: Option<bool>,
+    /// Preserve the source pixels for this item instead of fitting/rasterizing
+    /// its text. This is distinct from `preserve_by_default`: an explicit
+    /// replace request sets this to false even when the item is structurally
+    /// unmatched text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preserve_source: Option<bool>,
     pub bbox: Rect,
     /// Optional detector geometry. When valid, this is the containing speech
     /// bubble and takes precedence over `bbox` for the safe layout area.

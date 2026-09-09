@@ -1477,6 +1477,38 @@ fn translation_manifest(state: &Value) -> Value {
     json!({"schema_version": 1, "pages": pages})
 }
 
+fn bubble_preserve_for_render(bubble: &Value) -> bool {
+    let text_is_empty = bubble
+        .get("translation")
+        .and_then(Value::as_str)
+        .is_none_or(|text| text.trim().is_empty());
+    if text_is_empty {
+        return true;
+    }
+    if let Some(explicit) = bubble.get("preserve_source").and_then(Value::as_bool) {
+        return explicit;
+    }
+    if bubble
+        .get("keep_source")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    bubble
+        .get("preserve_by_default")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || bubble
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "unmatched_text")
+        || bubble
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("text-"))
+}
+
 fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> {
     let cleaned = page_image_path(session, state, index, "cleaned", true)?;
     let source_image = page_image_path(session, state, index, "source", true)?;
@@ -1506,25 +1538,31 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let removed_ids: std::collections::HashSet<String> = removed_bubbles
+        .iter()
+        .filter_map(removed_bubble_id)
+        .map(str::to_owned)
+        .collect();
+    let preserved_bubbles = bubbles
+        .iter()
+        .filter(|bubble| {
+            bubble
+                .get("id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !removed_ids.contains(id))
+        })
+        .filter(|bubble| bubble_preserve_for_render(bubble))
+        .cloned()
+        .collect::<Vec<_>>();
     if !strokes.is_empty() && bubbles.is_empty() {
         bail!(
             "legacy page is missing saved typeset data; import or recover its bubbles before applying brush and rendering"
         );
     }
-    if !strokes.is_empty()
-        && bubbles.iter().all(|bubble| {
-            bubble
-                .get("translation")
-                .and_then(Value::as_str)
-                .or_else(|| bubble.get("text").and_then(Value::as_str))
-                .is_none_or(str::is_empty)
-        })
+    let (source, corrected_cleaned) = if strokes.is_empty()
+        && removed_bubbles.is_empty()
+        && preserved_bubbles.is_empty()
     {
-        bail!(
-            "legacy page is missing saved translation payloads; import or recover its typeset data before applying brush and rendering"
-        );
-    }
-    let (source, corrected_cleaned) = if strokes.is_empty() && removed_bubbles.is_empty() {
         (cleaned.clone(), None)
     } else {
         let mut corrected = if strokes.is_empty() {
@@ -1534,11 +1572,13 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         } else {
             apply_correction_strokes(&cleaned, &strokes)?
         };
-        if !removed_bubbles.is_empty() {
+        if !removed_bubbles.is_empty() || !preserved_bubbles.is_empty() {
             let original = image::open(&source_image)
                 .with_context(|| format!("read source image {}", source_image.display()))?
                 .to_rgb8();
-            restore_source_bubbles(&mut corrected, &original, &removed_bubbles)?;
+            let mut source_preservations = removed_bubbles.clone();
+            source_preservations.extend(preserved_bubbles.iter().cloned());
+            restore_source_bubbles(&mut corrected, &original, &source_preservations)?;
         }
         let output = cleaned
             .parent()
@@ -1554,6 +1594,10 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
     let global_font = state.get("font_path").and_then(Value::as_str);
     let mut payloads = Vec::with_capacity(bubbles.len());
     for (bubble_index, bubble) in bubbles.iter().enumerate() {
+        let bubble_id = bubble.get("id").and_then(Value::as_str);
+        if bubble_id.is_some_and(|id| removed_ids.contains(id)) {
+            continue;
+        }
         let bbox: Rect = serde_json::from_value(
             bubble
                 .get("bbox")
@@ -1563,20 +1607,62 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         let text = bubble
             .get("translation")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                anyhow!(
-                    "bubble {bubble_index} has no translation; use Preserve original / remove translation box"
-                )
-            })?;
+            .unwrap_or_default()
+            .to_owned();
+        let preserve_source = bubble_preserve_for_render(bubble);
+        if preserve_source {
+            payloads.push(TypesetPayload {
+                id: bubble_id.map(str::to_owned),
+                source_text: bubble
+                    .get("source_text")
+                    .and_then(Value::as_str)
+                    .or_else(|| bubble.get("text").and_then(Value::as_str))
+                    .map(str::to_owned),
+                kind: bubble
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                preserve_by_default: bubble.get("preserve_by_default").and_then(Value::as_bool),
+                needs_review: bubble.get("needs_review").and_then(Value::as_bool),
+                flagged: bubble.get("flagged").and_then(Value::as_bool),
+                preserve_source: Some(true),
+                bbox,
+                bubble_bbox: bubble
+                    .get("bubble_bbox")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?,
+                text_bbox: bubble
+                    .get("text_bbox")
+                    .filter(|value| !value.is_null())
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()?,
+                padding: bubble
+                    .get("padding")
+                    .and_then(Value::as_f64)
+                    .map(|v| v as f32),
+                text,
+                font_path: None,
+                min_font_size: None,
+                max_font_size: None,
+                shape: bubble
+                    .get("shape")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            });
+            continue;
+        }
         if text.trim().is_empty() {
             bail!(
                 "bubble {bubble_index} has an empty translation; use Preserve original / remove translation box"
             );
         }
-        let text = text.to_owned();
         let font_path = bubble
-            .get("font_path")
+            .get("rendered_font_path")
             .and_then(Value::as_str)
+            .or_else(|| bubble.get("font_path").and_then(Value::as_str))
             .or(global_font)
             .ok_or_else(|| anyhow!("bubble {bubble_index} has no project font_path"))?;
         let font_path = safe_project_path(&session.root_dir, font_path)?;
@@ -1585,7 +1671,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             .and_then(Value::as_f64)
             .map(|v| v as f32);
         payloads.push(TypesetPayload {
-            id: bubble.get("id").and_then(Value::as_str).map(str::to_owned),
+            id: bubble_id.map(str::to_owned),
             source_text: bubble
                 .get("source_text")
                 .and_then(Value::as_str)
@@ -1598,6 +1684,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             preserve_by_default: bubble.get("preserve_by_default").and_then(Value::as_bool),
             needs_review: bubble.get("needs_review").and_then(Value::as_bool),
             flagged: bubble.get("flagged").and_then(Value::as_bool),
+            preserve_source: Some(false),
             bbox,
             bubble_bbox: bubble
                 .get("bubble_bbox")

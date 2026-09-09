@@ -487,6 +487,7 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
         preserve_by_default: Some(false),
         needs_review: Some(false),
         flagged: Some(false),
+        preserve_source: Some(false),
         bbox: Rect {
             x1: 1.0,
             y1: 1.0,
@@ -509,6 +510,7 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
         preserve_by_default: Some(false),
         needs_review: Some(false),
         flagged: Some(false),
+        preserve_source: Some(false),
         bbox: Rect {
             x1: 15.0,
             y1: 15.0,
@@ -607,6 +609,205 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
     assert_eq!(persisted_bubbles[0]["id"], "b2");
     assert_eq!(persisted["pages"][0]["removed_bubbles"][0]["id"], "b1");
     assert_eq!(persisted["pages"][0]["render_dirty"], false);
+}
+
+#[test]
+fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("page.png");
+    let mut source_image = ImageBuffer::<Rgb<u8>, _>::from_pixel(128, 128, Rgb([255, 255, 255]));
+    for y in 20..80 {
+        for x in 12..68 {
+            source_image.put_pixel(x, y, Rgb([0, 0, 0]));
+        }
+    }
+    for y in 24..44 {
+        for x in 84..108 {
+            source_image.put_pixel(x, y, Rgb([30, 30, 30]));
+        }
+    }
+    source_image.put_pixel(116, 116, Rgb([20, 20, 20]));
+    source_image.save(&source).unwrap();
+
+    let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+    let registration = workflow.register_analysis(&source, None).unwrap();
+    let mut cleaned = source_image.clone();
+    for y in 20..80 {
+        for x in 12..68 {
+            cleaned.put_pixel(x, y, Rgb([255, 255, 255]));
+        }
+    }
+    let mut mask = image::GrayImage::new(128, 128);
+    for y in 20..80 {
+        for x in 12..68 {
+            mask.put_pixel(x, y, image::Luma([255]));
+        }
+    }
+    workflow
+        .write_clean_artifact(&source, &cleaned, &mask, 0, "full")
+        .unwrap();
+    let artifacts = workflow.page_artifacts_for_source(&source).unwrap();
+    let cleaned_path = artifacts.2;
+    let rendered_path = artifacts.4;
+    let requested_font = workflow
+        .materialize_bundled_font(
+            &registration.job_dir,
+            &fukidashi_mcp::fonts::COMIC_NEUE_REGULAR,
+        )
+        .unwrap();
+    let resolved_fallback = workflow
+        .materialize_bundled_font(
+            &registration.job_dir,
+            &fukidashi_mcp::fonts::PATRICK_HAND_REGULAR,
+        )
+        .unwrap();
+    let dialogue = TypesetPayload {
+        id: Some("bubble-dialogue".into()),
+        source_text: Some("原文".into()),
+        kind: Some("dialogue".into()),
+        preserve_by_default: Some(false),
+        needs_review: Some(false),
+        flagged: Some(false),
+        preserve_source: Some(false),
+        bbox: Rect {
+            x1: 8.0,
+            y1: 8.0,
+            x2: 72.0,
+            y2: 92.0,
+        },
+        bubble_bbox: None,
+        text_bbox: None,
+        padding: Some(4.0),
+        text: "Cảm ơn bạn".into(),
+        font_path: Some(requested_font.display().to_string()),
+        min_font_size: Some(1.0),
+        max_font_size: Some(38.0),
+        shape: Some("rectangle".into()),
+    };
+    let preserved_sfx = TypesetPayload {
+        id: Some("text-sfx".into()),
+        source_text: Some("クス".into()),
+        kind: Some("unmatched_text".into()),
+        preserve_by_default: Some(true),
+        needs_review: Some(false),
+        flagged: Some(false),
+        preserve_source: Some(true),
+        bbox: Rect {
+            x1: 82.0,
+            y1: 22.0,
+            x2: 110.0,
+            y2: 46.0,
+        },
+        bubble_bbox: None,
+        text_bbox: None,
+        padding: None,
+        text: "クス".into(),
+        font_path: None,
+        min_font_size: None,
+        max_font_size: None,
+        shape: None,
+    };
+    let initial_report = fukidashi_mcp::typeset::typeset_page_with_fallbacks(
+        &cleaned_path,
+        &[dialogue.clone(), preserved_sfx.clone()],
+        &[resolved_fallback.display().to_string()],
+        &rendered_path,
+    )
+    .unwrap();
+    assert_eq!(initial_report["bubbles"][1]["skipped"], true);
+    assert_eq!(
+        initial_report["bubbles"][0]["font_path"],
+        resolved_fallback.display().to_string()
+    );
+    let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
+    workflow
+        .register_render(
+            &rendered_path,
+            &clean,
+            json!({
+                "request_bubbles": [dialogue, preserved_sfx],
+                "report": initial_report
+            }),
+            json!({"status":"pass","issues":[]}),
+        )
+        .unwrap();
+
+    let state = workflow.editor_state(&rendered_path, None).unwrap();
+    let result = serve_editor_with_allowed_sources(
+        &rendered_path,
+        state,
+        vec![fs::canonicalize(&source).unwrap()],
+    )
+    .unwrap();
+    let persisted_path = result["persistence_path"].as_str().unwrap();
+    let endpoint = result["url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://")
+        .unwrap();
+    let (host, _) = endpoint.split_once('/').unwrap();
+    let token = result["session_token"].as_str().unwrap();
+    let mut edited: serde_json::Value =
+        serde_json::from_slice(&fs::read(persisted_path).unwrap()).unwrap();
+    assert_eq!(
+        edited["pages"][0]["bubbles"][0]["rendered_font_path"],
+        resolved_fallback.display().to_string()
+    );
+    edited["pages"][0]["correction_strokes"] = json!([{
+        "mode": "cover",
+        "size": 8,
+        "points": [{"x": 116, "y": 116}]
+    }]);
+    let save = request(
+        host,
+        &format!("/{token}/save"),
+        "POST",
+        Some(&edited.to_string()),
+        host,
+    );
+    assert!(save.starts_with("HTTP/1.1 200"), "unexpected save: {save}");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(persisted_path).unwrap()).unwrap();
+    assert_eq!(saved["pages"][0]["render_dirty"], true);
+    let render = request(
+        host,
+        &format!("/{token}/render"),
+        "POST",
+        Some(&json!({"page_index":0,"state":saved}).to_string()),
+        host,
+    );
+    assert!(
+        render.starts_with("HTTP/1.1 200"),
+        "unexpected render: {render}"
+    );
+    let rendered = image::open(&rendered_path).unwrap().to_rgb8();
+    assert_eq!(*rendered.get_pixel(116, 116), Rgb([255, 255, 255]));
+    assert_eq!(*rendered.get_pixel(90, 30), Rgb([30, 30, 30]));
+    let rerender: serde_json::Value =
+        serde_json::from_str(render.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(rerender["state"]["pages"][0]["render_dirty"], false);
+    assert_eq!(
+        rerender["typeset"]["bubbles"][1]["skip_reason"],
+        "preserve_source"
+    );
+
+    let approve = json!({
+        "revision": result["review_revision"],
+        "action": "approve_export",
+        "approved_pages": [0]
+    });
+    let approved = request(
+        host,
+        &format!("/{token}/review/submit"),
+        "POST",
+        Some(&approve.to_string()),
+        host,
+    );
+    assert!(
+        approved.starts_with("HTTP/1.1 200"),
+        "unexpected approval: {approved}"
+    );
+    assert!(fukidashi_mcp::export::export_project(&registration.job_dir, "zip").is_ok());
 }
 
 #[test]

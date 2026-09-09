@@ -47,6 +47,26 @@ pub fn typeset_page_with_fallbacks(
 
     let mut reports = Vec::with_capacity(bubbles.len());
     for (index, payload) in bubbles.iter().enumerate() {
+        // A preserved item is deliberately left as source pixels. Empty text
+        // is also non-renderable: it must not reach layout fitting, where a
+        // legacy state can turn an otherwise valid rerender into a fit error.
+        // Keep a report entry so the editor can retain the item and explain
+        // why no glyphs were emitted.
+        let skip_reason = payload_skip_reason(payload);
+        if let Some(skip_reason) = skip_reason {
+            reports.push(json!({
+                "index": index,
+                "id": payload.id,
+                "source_text": payload.source_text,
+                "kind": payload.kind,
+                "preserve_by_default": payload.preserve_by_default,
+                "preserve_source": payload.preserve_source,
+                "text": payload.text,
+                "skipped": true,
+                "skip_reason": skip_reason,
+            }));
+            continue;
+        }
         let rect = payload.bbox;
         if !rect.x1.is_finite()
             || !rect.y1.is_finite()
@@ -123,6 +143,30 @@ pub fn typeset_page_with_fallbacks(
     Ok(json!({"output_path": absolute, "bubbles": reports}))
 }
 
+fn payload_skip_reason(payload: &TypesetPayload) -> Option<&'static str> {
+    if payload.text.trim().is_empty() {
+        return Some("empty_text");
+    }
+    if let Some(explicit) = payload.preserve_source {
+        return explicit.then_some("preserve_source");
+    }
+    if payload.preserve_by_default.unwrap_or(false) {
+        return Some("preserve_by_default");
+    }
+    if payload
+        .kind
+        .as_deref()
+        .is_some_and(|kind| kind == "unmatched_text")
+        || payload
+            .id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("text-"))
+    {
+        return Some("structural_unmatched_text");
+    }
+    None
+}
+
 /// Deterministic checks that run after rasterization and before the artifact is
 /// exposed to the review UI.  Geometry failures become review items instead of
 /// silently producing a page that looks finished in the agent transcript.
@@ -156,6 +200,13 @@ pub fn post_render_qa(
         .into_iter()
         .flatten()
     {
+        if bubble
+            .get("skipped")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
         let safe = bubble
             .get("safe_bbox")
             .filter(|value| !value.is_null())

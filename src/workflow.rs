@@ -1588,7 +1588,25 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 && let Some(report) = report.as_object()
             {
                 for (key, value) in report {
-                    bubble.entry(key.clone()).or_insert_with(|| value.clone());
+                    // Older sidecars contain explicit JSON nulls for optional
+                    // geometry. Treat those as absent so the concrete layout
+                    // produced by the renderer is available to editor
+                    // rerenders.
+                    if bubble.get(key).is_none_or(serde_json::Value::is_null) {
+                        bubble.insert(key.clone(), value.clone());
+                    }
+                }
+                // The requested font can legitimately be a non-Unicode face;
+                // the typesetter may have selected a managed fallback. Keep
+                // that resolved face separately so a brush-only editor
+                // rerender uses the same metrics and cannot fail a previously
+                // valid layout merely because fallback selection is omitted.
+                if let Some(font_path) = report.get("font_path").and_then(serde_json::Value::as_str)
+                {
+                    bubble.insert(
+                        "rendered_font_path".into(),
+                        serde_json::Value::String(font_path.to_owned()),
+                    );
                 }
             }
             Some(serde_json::Value::Object(bubble))

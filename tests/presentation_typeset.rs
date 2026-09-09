@@ -46,6 +46,7 @@ fn narrow_tall_comic_bubble_fits_vietnamese_dialogue() {
             preserve_by_default: None,
             needs_review: None,
             flagged: None,
+            preserve_source: None,
             bbox,
             bubble_bbox: None,
             text_bbox: None,
@@ -175,6 +176,7 @@ fn raster_output_is_png_and_does_not_modify_source() {
         preserve_by_default: None,
         needs_review: None,
         flagged: None,
+        preserve_source: None,
         bbox: Rect {
             x1: 20.0,
             y1: 20.0,
@@ -207,4 +209,77 @@ fn raster_output_is_png_and_does_not_modify_source() {
     assert!(report["bubbles"][0]["line_count"].as_u64().unwrap() >= 1);
     assert_eq!(image::open(&source).unwrap().dimensions(), (200, 120));
     assert_eq!(image::open(&output).unwrap().dimensions(), (200, 120));
+}
+
+#[test]
+fn preserved_and_empty_payloads_skip_layout_fitting() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("page.png");
+    let output = dir.path().join("rendered.png");
+    let original = ImageBuffer::<Rgba<u8>, _>::from_pixel(48, 32, Rgba([240, 240, 240, 255]));
+    original.save(&source).unwrap();
+
+    let report = fukidashi_mcp::typeset::typeset_page_with_fallbacks(
+        &source,
+        &[
+            TypesetPayload {
+                id: Some("text-sfx".into()),
+                source_text: Some("クス".into()),
+                kind: Some("unmatched_text".into()),
+                preserve_by_default: Some(true),
+                needs_review: None,
+                flagged: None,
+                preserve_source: None,
+                bbox: Rect {
+                    x1: 20.0,
+                    y1: 10.0,
+                    x2: 10.0,
+                    y2: 10.0,
+                },
+                bubble_bbox: None,
+                text_bbox: None,
+                padding: None,
+                text: "クス".into(),
+                font_path: None,
+                min_font_size: None,
+                max_font_size: None,
+                shape: None,
+            },
+            TypesetPayload {
+                id: Some("empty".into()),
+                source_text: Some("source".into()),
+                kind: Some("dialogue".into()),
+                preserve_by_default: Some(false),
+                needs_review: None,
+                flagged: None,
+                preserve_source: Some(false),
+                bbox: Rect {
+                    x1: 0.0,
+                    y1: 0.0,
+                    x2: 0.0,
+                    y2: 0.0,
+                },
+                bubble_bbox: None,
+                text_bbox: None,
+                padding: None,
+                text: "".into(),
+                font_path: None,
+                min_font_size: None,
+                max_font_size: None,
+                shape: None,
+            },
+        ],
+        &[],
+        &output,
+    )
+    .unwrap();
+
+    assert_eq!(report["bubbles"][0]["skipped"], true);
+    assert_eq!(
+        report["bubbles"][0]["skip_reason"],
+        "structural_unmatched_text"
+    );
+    assert_eq!(report["bubbles"][1]["skipped"], true);
+    assert_eq!(report["bubbles"][1]["skip_reason"], "empty_text");
+    assert_eq!(fs::read(&source).unwrap(), fs::read(&output).unwrap());
 }

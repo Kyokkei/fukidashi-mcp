@@ -1236,6 +1236,7 @@ impl FukidashiServer {
                 // Model uncertainty is advisory. Only an explicit editor flag
                 // or problem is an approval blocker.
                 flagged: None,
+                preserve_source: Some(keep_source),
                 bbox,
                 bubble_bbox: None,
                 text_bbox: None,
@@ -1384,19 +1385,21 @@ fn checkpoint_text_regions(
             .into_iter()
             .flatten()
             .filter(|item| {
-                item.get("preserve_by_default")
+                item.get("keep_source")
                     .and_then(serde_json::Value::as_bool)
-                    .unwrap_or_else(|| {
-                        item.get("kind")
-                            .and_then(serde_json::Value::as_str)
-                            .map(|kind| kind == "unmatched_text")
-                            .or_else(|| {
-                                item.get("id")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(|id| id.starts_with("text-"))
-                            })
-                            .unwrap_or(false)
-                    })
+                    .unwrap_or(false)
+                    || item
+                        .get("preserve_by_default")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                    || item
+                        .get("kind")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|kind| kind == "unmatched_text")
+                    || item
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| id.starts_with("text-"))
             })
             .filter_map(|item| serde_json::from_value::<Rect>(item.get("bbox").cloned()?).ok())
             .filter_map(|rect| rect.validate().ok())
@@ -3520,6 +3523,7 @@ mod tests {
                 preserve_by_default: None,
                 needs_review: None,
                 flagged: None,
+                preserve_source: None,
                 bbox,
                 bubble_bbox: None,
                 text_bbox: None,
@@ -3568,6 +3572,7 @@ mod tests {
             preserve_by_default: None,
             needs_review: None,
             flagged: None,
+            preserve_source: None,
             bbox,
             bubble_bbox: None,
             text_bbox: None,
