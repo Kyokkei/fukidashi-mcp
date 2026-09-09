@@ -1781,7 +1781,7 @@ impl FukidashiServer {
 
     #[tool(
         name = "fukidashi_search_manga",
-        description = "Search native MangaDex titles only. source=auto resolves to MangaDex; no aggregator or guessed provider is used. Returns stable manga_id values, display/original language/status metadata, and alternate titles. Use an exact returned manga_id when calling fukidashi_pull_chapter."
+        description = "Search native MangaDex titles only. source=auto resolves to MangaDex; no aggregator or guessed provider is used. Returns stable manga_id values, display/original language/status metadata, alternate titles, and a suggested latest=true next call. Use an exact returned manga_id when calling fukidashi_pull_chapter; source language is metadata, not a failure."
     )]
     pub async fn search_manga(
         &self,
@@ -1801,7 +1801,7 @@ impl FukidashiServer {
 
     #[tool(
         name = "fukidashi_pull_chapter",
-        description = "Import a chapter into a new server-owned Fukidashi job. MangaDex mode accepts only an exact manga_id or chapter_id plus optional exact chapter/language filters and reports ambiguity instead of guessing; data_saver='full' selects full data by default (legacy booleans are accepted). Direct mode accepts one explicit http(s) url, an optional bounded job_name label, and invokes an already installed gallery-dl helper with bounded, transactional staging. Imported job prefixes use the canonical manga title/chapter or a conservative URL label; labels never choose paths. The response includes job_id/job_path/page_count/source metadata and the exact fukidashi_translation_start next step; do not shell-read or invent paths."
+        description = "Acquire a chapter into a new server-owned Fukidashi job. For a vague latest request, first search MangaDex, then pass the exact returned manga_id with latest=true; latest selects the highest chapter value from the descending feed, including external releases, and never silently downgrades to an older hosted chapter. MangaDex mode also accepts exact manga_id/chapter_id plus optional exact chapter/language filters; source language is accepted as metadata and data_saver='full' selects full data by default (legacy booleans are accepted). An external or empty hosted release returns imported=false with exact release metadata instead of calling another chapter. Direct mode is first-class: pass one explicit http(s) url and optional bounded job_name; the already installed gallery-dl helper uses bounded transactional staging. Imported job prefixes use the canonical manga title/chapter or a conservative URL label; labels never choose paths. Imported responses include job_id/job_path/page_count/source metadata and the exact fukidashi_translation_start next step; do not shell-read or invent paths."
     )]
     pub async fn pull_chapter(
         &self,
@@ -2916,9 +2916,14 @@ impl ServerHandler for FukidashiServer {
                 fukidashi_analyze_page, fukidashi_clean_page, and fukidashi_typeset tools remain available for \
                 compatibility; pass their exact server-returned paths and stable IDs. Use \
                 fukidashi_release_models between bounded legacy batches on memory-constrained machines. For \
-                acquisition, fukidashi_search_manga searches native MangaDex only and fukidashi_pull_chapter \
-                accepts exact MangaDex identifiers or one explicit http(s) URL for a provisioned gallery-dl \
-                helper; follow its returned fukidashi_translation_start next step.",
+                acquisition, fukidashi_search_manga searches native MangaDex only and returns an exact manga_id \
+                plus a suggested latest=true pull. For a vague latest request, call fukidashi_pull_chapter with \
+                source=mangadex, that manga_id, and latest=true; it selects the highest chapter value including \
+                external releases and never silently falls back to an older hosted chapter. Source language is \
+                metadata that Fukidashi auto-translates. An external or unavailable result is a successful \
+                non-import report for that exact release. Direct mode is first-class: use one explicit http(s) URL \
+                and optional job_name with a provisioned gallery-dl helper; follow the returned \
+                fukidashi_translation_start next step after an import.",
             )
     }
 }
@@ -2973,6 +2978,9 @@ mod tests {
         assert!(instructions.contains("fukidashi_wait_for_review"));
         assert!(instructions.contains("fukidashi_search_manga"));
         assert!(instructions.contains("fukidashi_pull_chapter"));
+        assert!(instructions.contains("latest=true"));
+        assert!(instructions.contains("external releases"));
+        assert!(instructions.contains("Source language"));
         assert!(instructions.contains("after approval"));
     }
 

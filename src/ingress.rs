@@ -1,6 +1,6 @@
 //! Deterministic manga ingress for the local Fukidashi pipeline.
 //!
-//! MangaDex is the only native provider in v1. A direct URL is delegated to
+//! MangaDex is the only native provider in v2. A direct URL is delegated to
 //! an already provisioned gallery-dl executable, with its output constrained
 //! to an owned staging directory before images are imported into a fresh
 //! server-managed job.
@@ -48,6 +48,8 @@ const MAX_STDERR_BYTES: usize = 64 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DIRECT_OUTPUT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DIRECT_OUTPUT_FILES: usize = 500;
+const MAX_FEED_PAGE_SIZE: usize = 100;
+const MAX_FEED_PAGES: usize = 100;
 const OUTPUT_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 // A large gallery-dl chapter may legitimately take many minutes on a
 // constrained connection. Keep a finite ceiling while still killing the
@@ -66,7 +68,7 @@ pub struct SearchMangaRequest {
     pub limit: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct PullChapterRequest {
     /// auto, mangadex, or direct.
     #[serde(default = "default_auto_source")]
@@ -82,6 +84,10 @@ pub struct PullChapterRequest {
     /// error with candidates instead of being guessed.
     #[serde(default, alias = "chapter_string")]
     pub chapter: Option<String>,
+    /// Select the highest chapter value from the MangaDex feed. This requires
+    /// manga_id and cannot be combined with chapter_id or chapter.
+    #[schemars(schema_with = "latest_schema")]
+    pub latest: bool,
     /// Exact translated language code used for MangaDex feed filtering.
     #[serde(default)]
     pub translated_language: Option<String>,
@@ -101,6 +107,50 @@ pub struct PullChapterRequest {
     #[serde(default, alias = "title")]
     #[schemars(length(max = 96))]
     pub job_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PullChapterRequestWire {
+    #[serde(default = "default_auto_source")]
+    source: String,
+    #[serde(default)]
+    manga_id: Option<String>,
+    #[serde(default)]
+    chapter_id: Option<String>,
+    #[serde(default, alias = "chapter_string")]
+    chapter: Option<String>,
+    latest: Option<bool>,
+    #[serde(default)]
+    translated_language: Option<String>,
+    #[serde(
+        default = "default_data_mode",
+        deserialize_with = "deserialize_data_mode"
+    )]
+    data_saver: String,
+    #[serde(default, alias = "direct_url")]
+    url: Option<String>,
+    #[serde(default, alias = "title")]
+    job_name: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for PullChapterRequest {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = PullChapterRequestWire::deserialize(deserializer)?;
+        Ok(Self {
+            source: wire.source,
+            manga_id: wire.manga_id,
+            chapter_id: wire.chapter_id,
+            chapter: wire.chapter,
+            latest: wire.latest.unwrap_or(false),
+            translated_language: wire.translated_language,
+            data_saver: wire.data_saver,
+            url: wire.url,
+            job_name: wire.job_name,
+        })
+    }
 }
 
 fn default_auto_source() -> String {
@@ -159,6 +209,13 @@ fn search_source_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 
 fn pull_source_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({"type": "string", "enum": ["auto", "mangadex", "direct"]})
+}
+
+fn latest_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "boolean",
+        "description": "Set true for the highest MangaDex chapter; omitted means false."
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -255,19 +312,28 @@ impl MangaDexClient {
     ) -> Result<Value> {
         validate_mangadex_request(request)?;
         let chapter = self.resolve_chapter_record(request).await?;
+        if chapter.external_url.is_some() {
+            return Ok(external_release_response(&chapter));
+        }
         let use_data_saver = Self::uses_data_saver(request);
         let manga_title = self.manga_title(&chapter.manga_id).await?;
         let at_home = self.at_home(&chapter.id).await?;
-        let file_names = at_home
-            .get(if use_data_saver { "dataSaver" } else { "data" })
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                anyhow!(
-                    "MangaDex at-home response has no {} page list",
-                    if use_data_saver { "dataSaver" } else { "data" }
-                )
-            })?;
-        if file_names.is_empty() || file_names.len() > MAX_PAGES {
+        let page_key = if use_data_saver { "dataSaver" } else { "data" };
+        let Some(file_names) = at_home.get(page_key).and_then(Value::as_array) else {
+            return Ok(unavailable_release_response(
+                &chapter,
+                Some(manga_title.as_deref().unwrap_or_default()),
+                format!("MangaDex at-home response has no {page_key} page list"),
+            ));
+        };
+        if file_names.is_empty() {
+            return Ok(unavailable_release_response(
+                &chapter,
+                Some(manga_title.as_deref().unwrap_or_default()),
+                format!("MangaDex at-home response returned no {page_key} pages"),
+            ));
+        }
+        if file_names.len() > MAX_PAGES {
             bail!("MangaDex chapter page count must be between 1 and {MAX_PAGES}");
         }
         let base = at_home
@@ -345,6 +411,9 @@ impl MangaDexClient {
         request: &PullChapterRequest,
     ) -> Result<ResolvedChapter> {
         validate_mangadex_request(request)?;
+        if request.latest {
+            return self.resolve_latest_chapter_record(request).await;
+        }
         if let Some(chapter_id) = request.chapter_id.as_deref() {
             let id = validate_uuid(chapter_id, "chapter_id")?;
             let expected_manga_id = request
@@ -425,6 +494,70 @@ impl MangaDexClient {
                 );
             }
         }
+    }
+
+    async fn resolve_latest_chapter_record(
+        &self,
+        request: &PullChapterRequest,
+    ) -> Result<ResolvedChapter> {
+        let manga_id = request
+            .manga_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("latest=true requires manga_id"))?;
+        let manga_id = validate_uuid(manga_id, "manga_id")?;
+        let mut chapters = Vec::new();
+        let mut exhausted = false;
+        for page in 0..MAX_FEED_PAGES {
+            let offset = page
+                .checked_mul(MAX_FEED_PAGE_SIZE)
+                .ok_or_else(|| anyhow!("MangaDex feed pagination overflowed"))?;
+            let mut url = self.endpoint(&format!("manga/{manga_id}/feed"))?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("limit", &MAX_FEED_PAGE_SIZE.to_string());
+                query.append_pair("offset", &offset.to_string());
+                query.append_pair("order[chapter]", "desc");
+                query.append_pair("includes[]", "scanlation_group");
+                if let Some(language) = request.translated_language.as_deref() {
+                    validate_language(language)?;
+                    query.append_pair("translatedLanguage[]", language);
+                }
+            }
+            let body = self.get_json(url).await?;
+            let entries = body
+                .get("data")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("MangaDex feed response has no data array"))?;
+            if entries.is_empty() {
+                exhausted = true;
+                break;
+            }
+            for entry in entries {
+                let chapter = parse_chapter(entry, Some(&manga_id))?;
+                if request
+                    .translated_language
+                    .as_deref()
+                    .is_none_or(|language| chapter.translated_language.as_deref() == Some(language))
+                {
+                    chapters.push(chapter);
+                }
+            }
+            if entries.len() < MAX_FEED_PAGE_SIZE {
+                exhausted = true;
+                break;
+            }
+        }
+        if !exhausted {
+            bail!(
+                "MangaDex latest chapter feed exceeded the bounded {}-page search; no chapter was imported",
+                MAX_FEED_PAGES
+            );
+        }
+        chapters.sort_by(compare_latest_chapters);
+        chapters
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no MangaDex chapter matched the requested manga/language"))
     }
 
     async fn at_home(&self, chapter_id: &str) -> Result<Value> {
@@ -566,7 +699,103 @@ struct ResolvedChapter {
     chapter: Option<String>,
     title: Option<String>,
     translated_language: Option<String>,
+    external_url: Option<String>,
+    published_at: Option<String>,
+    readable_at: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
     summary: Value,
+}
+
+fn compare_latest_chapters(left: &ResolvedChapter, right: &ResolvedChapter) -> Ordering {
+    compare_chapter_values(
+        right.chapter.as_deref().unwrap_or_default(),
+        left.chapter.as_deref().unwrap_or_default(),
+    )
+    .then_with(|| language_preference(left).cmp(&language_preference(right)))
+    .then_with(|| {
+        compare_optional_desc(left.published_at.as_deref(), right.published_at.as_deref())
+    })
+    .then_with(|| compare_optional_desc(left.readable_at.as_deref(), right.readable_at.as_deref()))
+    .then_with(|| compare_optional_desc(left.created_at.as_deref(), right.created_at.as_deref()))
+    .then_with(|| compare_optional_desc(left.updated_at.as_deref(), right.updated_at.as_deref()))
+    .then_with(|| left.id.cmp(&right.id))
+}
+
+fn language_preference(chapter: &ResolvedChapter) -> (u8, &str) {
+    match chapter.translated_language.as_deref() {
+        Some("en") => (0, "en"),
+        Some(language) => (1, language),
+        None => (2, ""),
+    }
+}
+
+fn compare_optional_desc(left: Option<&str>, right: Option<&str>) -> Ordering {
+    right.unwrap_or_default().cmp(left.unwrap_or_default())
+}
+
+fn compare_chapter_values(left: &str, right: &str) -> Ordering {
+    match (parse_numeric_chapter(left), parse_numeric_chapter(right)) {
+        (Some(left), Some(right)) => compare_numeric_chapters(&left, &right),
+        (Some(_), None) => Ordering::Greater,
+        (None, Some(_)) => Ordering::Less,
+        (None, None) => left.trim().cmp(right.trim()),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NumericChapter {
+    integer: String,
+    fraction: String,
+}
+
+fn parse_numeric_chapter(raw: &str) -> Option<NumericChapter> {
+    let trimmed = raw.trim();
+    let mut parts = trimmed.split('.');
+    let integer = parts.next()?;
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let integer = integer.trim_start_matches('0');
+    let integer = if integer.is_empty() { "0" } else { integer };
+    let fraction = fraction.trim_end_matches('0');
+    Some(NumericChapter {
+        integer: integer.to_owned(),
+        fraction: fraction.to_owned(),
+    })
+}
+
+fn compare_numeric_chapters(left: &NumericChapter, right: &NumericChapter) -> Ordering {
+    left.integer
+        .len()
+        .cmp(&right.integer.len())
+        .then_with(|| left.integer.cmp(&right.integer))
+        .then_with(|| {
+            let length = left.fraction.len().max(right.fraction.len());
+            (0..length)
+                .map(|index| {
+                    left.fraction
+                        .as_bytes()
+                        .get(index)
+                        .copied()
+                        .unwrap_or(b'0')
+                        .cmp(
+                            &right
+                                .fraction
+                                .as_bytes()
+                                .get(index)
+                                .copied()
+                                .unwrap_or(b'0'),
+                        )
+                })
+                .find(|ordering| *ordering != Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+        })
 }
 
 fn parse_manga_result(value: &Value) -> Result<Value> {
@@ -610,6 +839,15 @@ fn parse_manga_result(value: &Value) -> Result<Value> {
         "original_language": attributes.get("originalLanguage").cloned().unwrap_or(Value::Null),
         "status": attributes.get("status").cloned().unwrap_or(Value::Null),
         "alternate_titles": alternate_titles,
+        "suggested_next_step": {
+            "tool": "fukidashi_pull_chapter",
+            "arguments": {
+                "source": "mangadex",
+                "manga_id": id,
+                "latest": true,
+            },
+            "description": "Resolve the highest chapter value, including external releases, without silently falling back to an older chapter."
+        },
     }))
 }
 
@@ -659,20 +897,50 @@ fn parse_chapter(value: &Value, expected_manga_id: Option<&str>) -> Result<Resol
         .get("translatedLanguage")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let external_url = attributes
+        .get("externalUrl")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let published_at = chapter_date_attribute(attributes, "publishAt");
+    let readable_at = chapter_date_attribute(attributes, "readableAt");
+    let created_at = chapter_date_attribute(attributes, "createdAt");
+    let updated_at = chapter_date_attribute(attributes, "updatedAt");
     Ok(ResolvedChapter {
         id: id.to_owned(),
         manga_id: manga_id.to_owned(),
         chapter: chapter.clone(),
         title: title.clone(),
         translated_language,
+        external_url: external_url.clone(),
+        published_at: published_at.clone(),
+        readable_at: readable_at.clone(),
+        created_at: created_at.clone(),
+        updated_at: updated_at.clone(),
         summary: json!({
             "chapter_id": id,
             "manga_id": manga_id,
             "chapter": chapter,
             "title": title,
             "translated_language": attributes.get("translatedLanguage").cloned().unwrap_or(Value::Null),
+            "external_url": external_url,
+            "published_at": published_at,
+            "readable_at": readable_at,
+            "created_at": created_at,
+            "updated_at": updated_at,
         }),
     })
+}
+
+fn chapter_date_attribute(
+    attributes: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<String> {
+    attributes
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 pub async fn search_manga(request: SearchMangaRequest) -> Result<Value> {
@@ -780,6 +1048,15 @@ fn validate_mangadex_request(request: &PullChapterRequest) -> Result<()> {
     if request.url.is_some() {
         bail!("url is only accepted for source=direct");
     }
+    if request.latest && request.manga_id.is_none() {
+        bail!("latest=true requires manga_id");
+    }
+    if request.latest && request.chapter_id.is_some() {
+        bail!("latest=true cannot be combined with chapter_id");
+    }
+    if request.latest && request.chapter.is_some() {
+        bail!("latest=true cannot be combined with chapter");
+    }
     if request.manga_id.is_none() && request.chapter_id.is_none() {
         bail!("manga_id or exact chapter_id is required for MangaDex ingress");
     }
@@ -808,6 +1085,7 @@ fn validate_direct_request(request: &PullChapterRequest) -> Result<()> {
     if request.manga_id.is_some()
         || request.chapter_id.is_some()
         || request.chapter.is_some()
+        || request.latest
         || request.translated_language.is_some()
     {
         bail!("MangaDex identifiers cannot be combined with source=direct");
@@ -1057,6 +1335,51 @@ fn imported_response(provider: &str, registration: Registration, source: Value) 
             "arguments": {"job_id": job_id},
         },
     }))
+}
+
+fn external_release_response(chapter: &ResolvedChapter) -> Value {
+    let mut response = chapter.summary.as_object().cloned().unwrap_or_default();
+    response.insert("provider".to_owned(), json!("mangadex"));
+    response.insert("status".to_owned(), json!("external_release"));
+    response.insert("imported".to_owned(), json!(false));
+    response.insert("manga_title".to_owned(), Value::Null);
+    response.insert(
+        "next_step".to_owned(),
+        json!({
+            "tool": "fukidashi_pull_chapter",
+            "arguments": {
+                "source": "direct",
+                "url": chapter.external_url,
+            },
+            "description": "This selected MangaDex release has no native hosted pages. Use source=direct only with this explicit URL (or another explicit URL you already have); do not substitute an older chapter."
+        }),
+    );
+    Value::Object(response)
+}
+
+fn unavailable_release_response(
+    chapter: &ResolvedChapter,
+    manga_title: Option<&str>,
+    reason: String,
+) -> Value {
+    let mut response = chapter.summary.as_object().cloned().unwrap_or_default();
+    response.insert("provider".to_owned(), json!("mangadex"));
+    response.insert("status".to_owned(), json!("unavailable"));
+    response.insert("imported".to_owned(), json!(false));
+    response.insert(
+        "manga_title".to_owned(),
+        manga_title
+            .filter(|title| !title.is_empty())
+            .map_or(Value::Null, |title| json!(title)),
+    );
+    response.insert("reason".to_owned(), json!(reason));
+    response.insert(
+        "next_step".to_owned(),
+        json!({
+            "description": "The selected release has no usable MangaDex page list. Report this exact release or provide an explicit direct URL; never substitute an older chapter."
+        }),
+    );
+    Value::Object(response)
 }
 
 pub fn gallery_dl_args(staging: &Path, url: &Url) -> Vec<OsString> {
@@ -1448,6 +1771,29 @@ mod tests {
     }
 
     #[test]
+    fn latest_defaults_to_false_and_conflicts_with_exact_selectors() {
+        let base = serde_json::json!({
+            "source": "mangadex",
+            "manga_id": "11111111-1111-1111-1111-111111111111"
+        });
+        let request: PullChapterRequest = serde_json::from_value(base).unwrap();
+        assert!(!request.latest);
+
+        let mut latest = serde_json::json!({
+            "source": "mangadex",
+            "manga_id": "11111111-1111-1111-1111-111111111111",
+            "latest": true,
+            "chapter": "1192"
+        });
+        let request: PullChapterRequest = serde_json::from_value(latest.clone()).unwrap();
+        assert!(validate_mangadex_request(&request).is_err());
+        latest["chapter"] = Value::Null;
+        latest["manga_id"] = Value::Null;
+        let request: PullChapterRequest = serde_json::from_value(latest).unwrap();
+        assert!(validate_mangadex_request(&request).is_err());
+    }
+
+    #[test]
     fn gallery_arguments_keep_url_as_one_argument() {
         let url = validate_direct_url("https://example.test/gallery?a=1&b=2").unwrap();
         let args = gallery_dl_args(Path::new("C:/owned/stage"), &url);
@@ -1600,6 +1946,10 @@ mod tests {
             response["results"][0]["alternate_titles"][0]["language"],
             "vi"
         );
+        assert_eq!(
+            response["results"][0]["suggested_next_step"]["arguments"]["latest"],
+            true
+        );
     }
 
     #[tokio::test]
@@ -1619,6 +1969,7 @@ mod tests {
                 manga_id: Some(manga_id.into()),
                 chapter_id: None,
                 chapter: None,
+                latest: false,
                 translated_language: Some("en".into()),
                 data_saver: "full".into(),
                 url: None,
@@ -1653,6 +2004,7 @@ mod tests {
                 manga_id: Some(manga_id.into()),
                 chapter_id: Some(chapter_id.into()),
                 chapter: None,
+                latest: false,
                 translated_language: Some("en".into()),
                 data_saver: "full".into(),
                 url: None,
@@ -1665,6 +2017,253 @@ mod tests {
         assert!(message.contains("translated_language mismatch"));
         assert!(message.contains("requested \"en\""));
         assert!(message.contains("\"ja\""));
+    }
+
+    #[tokio::test]
+    async fn latest_selects_external_newer_chapter_without_falling_back_or_importing() {
+        let manga_id = "12121212-1212-1212-1212-121212121212";
+        let latest_id = "13131313-1313-1313-1313-131313131313";
+        let older_id = "14141414-1414-1414-1414-141414141414";
+        let mut latest = chapter_json(latest_id, manga_id, "1192");
+        latest["attributes"]["translatedLanguage"] = Value::String("ja".to_owned());
+        latest["attributes"]["externalUrl"] =
+            Value::String("https://example.test/releases/1192".to_owned());
+        latest["attributes"]["publishAt"] = Value::String("2026-09-08T00:00:00+00:00".to_owned());
+        let older = chapter_json(older_id, manga_id, "1191");
+        let body = serde_json::to_vec(&json!({"data": [latest, older]})).unwrap();
+        let (base, thread) = mock_server(1, move |path, _base| {
+            assert!(
+                path.contains("order%5Bchapter%5D=desc") || path.contains("order[chapter]=desc")
+            );
+            assert!(path.contains("offset=0"));
+            (200, body.clone())
+        });
+        let client = MangaDexClient::with_base_url(&base).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = Workflow::new(directory.path().join("jobs")).unwrap();
+        let response = client
+            .pull_mangadex(
+                &test_config(directory.path()),
+                &PullChapterRequest {
+                    source: "mangadex".into(),
+                    manga_id: Some(manga_id.into()),
+                    chapter_id: None,
+                    chapter: None,
+                    latest: true,
+                    translated_language: None,
+                    data_saver: "full".into(),
+                    url: None,
+                    job_name: None,
+                },
+                &workflow,
+            )
+            .await
+            .unwrap();
+        thread.join().unwrap();
+        assert_eq!(response["status"], "external_release");
+        assert_eq!(response["imported"], false);
+        assert_eq!(response["chapter_id"], latest_id);
+        assert_eq!(response["chapter"], "1192");
+        assert_eq!(response["translated_language"], "ja");
+        assert_eq!(
+            response["external_url"],
+            "https://example.test/releases/1192"
+        );
+        assert_eq!(response["next_step"]["arguments"]["source"], "direct");
+        assert_eq!(
+            response["next_step"]["arguments"]["url"],
+            response["external_url"]
+        );
+        assert_eq!(std::fs::read_dir(workflow.root()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn latest_hosted_chapter_imports_the_selected_release() {
+        let manga_id = "15151515-1515-1515-1515-151515151515";
+        let latest_id = "16161616-1616-1616-1616-161616161616";
+        let older_id = "17171717-1717-1717-1717-171717171717";
+        let latest = chapter_json(latest_id, manga_id, "1192");
+        let older = chapter_json(older_id, manga_id, "1191");
+        let feed = serde_json::to_vec(&json!({"data": [latest, older]})).unwrap();
+        let image = png_bytes([15, 25, 35]);
+        let (base, thread) = mock_server(4, move |path, request_base| {
+            if path.starts_with("/api/manga/15151515-1515-1515-1515-151515151515/feed?") {
+                assert!(
+                    path.contains("order%5Bchapter%5D=desc")
+                        || path.contains("order[chapter]=desc")
+                );
+                return (200, feed.clone());
+            }
+            if path == "/api/manga/15151515-1515-1515-1515-151515151515" {
+                return (
+                    200,
+                    serde_json::to_vec(&json!({
+                        "data": {"id": manga_id, "attributes": {"title": {"en": "Latest Hosted"}}}
+                    }))
+                    .unwrap(),
+                );
+            }
+            if path == "/api/at-home/server/16161616-1616-1616-1616-161616161616" {
+                return (
+                    200,
+                    serde_json::to_vec(&json!({
+                        "baseUrl": format!("{request_base}images/"),
+                        "chapter": {"hash": "latest-hash"},
+                        "data": ["page1.png"]
+                    }))
+                    .unwrap(),
+                );
+            }
+            if path == "/api/images/data/latest-hash/page1.png" {
+                return (200, image.clone());
+            }
+            panic!("unexpected MangaDex request path {path}");
+        });
+        let client = MangaDexClient::with_base_url(&base).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = Workflow::new(directory.path().join("jobs")).unwrap();
+        let response = client
+            .pull_mangadex(
+                &test_config(directory.path()),
+                &PullChapterRequest {
+                    source: "mangadex".into(),
+                    manga_id: Some(manga_id.into()),
+                    chapter_id: None,
+                    chapter: None,
+                    latest: true,
+                    translated_language: None,
+                    data_saver: "full".into(),
+                    url: None,
+                    job_name: None,
+                },
+                &workflow,
+            )
+            .await
+            .unwrap();
+        thread.join().unwrap();
+        assert_eq!(response["page_count"], 1);
+        assert_eq!(response["source"]["chapter_id"], latest_id);
+        assert_eq!(response["source"]["chapter"], "1192");
+        assert!(
+            response["job_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("Latest_Hosted-ch-1192--")
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_external_chapter_returns_structured_non_import() {
+        let manga_id = "18181818-1818-1818-1818-181818181818";
+        let chapter_id = "19191919-1919-1919-1919-191919191919";
+        let mut chapter = chapter_json(chapter_id, manga_id, "1192");
+        chapter["attributes"]["externalUrl"] =
+            Value::String("https://example.test/one-piece/1192".to_owned());
+        let body = serde_json::to_vec(&json!({"data": chapter})).unwrap();
+        let (base, thread) = mock_server(1, move |path, _base| {
+            assert_eq!(path, "/api/chapter/19191919-1919-1919-1919-191919191919");
+            (200, body.clone())
+        });
+        let client = MangaDexClient::with_base_url(&base).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = Workflow::new(directory.path().join("jobs")).unwrap();
+        let response = client
+            .pull_mangadex(
+                &test_config(directory.path()),
+                &PullChapterRequest {
+                    source: "mangadex".into(),
+                    manga_id: Some(manga_id.into()),
+                    chapter_id: Some(chapter_id.into()),
+                    chapter: None,
+                    latest: false,
+                    translated_language: None,
+                    data_saver: "full".into(),
+                    url: None,
+                    job_name: None,
+                },
+                &workflow,
+            )
+            .await
+            .unwrap();
+        thread.join().unwrap();
+        assert_eq!(response["status"], "external_release");
+        assert_eq!(response["imported"], false);
+        assert_eq!(response["chapter_id"], chapter_id);
+        assert_eq!(
+            response["external_url"],
+            "https://example.test/one-piece/1192"
+        );
+        assert_eq!(std::fs::read_dir(workflow.root()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn empty_at_home_pages_return_unavailable_without_substituting_an_older_release() {
+        let manga_id = "20202020-2020-2020-2020-202020202020";
+        let latest_id = "21212121-2121-2121-2121-212121212121";
+        let older_id = "22222222-2222-2222-2222-222222222222";
+        let latest = chapter_json(latest_id, manga_id, "1192");
+        let older = chapter_json(older_id, manga_id, "1191");
+        let feed = serde_json::to_vec(&json!({"data": [latest, older]})).unwrap();
+        let (base, thread) = mock_server(3, move |path, request_base| {
+            if path.starts_with("/api/manga/20202020-2020-2020-2020-202020202020/feed?") {
+                return (200, feed.clone());
+            }
+            if path == "/api/manga/20202020-2020-2020-2020-202020202020" {
+                return (
+                    200,
+                    serde_json::to_vec(&json!({
+                        "data": {"id": manga_id, "attributes": {"title": {"en": "Empty Hosted"}}}
+                    }))
+                    .unwrap(),
+                );
+            }
+            if path == "/api/at-home/server/21212121-2121-2121-2121-212121212121" {
+                return (
+                    200,
+                    serde_json::to_vec(&json!({
+                        "baseUrl": format!("{request_base}images/"),
+                        "chapter": {"hash": "empty-hash"},
+                        "data": [],
+                        "dataSaver": ["page1.png"]
+                    }))
+                    .unwrap(),
+                );
+            }
+            panic!("unexpected MangaDex request path {path}");
+        });
+        let client = MangaDexClient::with_base_url(&base).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let workflow = Workflow::new(directory.path().join("jobs")).unwrap();
+        let response = client
+            .pull_mangadex(
+                &test_config(directory.path()),
+                &PullChapterRequest {
+                    source: "mangadex".into(),
+                    manga_id: Some(manga_id.into()),
+                    chapter_id: None,
+                    chapter: None,
+                    latest: true,
+                    translated_language: None,
+                    data_saver: "full".into(),
+                    url: None,
+                    job_name: None,
+                },
+                &workflow,
+            )
+            .await
+            .unwrap();
+        thread.join().unwrap();
+        assert_eq!(response["status"], "unavailable");
+        assert_eq!(response["imported"], false);
+        assert_eq!(response["chapter_id"], latest_id);
+        assert_eq!(response["chapter"], "1192");
+        assert!(
+            response["reason"]
+                .as_str()
+                .unwrap()
+                .contains("no data pages")
+        );
+        assert_eq!(std::fs::read_dir(workflow.root()).unwrap().count(), 0);
     }
 
     #[tokio::test]
@@ -1719,6 +2318,7 @@ mod tests {
                     manga_id: Some(manga_id.into()),
                     chapter_id: None,
                     chapter: Some("1".into()),
+                    latest: false,
                     translated_language: Some("en".into()),
                     data_saver: "full".into(),
                     url: None,
@@ -1800,6 +2400,7 @@ mod tests {
                     manga_id: Some(manga_id.into()),
                     chapter_id: None,
                     chapter: Some("2".into()),
+                    latest: false,
                     translated_language: Some("en".into()),
                     data_saver: "data_saver".into(),
                     url: None,
