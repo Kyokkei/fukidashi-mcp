@@ -471,13 +471,11 @@ fn submit_review(session: &Session, request: &Value) -> Result<Value> {
             current.status = "fixes_requested".to_owned();
         }
         "approve_export" => {
-            let blockers = review_blockers(&project);
-            if !blockers.is_empty() {
-                bail!(
-                    "approve_export is blocked by unresolved review data: {}",
-                    serde_json::to_string(&blockers)?
-                );
-            }
+            // Approval is the operator's explicit override.  Keep collecting
+            // these diagnostics for the audit trail, but do not turn advisory
+            // flags, drawn issues, or a stale render marker into a second
+            // approval lock.  The browser rerenders dirty pages before this
+            // request; the export gate trusts this recorded human decision.
             let approved = request
                 .get("approved_pages")
                 .and_then(Value::as_array)
@@ -511,6 +509,7 @@ fn submit_review(session: &Session, request: &Value) -> Result<Value> {
         "event": action,
         "revision": current.revision,
         "feedback_count": current.feedback.len(),
+        "advisory_count": review_blockers(&project).len(),
     }));
     save_review(&session.root_dir, &current)?;
     *session
@@ -582,6 +581,7 @@ pub async fn wait_for_review(
 }
 
 /// Export may proceed only after the latest review revision was explicitly approved.
+/// Review findings remain advisory once the operator has submitted approval.
 pub fn export_gate(project_dir: &Path) -> Result<()> {
     let path = review_file(project_dir);
     if !path.exists() {
@@ -592,18 +592,6 @@ pub fn export_gate(project_dir: &Path) -> Result<()> {
         && matches!(state.status.as_str(), "approved" | "consumed");
     if !approved {
         bail!("export is blocked until the latest review revision is explicitly approved");
-    }
-    let state_path = project_dir.join("project.json");
-    if state_path.is_file() {
-        let state: Value = serde_json::from_slice(&fs::read(&state_path)?)
-            .context("parse editor state before export")?;
-        let blockers = review_blockers(&state);
-        if !blockers.is_empty() {
-            bail!(
-                "export is blocked by unresolved review data: {}",
-                serde_json::to_string(&blockers)?
-            );
-        }
     }
     Ok(())
 }
@@ -2078,8 +2066,42 @@ mod tests {
         assert!(!state_revision_matches(&advanced, &stale));
         assert!(EDITOR_HTML.contains("Project changed—reload this page"));
         assert!(EDITOR_HTML.contains("id=\"reload\""));
-        assert!(EDITOR_HTML.contains("if(dirty&&!stale)save()"));
+        assert!(EDITOR_HTML.contains("if(dirty&&!stale)save().catch(()=>{})"));
+        assert!(EDITOR_HTML.contains("renderQueue=null"));
+        assert!(EDITOR_HTML.contains("const previousRender=renderQueue"));
+        assert!(EDITOR_HTML.contains("releaseRender();if(renderQueue===queue)renderQueue=null"));
+        assert!(EDITOR_HTML.contains("await save(true)"));
+        assert!(
+            EDITOR_HTML.contains(
+                "while(saveInFlight||renderInFlight){await(saveInFlight||renderInFlight)"
+            )
+        );
+        assert!(EDITOR_HTML.contains("generation===editGeneration"));
+        assert!(EDITOR_HTML.contains("if(renderInFlight===request)renderInFlight=null"));
+        assert!(
+            EDITOR_HTML
+                .contains("const renderState=JSON.stringify({page_index:renderPageIndex,state})")
+        );
         assert!(EDITOR_HTML.contains("e.status===409"));
+    }
+
+    #[test]
+    fn editor_keeps_advisories_visible_without_counting_them_as_auto_flags() {
+        let flag_function = EDITOR_HTML
+            .split("function isFlagged(i){")
+            .nth(1)
+            .and_then(|tail| tail.split("function fileName").next())
+            .expect("editor isFlagged function");
+        assert!(flag_function.contains("bubbleIsFlagged"));
+        assert!(flag_function.contains("p.issues"));
+        assert!(!flag_function.contains("render_dirty"));
+        assert!(!flag_function.contains("needs_review"));
+        assert!(EDITOR_HTML.contains("does not block approval"));
+        assert!(
+            EDITOR_HTML.contains(
+                "$('approveExport').disabled=!!(review&&review.status==='fixes_requested')"
+            )
+        );
     }
 
     #[test]

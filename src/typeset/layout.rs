@@ -59,6 +59,188 @@ pub struct LayoutResult {
     pub safe_bbox: Rect,
     pub padding: f32,
     pub placement_center: (f32, f32),
+    /// The eroded connected component of the individual speech balloon, when
+    /// one could be recovered from the cleaned page.  Raster composition uses
+    /// this as the final containment guard as well as the layout interval.
+    pub safe_mask: Option<LayoutMask>,
+}
+
+/// A compact binary mask in page coordinates.  Balloon masks are kept at the
+/// small crop around one component instead of allocating a full-page image for
+/// every bubble.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayoutMask {
+    origin_x: i32,
+    origin_y: i32,
+    width: usize,
+    height: usize,
+    pixels: Vec<bool>,
+}
+
+impl LayoutMask {
+    pub(crate) fn from_binary(
+        origin_x: i32,
+        origin_y: i32,
+        width: usize,
+        height: usize,
+        pixels: Vec<bool>,
+    ) -> Result<Self> {
+        if width == 0 || height == 0 || pixels.len() != width.saturating_mul(height) {
+            bail!("layout mask dimensions do not match its pixel buffer");
+        }
+        Ok(Self {
+            origin_x,
+            origin_y,
+            width,
+            height,
+            pixels,
+        })
+    }
+
+    pub(crate) fn eroded(&self, radius: usize) -> Option<Self> {
+        if radius == 0 {
+            return Some(self.clone());
+        }
+        let mut pixels = vec![false; self.pixels.len()];
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if !self.pixels[y * self.width + x] {
+                    continue;
+                }
+                let left = x.checked_sub(radius);
+                let right = x.checked_add(radius);
+                let top = y.checked_sub(radius);
+                let bottom = y.checked_add(radius);
+                let Some(left) = left else { continue };
+                let Some(right) = right.filter(|right| *right < self.width) else {
+                    continue;
+                };
+                let Some(top) = top else { continue };
+                let Some(bottom) = bottom.filter(|bottom| *bottom < self.height) else {
+                    continue;
+                };
+                let mut keep = true;
+                'neighborhood: for yy in top..=bottom {
+                    for xx in left..=right {
+                        if !self.pixels[yy * self.width + xx] {
+                            keep = false;
+                            break 'neighborhood;
+                        }
+                    }
+                }
+                pixels[y * self.width + x] = keep;
+            }
+        }
+        let result = Self {
+            origin_x: self.origin_x,
+            origin_y: self.origin_y,
+            width: self.width,
+            height: self.height,
+            pixels,
+        };
+        result.bounds().map(|_| result)
+    }
+
+    pub(crate) fn bounds(&self) -> Option<Rect> {
+        let mut min_x = self.width;
+        let mut min_y = self.height;
+        let mut max_x = 0usize;
+        let mut max_y = 0usize;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                if self.pixels[y * self.width + x] {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x + 1);
+                    max_y = max_y.max(y + 1);
+                }
+            }
+        }
+        (min_x < max_x && min_y < max_y).then_some(Rect {
+            x1: self.origin_x as f32 + min_x as f32,
+            y1: self.origin_y as f32 + min_y as f32,
+            x2: self.origin_x as f32 + max_x as f32,
+            y2: self.origin_y as f32 + max_y as f32,
+        })
+    }
+
+    pub(crate) fn contains_pixel(&self, x: i32, y: i32) -> bool {
+        let Some(local_x) = x.checked_sub(self.origin_x) else {
+            return false;
+        };
+        let Some(local_y) = y.checked_sub(self.origin_y) else {
+            return false;
+        };
+        let (Ok(local_x), Ok(local_y)) = (usize::try_from(local_x), usize::try_from(local_y))
+        else {
+            return false;
+        };
+        local_x < self.width && local_y < self.height && self.pixels[local_y * self.width + local_x]
+    }
+
+    /// Return the largest horizontal interval that is inside the mask for
+    /// every raster row touched by a glyph band.  Prefer the interval around
+    /// the layout centre so disconnected artwork in a broad detector box can
+    /// never become a second writing area.
+    fn interval_for_band(&self, top: f32, bottom: f32, preferred_x: f32) -> Option<(f32, f32)> {
+        if !top.is_finite() || !bottom.is_finite() || bottom <= top {
+            return None;
+        }
+        let first = (top.floor() as i32).max(self.origin_y);
+        let last = (bottom.ceil() as i32).min(self.origin_y + self.height as i32);
+        if last <= first {
+            return None;
+        }
+        let mut intersection: Option<Vec<(i32, i32)>> = None;
+        for y in first..last {
+            let local_y = usize::try_from(y - self.origin_y).ok()?;
+            let row = &self.pixels[local_y * self.width..(local_y + 1) * self.width];
+            let mut runs = Vec::new();
+            let mut start = None;
+            for (x, inside) in row.iter().copied().enumerate() {
+                if inside && start.is_none() {
+                    start = Some(x as i32 + self.origin_x);
+                } else if !inside {
+                    if let Some(start) = start.take() {
+                        runs.push((start, x as i32 + self.origin_x));
+                    }
+                }
+            }
+            if let Some(start) = start {
+                runs.push((start, self.origin_x + self.width as i32));
+            }
+            if runs.is_empty() {
+                return None;
+            }
+            intersection = Some(match intersection {
+                None => runs,
+                Some(previous) => previous
+                    .into_iter()
+                    .flat_map(|(left, right)| {
+                        runs.iter().filter_map(move |(next_left, next_right)| {
+                            let left = left.max(*next_left);
+                            let right = right.min(*next_right);
+                            (left < right).then_some((left, right))
+                        })
+                    })
+                    .collect(),
+            });
+            if intersection.as_ref().is_some_and(Vec::is_empty) {
+                return None;
+            }
+        }
+        let intervals = intersection?;
+        intervals
+            .iter()
+            .copied()
+            .find(|(left, right)| preferred_x >= *left as f32 && preferred_x <= *right as f32)
+            .or_else(|| {
+                intervals
+                    .into_iter()
+                    .max_by_key(|(left, right)| right.saturating_sub(*left))
+            })
+            .map(|(left, right)| (left as f32, right as f32))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -542,6 +724,7 @@ pub fn fit_text_with_geometry(
         min_font_size,
         max_font_size,
         padding,
+        None,
         text,
         |size| Shaper::new(face, font, size),
     )
@@ -579,6 +762,41 @@ pub fn fit_text_with_font_candidates(
         min_font_size,
         max_font_size,
         padding,
+        None,
+        text,
+        |size| MultiShaper::new(fonts, size, &active_font_indices),
+    )
+}
+
+/// Fit text while using a connected component mask for the individual
+/// balloon.  The mask is eroded before it reaches the solver, leaving a
+/// measured border around the contour even when detector rectangles overlap.
+#[allow(clippy::too_many_arguments)]
+pub fn fit_text_with_font_candidates_masked(
+    fonts: &[FontCandidate<'_>],
+    text: &str,
+    bbox: Rect,
+    bubble_bbox: Option<Rect>,
+    text_bbox: Option<Rect>,
+    shape: &str,
+    min_font_size: f32,
+    max_font_size: f32,
+    padding: Option<f32>,
+    mask: Option<LayoutMask>,
+) -> Result<LayoutResult> {
+    if fonts.is_empty() {
+        bail!("at least one font candidate is required");
+    }
+    let active_font_indices = active_font_indices(fonts, text)?;
+    fit_text_with_factory(
+        bbox,
+        bubble_bbox,
+        text_bbox,
+        shape,
+        min_font_size,
+        max_font_size,
+        padding,
+        mask,
         text,
         |size| MultiShaper::new(fonts, size, &active_font_indices),
     )
@@ -593,6 +811,7 @@ fn fit_text_with_factory<F, S>(
     min_font_size: f32,
     max_font_size: f32,
     padding: Option<f32>,
+    mask: Option<LayoutMask>,
     text: &str,
     factory: F,
 ) -> Result<LayoutResult>
@@ -623,16 +842,44 @@ where
     if text.graphemes(true).count() > 4_096 {
         bail!("text exceeds the 4,096 grapheme limit");
     }
-    let area = bubble_bbox.filter(|rect| valid_rect(*rect)).unwrap_or(bbox);
+    // A mask is authoritative for the individual balloon, while the
+    // detector geometry still bounds any accidental component recovery.
+    // Erosion uses a 5x5 Chebyshev kernel (radius 2), matching the minimum
+    // visible contour clearance used by the renderer.
+    let mask = match mask {
+        Some(mask) => Some(
+            mask.eroded(2)
+                .ok_or_else(|| anyhow!("balloon mask has no safe interior after erosion"))?,
+        ),
+        None => None,
+    };
+    let detector_area = bubble_bbox.filter(|rect| valid_rect(*rect)).unwrap_or(bbox);
+    let area = mask
+        .as_ref()
+        .and_then(|mask| {
+            mask.bounds()
+                .and_then(|bounds| rect_intersection(bounds, detector_area))
+        })
+        .unwrap_or(detector_area);
     let padding = padding
         .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or_else(|| (area.x2 - area.x1).min(area.y2 - area.y1) * 0.06);
     let padding = padding.clamp(4.0, 16.0);
     let safe_bbox = inset_rect(area, padding)?;
     let anchor = text_bbox.filter(|rect| valid_rect(*rect)).unwrap_or(area);
+    let mask_center = mask
+        .as_ref()
+        .and_then(LayoutMask::bounds)
+        .map(|bounds| ((bounds.x1 + bounds.x2) * 0.5, (bounds.y1 + bounds.y2) * 0.5));
     let placement_center = (
-        ((anchor.x1 + anchor.x2) * 0.5).clamp(safe_bbox.x1, safe_bbox.x2),
-        ((anchor.y1 + anchor.y2) * 0.5).clamp(safe_bbox.y1, safe_bbox.y2),
+        mask_center
+            .map(|center| center.0)
+            .unwrap_or((anchor.x1 + anchor.x2) * 0.5)
+            .clamp(safe_bbox.x1, safe_bbox.x2),
+        mask_center
+            .map(|center| center.1)
+            .unwrap_or((anchor.y1 + anchor.y2) * 0.5)
+            .clamp(safe_bbox.y1, safe_bbox.y2),
     );
     let mut size = (max_font_size * 2.0).floor() / 2.0;
     let floor = (min_font_size * 2.0).ceil() / 2.0;
@@ -641,13 +888,21 @@ where
     }
     while size + 1e-4 >= floor {
         let shaper = factory(size)?;
-        if let Some(lines) = fit_at_size(&shaper, text, safe_bbox, shape, placement_center)? {
+        if let Some(lines) = fit_at_size(
+            &shaper,
+            text,
+            safe_bbox,
+            shape,
+            placement_center,
+            mask.as_ref(),
+        )? {
             return Ok(LayoutResult {
                 font_size: size,
                 lines,
                 safe_bbox,
                 padding,
                 placement_center,
+                safe_mask: mask,
             });
         }
         size -= 0.5;
@@ -655,6 +910,16 @@ where
     Err(anyhow!(
         "TextOverflow: supplied text does not fit at minimum font size {min_font_size:.1}px"
     ))
+}
+
+fn rect_intersection(left: Rect, right: Rect) -> Option<Rect> {
+    let result = Rect {
+        x1: left.x1.max(right.x1),
+        y1: left.y1.max(right.y1),
+        x2: left.x2.min(right.x2),
+        y2: left.y2.min(right.y2),
+    };
+    valid_rect(result).then_some(result)
 }
 
 fn valid_rect(rect: Rect) -> bool {
@@ -685,6 +950,7 @@ fn fit_at_size(
     bbox: Rect,
     shape: &str,
     placement_center: (f32, f32),
+    mask: Option<&LayoutMask>,
 ) -> Result<Option<Vec<ShapedLine>>> {
     let metrics = shaper.metrics_for_text(text);
     let tokens = UnicodeSegmentation::graphemes(text, true)
@@ -735,11 +1001,13 @@ fn fit_at_size(
             metrics.ascent,
             metrics.descent,
             metrics.leading,
+            bbox,
             cx,
             cy,
             a,
             b,
             shape,
+            mask,
             &mut memo,
         )? {
             chosen.sort_by_key(|(line, _)| *line);
@@ -769,11 +1037,13 @@ fn solve_lines(
     ascent: f32,
     descent: f32,
     leading: f32,
+    bbox: Rect,
     cx: f32,
     cy: f32,
     a: f32,
     b: f32,
     shape: &str,
+    mask: Option<&LayoutMask>,
     memo: &mut HashMap<(usize, usize), SolveResult>,
 ) -> Result<SolveResult> {
     if line == line_count {
@@ -813,11 +1083,13 @@ fn solve_lines(
                 ascent,
                 descent,
                 leading,
+                bbox,
                 cx,
                 cy,
                 a,
                 b,
                 shape,
+                mask,
                 memo,
             )?;
             if let Some((cost, mut lines)) = tail {
@@ -839,7 +1111,7 @@ fn solve_lines(
             let q = 1.0;
             let top = baseline + shaped.top - q;
             let bottom = baseline + shaped.bottom + q;
-            let available = available_width(cx, cy, a, b, top, bottom, shape)?;
+            let available = available_width(bbox, cx, cy, a, b, top, bottom, shape, mask)?;
             let ink_width = shaped.ink_right - shaped.ink_left + 2.0 * q;
             if ink_width > available + 1e-3 {
                 continue;
@@ -863,11 +1135,13 @@ fn solve_lines(
                 ascent,
                 descent,
                 leading,
+                bbox,
                 cx,
                 cy,
                 a,
                 b,
                 shape,
+                mask,
                 memo,
             )?;
             if let Some((cost, mut lines)) = tail {
@@ -885,6 +1159,7 @@ fn solve_lines(
 }
 
 fn available_width(
+    bbox: Rect,
     cx: f32,
     cy: f32,
     a: f32,
@@ -892,7 +1167,25 @@ fn available_width(
     top: f32,
     bottom: f32,
     shape: &str,
+    mask: Option<&LayoutMask>,
 ) -> Result<f32> {
+    if let Some(mask) = mask {
+        let Some((mask_left, mask_right)) = mask.interval_for_band(top, bottom, cx) else {
+            return Ok(0.0);
+        };
+        // The line is centred on `cx`, so use the narrower side of the
+        // interval.  Intersect with the detector safe box as well; a mask
+        // may contain a little more contour than the requested text box.
+        let left = mask_left.max(bbox.x1);
+        let right = mask_right.min(bbox.x2);
+        let half_width = (cx - left).min(right - cx);
+        let result = 2.0 * half_width - 2.0;
+        return Ok(if result.is_finite() && result > 0.0 {
+            result
+        } else {
+            0.0
+        });
+    }
     if shape == "rectangle" {
         return Ok(2.0 * a);
     }

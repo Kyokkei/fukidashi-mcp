@@ -402,7 +402,7 @@ fn review_rejects_stale_revision_and_malformed_bbox() {
 }
 
 #[test]
-fn approval_rejects_flags_issues_and_dirty_render_state() {
+fn approval_overrides_flags_issues_and_dirty_render_state() {
     let dir = tempdir().unwrap();
     let image_path = dir.path().join("page.png");
     ImageBuffer::<Rgb<u8>, _>::from_pixel(20, 20, Rgb([255, 255, 255]))
@@ -420,11 +420,13 @@ fn approval_rejects_flags_issues_and_dirty_render_state() {
                 "bubbles": [{
                     "id": "b1",
                     "bbox": {"x1": 2, "y1": 2, "x2": 10, "y2": 10},
+                    "text": "source",
                     "translation": "text",
                     "flagged": true
                 }, {
                     "id": "b2",
                     "bbox": {"x1": 10, "y1": 2, "x2": 18, "y2": 10},
+                    "text": "原文",
                     "source_text": "原文"
                 }]
             }]
@@ -450,10 +452,19 @@ fn approval_rejects_flags_issues_and_dirty_render_state() {
         Some(&approve.to_string()),
         host,
     );
-    assert!(response.starts_with("HTTP/1.1 400"));
-    assert!(response.contains("render_dirty"));
-    assert!(response.contains("flagged_bubble"));
-    assert!(response.contains("issue"));
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected approval response: {response}"
+    );
+    let approved: serde_json::Value =
+        serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(approved["status"], "approved");
+    assert_eq!(
+        approved["audit"].as_array().unwrap().last().unwrap()["advisory_count"],
+        3
+    );
+    let export = fukidashi_mcp::export::export_project(dir.path(), "zip");
+    assert!(export.is_ok(), "unexpected export result: {export:?}");
 }
 
 #[test]

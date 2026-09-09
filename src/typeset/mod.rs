@@ -3,12 +3,12 @@
 mod layout;
 
 pub use layout::{
-    FontCandidate, FontRun, LayoutResult, ShapedGlyph, ShapedLine, fit_text,
-    fit_text_with_font_candidates, fit_text_with_geometry,
+    FontCandidate, FontRun, LayoutMask, LayoutResult, ShapedGlyph, ShapedLine, fit_text,
+    fit_text_with_font_candidates, fit_text_with_font_candidates_masked, fit_text_with_geometry,
 };
 
 use anyhow::{Context, Result, anyhow};
-use image::{DynamicImage, Rgba};
+use image::{DynamicImage, Rgba, RgbaImage};
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
@@ -57,6 +57,10 @@ pub fn typeset_page_with_fallbacks(
         ));
     }
 
+    // Infer every component from the same unmodified page snapshot.  Drawing
+    // an earlier bubble must not alter the pixels used to isolate a later,
+    // overlapping bubble.
+    let mask_source = image.clone();
     let mut reports = Vec::with_capacity(bubbles.len());
     for (index, payload) in bubbles.iter().enumerate() {
         // A preserved item is deliberately left as source pixels. Empty text
@@ -95,7 +99,19 @@ pub fn typeset_page_with_fallbacks(
         let min = payload.min_font_size.unwrap_or(8.0);
         let max = payload.max_font_size.unwrap_or(72.0);
         let shape = payload.shape.as_deref().unwrap_or("ellipse");
-        let layout = fit_text_with_font_candidates(
+        let balloon_area = payload
+            .bubble_bbox
+            .filter(|area| {
+                area.x1.is_finite()
+                    && area.y1.is_finite()
+                    && area.x2.is_finite()
+                    && area.y2.is_finite()
+                    && area.x2 > area.x1
+                    && area.y2 > area.y1
+            })
+            .unwrap_or(rect);
+        let balloon_mask = infer_balloon_mask(&mask_source, balloon_area, payload.text_bbox);
+        let layout = fit_text_with_font_candidates_masked(
             &candidates,
             &payload.text,
             rect,
@@ -105,6 +121,7 @@ pub fn typeset_page_with_fallbacks(
             min,
             max,
             payload.padding,
+            balloon_mask,
         )
         .with_context(|| format!("fit text for bubble {index}"))?;
         raster_layout(&mut image, &candidates, &layout)?;
@@ -139,6 +156,8 @@ pub fn typeset_page_with_fallbacks(
             "bubble_bbox": payload.bubble_bbox,
             "text_bbox": payload.text_bbox,
             "safe_bbox": layout.safe_bbox,
+            "safe_mask_bbox": layout.safe_mask.as_ref().and_then(LayoutMask::bounds),
+            "mask_used": layout.safe_mask.is_some(),
             "padding": layout.padding,
             "placement_center": layout.placement_center,
             "font_size": layout.font_size,
@@ -181,6 +200,150 @@ pub fn typeset_page_with_fallbacks(
         .map_err(|e| anyhow!("promote typeset output: {}", e.error))?;
     let absolute = fs::canonicalize(output_path).unwrap_or_else(|_| output_path.to_path_buf());
     Ok(json!({"output_path": absolute, "bubbles": reports}))
+}
+
+/// Recover the light connected component that contains one bubble's interior.
+/// Detector rectangles are deliberately only a crop and a guard: when two
+/// rectangles overlap, the component boundary in the cleaned page decides
+/// which pixels belong to this bubble.  A broad unbounded white page is
+/// rejected and falls back to the existing rectangle/ellipse geometry.
+fn infer_balloon_mask(
+    image: &RgbaImage,
+    area: crate::domain::Rect,
+    anchor: Option<crate::domain::Rect>,
+) -> Option<LayoutMask> {
+    let area = area.clip(image.width() as f32, image.height() as f32)?;
+    let origin_x = area.x1.floor().max(0.0) as u32;
+    let origin_y = area.y1.floor().max(0.0) as u32;
+    let end_x = area.x2.ceil().min(image.width() as f32) as u32;
+    let end_y = area.y2.ceil().min(image.height() as f32) as u32;
+    let width = usize::try_from(end_x.saturating_sub(origin_x)).ok()?;
+    let height = usize::try_from(end_y.saturating_sub(origin_y)).ok()?;
+    if width < 8 || height < 8 {
+        return None;
+    }
+
+    let mut luminance = Vec::with_capacity(width.saturating_mul(height));
+    let mut brightest = 0_u8;
+    for y in origin_y..end_y {
+        for x in origin_x..end_x {
+            let pixel = image.get_pixel(x, y);
+            let value = ((u32::from(pixel[0]) * 299
+                + u32::from(pixel[1]) * 587
+                + u32::from(pixel[2]) * 114)
+                / 1000) as u8;
+            brightest = brightest.max(value);
+            luminance.push(value);
+        }
+    }
+    // Light speech balloons are the common case.  For a dark/colored balloon
+    // use a local high-value threshold, but do not mistake an all-dark crop
+    // for a recoverable component.
+    if brightest < 96 {
+        return None;
+    }
+    let threshold = if brightest >= 200 {
+        180
+    } else {
+        brightest.saturating_sub(24).max(96)
+    };
+    let binary = luminance
+        .iter()
+        .map(|value| *value >= threshold)
+        .collect::<Vec<_>>();
+    let anchor = anchor
+        .filter(|rect| {
+            rect.x1.is_finite()
+                && rect.y1.is_finite()
+                && rect.x2.is_finite()
+                && rect.y2.is_finite()
+                && rect.x2 > rect.x1
+                && rect.y2 > rect.y1
+        })
+        .unwrap_or(area);
+    let center_x = ((anchor.x1 + anchor.x2) * 0.5 - origin_x as f32).clamp(0.0, width as f32 - 1.0);
+    let center_y =
+        ((anchor.y1 + anchor.y2) * 0.5 - origin_y as f32).clamp(0.0, height as f32 - 1.0);
+    let seed = binary
+        .iter()
+        .enumerate()
+        .filter(|(_, inside)| **inside)
+        .min_by(|(left, _), (right, _)| {
+            let left_x = (*left % width) as f32;
+            let left_y = (*left / width) as f32;
+            let right_x = (*right % width) as f32;
+            let right_y = (*right / width) as f32;
+            let left_distance = (left_x - center_x).hypot(left_y - center_y);
+            let right_distance = (right_x - center_x).hypot(right_y - center_y);
+            left_distance.total_cmp(&right_distance)
+        })
+        .map(|(index, _)| index)?;
+
+    let mut component = vec![false; binary.len()];
+    let mut queue = std::collections::VecDeque::from([seed]);
+    component[seed] = true;
+    while let Some(index) = queue.pop_front() {
+        let x = index % width;
+        let y = index / width;
+        for (dx, dy) in [(1_i32, 0_i32), (-1, 0), (0, 1), (0, -1)] {
+            let next_x = x as i32 + dx;
+            let next_y = y as i32 + dy;
+            if next_x < 0 || next_y < 0 || next_x >= width as i32 || next_y >= height as i32 {
+                continue;
+            }
+            let next = next_y as usize * width + next_x as usize;
+            if binary[next] && !component[next] {
+                component[next] = true;
+                queue.push_back(next);
+            }
+        }
+    }
+    let component_pixels = component.iter().filter(|inside| **inside).count();
+    if component_pixels < 24 {
+        return None;
+    }
+    let min_x = component
+        .iter()
+        .enumerate()
+        .filter(|(_, inside)| **inside)
+        .map(|(index, _)| index % width)
+        .min()?;
+    let max_x = component
+        .iter()
+        .enumerate()
+        .filter(|(_, inside)| **inside)
+        .map(|(index, _)| index % width)
+        .max()?;
+    let min_y = component
+        .iter()
+        .enumerate()
+        .filter(|(_, inside)| **inside)
+        .map(|(index, _)| index / width)
+        .min()?;
+    let max_y = component
+        .iter()
+        .enumerate()
+        .filter(|(_, inside)| **inside)
+        .map(|(index, _)| index / width)
+        .max()?;
+    if max_x.saturating_sub(min_x) < 5 || max_y.saturating_sub(min_y) < 5 {
+        return None;
+    }
+    // A component that reaches every crop edge is usually the unbounded page
+    // background.  Do not require dark pixels on the crop perimeter: a valid
+    // closed contour can sit inside white padding, and one dark perimeter
+    // pixel is not evidence that a contour is actually closed.
+    let touches_left = (0..height).any(|y| component[y * width]);
+    let touches_right = (0..height).any(|y| component[y * width + width - 1]);
+    let touches_top = (0..width).any(|x| component[x]);
+    let touches_bottom = (0..width).any(|x| component[(height - 1) * width + x]);
+    if touches_left && touches_right && touches_top && touches_bottom {
+        return None;
+    }
+    if component_pixels * 100 < width.saturating_mul(height).saturating_mul(4) {
+        return None;
+    }
+    LayoutMask::from_binary(origin_x as i32, origin_y as i32, width, height, component).ok()
 }
 
 fn payload_skip_reason(payload: &TypesetPayload) -> Option<&'static str> {
@@ -412,6 +575,17 @@ fn raster_layout(
                     if x < 0 || y < 0 || x >= image.width() as i32 || y >= image.height() as i32 {
                         continue;
                     }
+                    // The layout solver already rejects bands wider than the
+                    // eroded component.  Keep the same mask as a final pixel
+                    // guard for antialiased glyph bearings and irregular
+                    // contours that cannot be represented by one rectangle.
+                    if layout
+                        .safe_mask
+                        .as_ref()
+                        .is_some_and(|mask| !mask.contains_pixel(x, y))
+                    {
+                        continue;
+                    }
                     let dst = image.get_pixel_mut(x as u32, y as u32);
                     let a = (u16::from(alpha) * u16::from(rgba[3]) / 255) as u8;
                     let inv = 255u16 - u16::from(a);
@@ -604,5 +778,121 @@ mod tests {
             second["bubbles"][0]["fallback_fonts_used"],
             json!([symbols.display().to_string()])
         );
+    }
+
+    fn closed_balloon_fixture(width: u32, height: u32) -> RgbaImage {
+        let mut image = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+        for x in 15..(width - 15) {
+            image.put_pixel(x, 12, Rgba([0, 0, 0, 255]));
+            image.put_pixel(x, height - 13, Rgba([0, 0, 0, 255]));
+        }
+        for y in 12..(height - 12) {
+            image.put_pixel(15, y, Rgba([0, 0, 0, 255]));
+            image.put_pixel(width - 16, y, Rgba([0, 0, 0, 255]));
+        }
+        image
+    }
+
+    #[test]
+    fn balloon_mask_accepts_a_closed_contour_inside_white_crop_padding() {
+        let image = closed_balloon_fixture(96, 64);
+        let area = Rect {
+            x1: 4.0,
+            y1: 4.0,
+            x2: 92.0,
+            y2: 60.0,
+        };
+        let anchor = Rect {
+            x1: 35.0,
+            y1: 24.0,
+            x2: 55.0,
+            y2: 40.0,
+        };
+        let mask = infer_balloon_mask(&image, area, Some(anchor))
+            .expect("white component enclosed by an interior contour");
+        let bounds = mask.bounds().expect("enclosed component bounds");
+        assert!(bounds.x1 > area.x1);
+        assert!(bounds.y1 > area.y1);
+        assert!(bounds.x2 < area.x2);
+        assert!(bounds.y2 < area.y2);
+        assert!(mask.contains_pixel(48, 32));
+        assert!(!mask.contains_pixel(15, 32));
+    }
+
+    #[test]
+    fn balloon_mask_rejects_unbounded_white_crop_with_a_black_speck() {
+        let mut image = RgbaImage::from_pixel(96, 64, Rgba([255, 255, 255, 255]));
+        image.put_pixel(48, 32, Rgba([0, 0, 0, 255]));
+        let area = Rect {
+            x1: 4.0,
+            y1: 4.0,
+            x2: 92.0,
+            y2: 60.0,
+        };
+        assert!(infer_balloon_mask(&image, area, None).is_none());
+    }
+
+    #[test]
+    fn rasterized_text_stays_inside_the_eroded_balloon_component() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.png");
+        let output_path = directory.path().join("rendered.png");
+        let source = closed_balloon_fixture(96, 64);
+        source.save(&source_path).unwrap();
+        let font_path = directory.path().join("ComicNeue-Regular.ttf");
+        fs::write(&font_path, crate::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+        let area = Rect {
+            x1: 4.0,
+            y1: 4.0,
+            x2: 92.0,
+            y2: 60.0,
+        };
+        let text_bbox = Rect {
+            x1: 28.0,
+            y1: 20.0,
+            x2: 68.0,
+            y2: 44.0,
+        };
+        let payload = TypesetPayload {
+            id: Some("bubble-1".into()),
+            source_text: Some("source".into()),
+            kind: Some("dialogue".into()),
+            preserve_by_default: Some(false),
+            needs_review: Some(false),
+            flagged: Some(false),
+            preserve_source: Some(false),
+            fallback_font_paths: Vec::new(),
+            bbox: area,
+            bubble_bbox: Some(area),
+            text_bbox: Some(text_bbox),
+            padding: Some(4.0),
+            text: "Mask text".into(),
+            font_path: Some(font_path.display().to_string()),
+            min_font_size: Some(8.0),
+            max_font_size: Some(18.0),
+            shape: Some("rectangle".into()),
+        };
+        let report =
+            typeset_page_with_fallbacks(&source_path, &[payload], &[], &output_path).unwrap();
+        assert_eq!(report["bubbles"][0]["mask_used"], true);
+        let safe_mask = infer_balloon_mask(&source, area, Some(text_bbox))
+            .and_then(|mask| mask.eroded(2))
+            .expect("same mask used by the renderer");
+        let rendered = image::open(&output_path).unwrap().to_rgba8();
+        let mut changed_text_pixels = 0usize;
+        for y in 0..rendered.height() {
+            for x in 0..rendered.width() {
+                let before = source.get_pixel(x, y);
+                let after = rendered.get_pixel(x, y);
+                if before[0] >= 240 && after[0] < 240 {
+                    changed_text_pixels += 1;
+                    assert!(
+                        safe_mask.contains_pixel(x as i32, y as i32),
+                        "text escaped eroded mask at ({x}, {y})"
+                    );
+                }
+            }
+        }
+        assert!(changed_text_pixels > 0);
     }
 }
