@@ -174,6 +174,15 @@ async fn rmcp_surface_lists_tools_and_reports_tool_errors() -> anyhow::Result<()
         review_export_schema["properties"]["format"]["default"],
         "zip"
     );
+    let pull_schema = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "fukidashi_pull_chapter")
+        .expect("pull chapter tool schema")
+        .input_schema
+        .clone();
+    let pull_schema = serde_json::to_value(pull_schema)?;
+    assert_eq!(pull_schema["properties"]["latest"]["default"], false);
     let editor_request: EditorRequest = serde_json::from_value(serde_json::json!({
         "image_path": "C:/page.png",
         "json_data": {"schema_version": 1, "flags": [true, false], "nested": {"value": null}}
@@ -223,22 +232,36 @@ async fn rmcp_surface_lists_tools_and_reports_tool_errors() -> anyhow::Result<()
 }
 
 fn assert_no_boolean_schema_nodes(value: &serde_json::Value, tool_name: &str) {
-    match value {
-        serde_json::Value::Bool(_) => {
-            panic!("tool {tool_name} contains a boolean JSON Schema node")
+    fn walk(value: &serde_json::Value, tool_name: &str, path: &str) {
+        if matches!(value, serde_json::Value::Bool(_))
+            && !(tool_name == "fukidashi_pull_chapter" && path == "properties.latest.default")
+        {
+            panic!("tool {tool_name} contains a boolean JSON Schema node at {path}");
         }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                assert_no_boolean_schema_nodes(item, tool_name);
+        match value {
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(item, tool_name, &format!("{path}[{index}]"));
+                }
             }
-        }
-        serde_json::Value::Object(properties) => {
-            for item in properties.values() {
-                assert_no_boolean_schema_nodes(item, tool_name);
+            serde_json::Value::Object(properties) => {
+                for (key, item) in properties {
+                    let child_path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    walk(item, tool_name, &child_path);
+                }
             }
+            serde_json::Value::Bool(_)
+            | serde_json::Value::Null
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
         }
-        serde_json::Value::Null | serde_json::Value::Number(_) | serde_json::Value::String(_) => {}
     }
+
+    walk(value, tool_name, "");
 }
 
 #[derive(Debug, Clone, Default)]
