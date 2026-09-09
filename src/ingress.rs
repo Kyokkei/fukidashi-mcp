@@ -315,6 +315,24 @@ impl MangaDexClient {
         let chapter = self.resolve_chapter_record(request).await?;
         let manga_title = self.manga_title(&chapter.manga_id).await?;
         if chapter.external_url.is_some() {
+            if let Some(title) = manga_title.as_deref() {
+                if let Ok(mirror_url) = resolve_aggregator_mirror(title, chapter.chapter.as_deref()).await {
+                    let direct_req = PullChapterRequest {
+                        source: "direct".to_owned(),
+                        url: Some(mirror_url),
+                        job_name: request.job_name.clone(),
+                        manga_id: None,
+                        chapter_id: None,
+                        chapter: None,
+                        latest: false,
+                        translated_language: None,
+                        data_saver: request.data_saver.clone(),
+                    };
+                    if let Ok(imported) = pull_direct(config, workflow, &direct_req).await {
+                        return Ok(imported);
+                    }
+                }
+            }
             return Ok(external_release_response(&chapter, manga_title.as_deref()));
         }
         let use_data_saver = Self::uses_data_saver(request);
@@ -1259,6 +1277,86 @@ fn reserve_download_bytes(counter: &AtomicU64, amount: usize, limit: u64) -> Res
             return Ok(());
         }
     }
+}
+
+async fn resolve_aggregator_mirror(title: &str, chapter_num: Option<&str>) -> Result<String> {
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+        .timeout(Duration::from_secs(10))
+        .build()?;
+    let mut clean_title = String::new();
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() || c == ' ' {
+            clean_title.push(c);
+        }
+    }
+    let query = clean_title.split_whitespace().collect::<Vec<_>>().join("+");
+    if query.is_empty() {
+        bail!("empty title for mirror search");
+    }
+    let search_url = format!("https://weebcentral.com/search/data?text={query}");
+    let html = client.get(&search_url).send().await?.text().await?;
+    let series_id = extract_weebcentral_series_id(&html)
+        .ok_or_else(|| anyhow!("series not found on WeebCentral"))?;
+    let list_url = format!("https://weebcentral.com/series/{series_id}/full-chapter-list");
+    let list_html = client.get(&list_url).send().await?.text().await?;
+    let chapters = extract_weebcentral_chapters(&list_html);
+    if chapters.is_empty() {
+        bail!("no chapters found on WeebCentral");
+    }
+    if let Some(target) = chapter_num {
+        let target = target.trim().trim_start_matches('0');
+        for (rel_path, ch) in &chapters {
+            let ch_clean = ch.trim().trim_start_matches('0');
+            if ch_clean == target {
+                return Ok(format!("https://weebcentral.com{rel_path}"));
+            }
+        }
+    }
+    Ok(format!("https://weebcentral.com{}", chapters[0].0))
+}
+
+fn extract_weebcentral_series_id(html: &str) -> Option<String> {
+    let marker = "/series/";
+    let start = html.find(marker)? + marker.len();
+    let rest = &html[start..];
+    let end = rest.find('/')?;
+    let id = &rest[..end];
+    if id.chars().all(|c| c.is_ascii_alphanumeric()) && !id.is_empty() {
+        Some(id.to_owned())
+    } else {
+        None
+    }
+}
+
+fn extract_weebcentral_chapters(html: &str) -> Vec<(String, String)> {
+    let mut results = Vec::new();
+    let marker = "href=\"/chapters/";
+    let mut cursor = 0;
+    while let Some(pos) = html[cursor..].find(marker) {
+        let start = cursor + pos + marker.len();
+        let Some(quote_end) = html[start..].find('"') else {
+            break;
+        };
+        let ch_id = &html[start..start + quote_end];
+        let rel_path = format!("/chapters/{ch_id}");
+        cursor = start + quote_end;
+        let window_len = 500.min(html.len().saturating_sub(cursor));
+        let window = &html[cursor..cursor + window_len];
+        let mut ch_num = String::new();
+        if let Some(ch_idx) = window.find("Chapter ") {
+            let num_part = &window[ch_idx + "Chapter ".len()..];
+            for c in num_part.chars() {
+                if c.is_ascii_digit() || c == '.' {
+                    ch_num.push(c);
+                } else {
+                    break;
+                }
+            }
+        }
+        results.push((rel_path, ch_num));
+    }
+    results
 }
 
 fn validate_direct_url(raw: &str) -> Result<Url> {
