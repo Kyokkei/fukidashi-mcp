@@ -845,6 +845,197 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
 }
 
 #[test]
+fn editor_reconstructs_missing_primary_and_substitutes_legacy_hash_arial() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("page.png");
+    let mut source_image = ImageBuffer::<Rgb<u8>, _>::from_pixel(96, 96, Rgb([255, 255, 255]));
+    for y in 16..64 {
+        for x in 12..72 {
+            source_image.put_pixel(x, y, Rgb([0, 0, 0]));
+        }
+    }
+    source_image.save(&source).unwrap();
+
+    let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+    let registration = workflow.register_analysis(&source, None).unwrap();
+    let mut cleaned = source_image.clone();
+    let mut mask = image::GrayImage::new(96, 96);
+    for y in 16..64 {
+        for x in 12..72 {
+            cleaned.put_pixel(x, y, Rgb([255, 255, 255]));
+            mask.put_pixel(x, y, image::Luma([255]));
+        }
+    }
+    workflow
+        .write_clean_artifact(&source, &cleaned, &mask, 0, "full")
+        .unwrap();
+    let artifacts = workflow.page_artifacts_for_source(&source).unwrap();
+    let cleaned_path = artifacts.2;
+    let rendered_path = artifacts.4;
+    let requested_font = workflow
+        .materialize_bundled_font(
+            &registration.job_dir,
+            &fukidashi_mcp::fonts::COMIC_NEUE_REGULAR,
+        )
+        .unwrap();
+    let payload = TypesetPayload {
+        id: Some("bubble-legacy".into()),
+        source_text: Some("Hello".into()),
+        kind: Some("dialogue".into()),
+        preserve_by_default: Some(false),
+        needs_review: Some(false),
+        flagged: Some(false),
+        preserve_source: Some(false),
+        fallback_font_paths: Vec::new(),
+        bbox: Rect {
+            x1: 16.0,
+            y1: 18.0,
+            x2: 68.0,
+            y2: 60.0,
+        },
+        bubble_bbox: None,
+        text_bbox: None,
+        padding: Some(2.0),
+        text: "Hello world".into(),
+        font_path: Some(requested_font.display().to_string()),
+        min_font_size: Some(1.0),
+        max_font_size: Some(28.0),
+        shape: Some("rectangle".into()),
+    };
+    let initial_report = fukidashi_mcp::typeset::typeset_page_with_fallbacks(
+        &cleaned_path,
+        std::slice::from_ref(&payload),
+        &[],
+        &rendered_path,
+    )
+    .unwrap();
+    workflow
+        .register_render(
+            &rendered_path,
+            &workflow.validate_clean_input(&cleaned_path).unwrap(),
+            json!({
+                "request_bubbles": [payload],
+                "report": initial_report,
+            }),
+            json!({"editor_render": false}),
+        )
+        .unwrap();
+
+    let state = workflow.editor_state(&rendered_path, None).unwrap();
+    let result = serve_editor_with_allowed_sources(
+        &rendered_path,
+        state,
+        vec![fs::canonicalize(&source).unwrap()],
+    )
+    .unwrap();
+    let endpoint = result["url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://")
+        .unwrap();
+    let (host, _) = endpoint.split_once('/').unwrap();
+    let token = result["session_token"].as_str().unwrap();
+    let state_path = result["persistence_path"].as_str().unwrap();
+
+    let mut missing_primary: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    let bubble = missing_primary["pages"][0]["bubbles"][0]
+        .as_object_mut()
+        .unwrap();
+    assert!(bubble.remove("font_path").is_some());
+    assert!(bubble.remove("rendered_font_path").is_some());
+    let save = request(
+        host,
+        &format!("/{token}/save"),
+        "POST",
+        Some(&missing_primary.to_string()),
+        host,
+    );
+    assert!(save.starts_with("HTTP/1.1 200"), "unexpected save: {save}");
+    let saved_missing: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    assert_eq!(saved_missing["pages"][0]["render_dirty"], true);
+    let render = request(
+        host,
+        &format!("/{token}/render"),
+        "POST",
+        Some(&json!({"page_index": 0, "state": saved_missing}).to_string()),
+        host,
+    );
+    assert!(
+        render.starts_with("HTTP/1.1 200"),
+        "unexpected render: {render}"
+    );
+    let rendered_missing: serde_json::Value =
+        serde_json::from_str(render.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let missing_report = &rendered_missing["typeset"]["bubbles"][0];
+    assert_eq!(missing_report["font_substituted"], true);
+    assert_eq!(missing_report["reason"], "missing_primary");
+    assert!(
+        missing_report["resolved_font_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("-ComicNeue-Regular.ttf"))
+    );
+    assert_eq!(
+        rendered_missing["typeset"]["font_substitutions"][0]["reason"],
+        "missing_primary"
+    );
+
+    let hash_arial = registration
+        .job_dir
+        .join("fonts")
+        .join("0123456789abcdef-Arial.ttf");
+    fs::write(&hash_arial, fukidashi_mcp::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+    let mut hash_primary = rendered_missing["state"].clone();
+    let hash_bubble = hash_primary["pages"][0]["bubbles"][0]
+        .as_object_mut()
+        .unwrap();
+    hash_bubble.insert("font_path".into(), json!(hash_arial.display().to_string()));
+    hash_bubble.insert(
+        "rendered_font_path".into(),
+        json!(hash_arial.display().to_string()),
+    );
+    let save = request(
+        host,
+        &format!("/{token}/save"),
+        "POST",
+        Some(&hash_primary.to_string()),
+        host,
+    );
+    assert!(
+        save.starts_with("HTTP/1.1 200"),
+        "unexpected hash save: {save}"
+    );
+    let saved_hash: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_path).unwrap()).unwrap();
+    let render = request(
+        host,
+        &format!("/{token}/render"),
+        "POST",
+        Some(&json!({"page_index": 0, "state": saved_hash}).to_string()),
+        host,
+    );
+    assert!(
+        render.starts_with("HTTP/1.1 200"),
+        "unexpected hash render: {render}"
+    );
+    let rendered_hash: serde_json::Value =
+        serde_json::from_str(render.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let hash_report = &rendered_hash["typeset"]["bubbles"][0];
+    assert_eq!(hash_report["font_substituted"], true);
+    assert_eq!(hash_report["reason"], "generic_desktop_primary");
+    assert_eq!(
+        rendered_hash["typeset"]["font_substitutions"][0]["requested_font_path"],
+        hash_arial.display().to_string()
+    );
+    assert!(
+        hash_report["resolved_font_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("-ComicNeue-Regular.ttf"))
+    );
+}
+
+#[test]
 fn export_requires_explicit_review_approval() {
     let dir = tempdir().unwrap();
     let image_path = dir.path().join("page.png");
