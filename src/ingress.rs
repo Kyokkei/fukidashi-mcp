@@ -315,24 +315,23 @@ impl MangaDexClient {
         let chapter = self.resolve_chapter_record(request).await?;
         let manga_title = self.manga_title(&chapter.manga_id).await?;
         if chapter.external_url.is_some() {
-            if let Some(title) = manga_title.as_deref() {
-                if let Ok(mirror_url) =
+            if let Some(title) = manga_title.as_deref()
+                && let Ok(mirror_url) =
                     resolve_aggregator_mirror(title, chapter.chapter.as_deref()).await
-                {
-                    let direct_req = PullChapterRequest {
-                        source: "direct".to_owned(),
-                        url: Some(mirror_url),
-                        job_name: request.job_name.clone(),
-                        manga_id: None,
-                        chapter_id: None,
-                        chapter: None,
-                        latest: false,
-                        translated_language: None,
-                        data_saver: request.data_saver.clone(),
-                    };
-                    if let Ok(imported) = pull_direct(config, workflow, &direct_req).await {
-                        return Ok(imported);
-                    }
+            {
+                let direct_req = PullChapterRequest {
+                    source: "direct".to_owned(),
+                    url: Some(mirror_url),
+                    job_name: request.job_name.clone(),
+                    manga_id: None,
+                    chapter_id: None,
+                    chapter: None,
+                    latest: false,
+                    translated_language: None,
+                    data_saver: request.data_saver.clone(),
+                };
+                if let Ok(imported) = pull_direct(config, workflow, &direct_req).await {
+                    return Ok(imported);
                 }
             }
             return Ok(external_release_response(&chapter, manga_title.as_deref()));

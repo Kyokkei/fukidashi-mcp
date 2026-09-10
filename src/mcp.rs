@@ -82,6 +82,9 @@ pub struct TypesetRequest {
     pub image_path: String,
     pub bubbles: Vec<TypesetPayload>,
     /// Defaults used only when the corresponding bubble field is absent.
+    /// Use the bundled Comic Neue or Patrick Hand faces for comic text;
+    /// generic Windows UI faces such as Arial, Calibri, and Segoe UI are
+    /// substituted when supplied as a primary.
     #[serde(default)]
     pub font_path: Option<String>,
     #[serde(default)]
@@ -1240,6 +1243,12 @@ impl FukidashiServer {
                 missing.join(", ")
             )));
         }
+        let bubble_bboxes = items
+            .iter()
+            .map(|item| {
+                analysis_bubble_bbox(analysis, &item.id).map(|bbox| (item.id.clone(), bbox))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let item_values = analysis
             .get_mut("translation_handoff")
             .and_then(|handoff| handoff.get_mut("items"))
@@ -1273,6 +1282,7 @@ impl FukidashiServer {
                 .into(),
             );
             let bbox = serde_json::from_value::<Rect>(item["bbox"].clone())?.validate()?;
+            let bubble_bbox = bubble_bboxes.get(&id).copied().flatten();
             payloads.push(TypesetPayload {
                 id: Some(id.clone()),
                 source_text: item
@@ -1293,7 +1303,7 @@ impl FukidashiServer {
                 preserve_source: Some(keep_source),
                 fallback_font_paths: Vec::new(),
                 bbox,
-                bubble_bbox: None,
+                bubble_bbox,
                 text_bbox: None,
                 padding: None,
                 text,
@@ -1374,25 +1384,37 @@ fn materialize_bundled_typeset_fonts(
     workflow: &Workflow,
     job_root: &std::path::Path,
     bubbles: &mut [TypesetPayload],
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<(Vec<String>, Vec<serde_json::Value>)> {
     if bubbles.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let regular = workflow.materialize_bundled_font(job_root, &crate::fonts::COMIC_NEUE_REGULAR)?;
-    for bubble in bubbles
-        .iter_mut()
-        .filter(|bubble| bubble.font_path.is_none())
-    {
-        bubble.font_path = Some(regular.display().to_string());
+    let regular_path = regular.display().to_string();
+    let mut substitutions = Vec::new();
+    for (index, bubble) in bubbles.iter_mut().enumerate() {
+        let Some(requested) = bubble.font_path.as_deref() else {
+            bubble.font_path = Some(regular_path.clone());
+            continue;
+        };
+        if crate::workflow::is_generic_desktop_font(std::path::Path::new(requested)) {
+            substitutions.push(serde_json::json!({
+                "index": index,
+                "requested_font_path": requested,
+                "replacement_primary_font": regular_path,
+                "reason": "generic_desktop_primary",
+            }));
+            bubble.font_path = Some(regular_path.clone());
+        }
     }
-    crate::fonts::bundled_fallbacks()
+    let fallbacks = crate::fonts::bundled_fallbacks()
         .into_iter()
         .map(|font| {
             workflow
                 .materialize_bundled_font(job_root, font)
                 .map(|path| path.display().to_string())
         })
-        .collect()
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((fallbacks, substitutions))
 }
 
 fn resolve_analysis_scope(scope: &AnalyzeScope) -> Result<ScopeSpec, FukidashiError> {
@@ -1422,6 +1444,43 @@ fn json_bbox(item: &serde_json::Value) -> Option<Rect> {
     serde_json::from_value::<Rect>(item.get("bbox").cloned()?)
         .ok()
         .and_then(|rect| rect.validate().ok())
+}
+
+fn analysis_bubble_bbox(
+    analysis: &serde_json::Value,
+    id: &str,
+) -> Result<Option<Rect>, FukidashiError> {
+    let Some(bubbles) = analysis
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(None);
+    };
+    let Some(bubble) = bubbles
+        .iter()
+        .find(|bubble| bubble.get("id").and_then(serde_json::Value::as_str) == Some(id))
+    else {
+        return Ok(None);
+    };
+    // Detector label 0 is the speech-bubble contour. Promoted OCR lines use
+    // their text rectangle as a synthetic bubble, which must not masquerade
+    // as a contour for strict typesetting geometry.
+    if bubble
+        .get("detector_label")
+        .and_then(serde_json::Value::as_i64)
+        != Some(0)
+    {
+        return Ok(None);
+    }
+    let bbox = bubble.get("bbox").cloned().ok_or_else(|| {
+        FukidashiError::InvalidInput(format!("analysis bubble {id:?} has no bbox"))
+    })?;
+    let bbox = serde_json::from_value::<Rect>(bbox)
+        .map_err(|error| {
+            FukidashiError::InvalidInput(format!("analysis bubble {id:?} bbox is invalid: {error}"))
+        })?
+        .validate()?;
+    Ok(Some(bbox))
 }
 
 fn checkpoint_item_is_preserved(item: &serde_json::Value, replace_sfx: bool) -> bool {
@@ -2386,7 +2445,7 @@ impl FukidashiServer {
     }
     #[tool(
         name = "fukidashi_typeset",
-        description = "Render supplied translations into speech bubbles using shaped glyph metrics."
+        description = "Render supplied translations into speech bubbles using shaped glyph metrics. Use bundled Comic Neue for comic dialogue and Patrick Hand coverage for Vietnamese; do not pass generic Windows UI fonts such as Arial, Calibri, Segoe UI, Tahoma, Verdana, Times, or DejaVu Sans as a primary because the server substitutes Comic Neue and reports the substitution."
     )]
     pub async fn typeset(&self, Parameters(req): Parameters<TypesetRequest>) -> CallToolResult {
         let (image_path, bubbles, fallback_font_paths) = resolve_typeset_request(req);
@@ -2429,7 +2488,7 @@ impl FukidashiServer {
             }
         };
         let mut bubbles = bubbles;
-        let bundled_fallback_paths = match materialize_bundled_typeset_fonts(
+        let (bundled_fallback_paths, font_substitutions) = match materialize_bundled_typeset_fonts(
             &workflow,
             &job_root,
             &mut bubbles,
@@ -2455,7 +2514,7 @@ impl FukidashiServer {
                     return json_result(
                         &serde_json::json!({
                             "error": format!("bubble {index} font {font:?} is not usable: {error}"),
-                            "next_step": "use a validated TTF/OTF/TTC from Windows Fonts or a managed job fonts directory"
+                            "next_step": "use Comic Neue or another legitimate comic font as the primary; generic Windows UI faces are substituted, while fallback faces may provide coverage"
                         }),
                         true,
                     );
@@ -2472,14 +2531,14 @@ impl FukidashiServer {
                         return json_result(
                             &serde_json::json!({
                                 "error": format!("bubble {index} fallback font {font:?} is not usable: {error}"),
-                                "next_step": "use a validated TTF/OTF/TTC from Windows Fonts or a managed job fonts directory"
+                                "next_step": "use Comic Neue or another legitimate comic font as the primary; generic Windows UI faces are substituted, while fallback faces may provide coverage"
                             }),
                             true,
                         );
                     }
                 }
             }
-            bubble.fallback_font_paths = materialized;
+            bubble.fallback_font_paths = crate::workflow::order_fallback_font_paths(materialized);
         }
         let requested_fallbacks = fallback_font_paths;
         let mut fallback_font_paths =
@@ -2491,7 +2550,7 @@ impl FukidashiServer {
                     return json_result(
                         &serde_json::json!({
                             "error": format!("fallback font {font:?} is not usable: {error}"),
-                            "next_step": "use a validated TTF/OTF/TTC from Windows Fonts or a managed job fonts directory"
+                            "next_step": "use a validated TTF/OTF/TTC from an approved font directory or managed job fonts directory"
                         }),
                         true,
                     );
@@ -2499,11 +2558,12 @@ impl FukidashiServer {
             }
         }
         fallback_font_paths.extend(bundled_fallback_paths);
+        fallback_font_paths = crate::workflow::order_fallback_font_paths(fallback_font_paths);
         for bubble in &mut bubbles {
             let mut effective = bubble.fallback_font_paths.clone();
             effective.extend(fallback_font_paths.iter().cloned());
             effective.dedup();
-            bubble.fallback_font_paths = effective;
+            bubble.fallback_font_paths = crate::workflow::order_fallback_font_paths(effective);
         }
         let output_path = parent.join("rendered.png");
         let render_lock = match workflow.acquire_render_lock(&job_root) {
@@ -2536,6 +2596,34 @@ impl FukidashiServer {
                 &fallback_font_paths,
                 &output_path,
             )?;
+            if !font_substitutions.is_empty() {
+                let mut substitutions = font_substitutions.clone();
+                if let Some(reports) = value["bubbles"].as_array_mut() {
+                    for substitution in &mut substitutions {
+                        let Some(index) = substitution
+                            .get("index")
+                            .and_then(|v| v.as_u64())
+                            .and_then(|index| usize::try_from(index).ok())
+                        else {
+                            continue;
+                        };
+                        let Some(report) = reports.get_mut(index).and_then(|v| v.as_object_mut())
+                        else {
+                            continue;
+                        };
+                        if let Some(resolved) = report.get("resolved_font_path").cloned() {
+                            substitution["resolved_font_path"] = resolved;
+                        }
+                        for key in ["requested_font_path", "replacement_primary_font", "reason"] {
+                            if let Some(value) = substitution.get(key) {
+                                report.insert(key.to_owned(), value.clone());
+                            }
+                        }
+                        report.insert("font_substituted".into(), serde_json::Value::Bool(true));
+                    }
+                }
+                value["font_substitutions"] = serde_json::Value::Array(substitutions);
+            }
             let qa = crate::typeset::post_render_qa(&clean_artifact, &value)?;
             let sidecar = workflow
                 .register_render_locked(
@@ -3061,7 +3149,11 @@ impl ServerHandler for FukidashiServer {
                 the single MCP call pending until review, returning feedback or exporting zip after approval. \
                 fukidashi_serve_editor and fukidashi_wait_for_review remain compatibility tools. Primitive \
                 fukidashi_analyze_page, fukidashi_clean_page, and fukidashi_typeset tools remain available for \
-                compatibility; pass their exact server-returned paths and stable IDs. Use \
+                compatibility; pass their exact server-returned paths and stable IDs. For typesetting, use \
+                Comic Neue or another legitimate comic face as the primary; never pass generic Windows UI \
+                faces such as Arial, Calibri, Segoe UI, Tahoma, Verdana, Times, or DejaVu Sans as a primary. \
+                The server substitutes bundled Comic Neue and reports the requested and resolved faces; Patrick \
+                Hand covers Vietnamese and Noto Sans Symbols 2 is reserved for symbols. Use \
                 fukidashi_release_models between bounded legacy batches on memory-constrained machines. For \
                 acquisition, fukidashi_search_manga searches native MangaDex only and returns an exact manga_id \
                 plus a suggested latest=true pull. For a vague latest request, call fukidashi_pull_chapter with \
@@ -3156,6 +3248,11 @@ mod tests {
         serde_json::json!({
             "source_language": "ja",
             "target_language": "vi",
+            "bubbles": [{
+                "id": "bubble-1",
+                "detector_label": 0,
+                "bbox": {"x1": 0.5, "y1": 0.5, "x2": 20.0, "y2": 20.0}
+            }],
             "translation_handoff": {
                 "target_language": "vi",
                 "status": "pending",
@@ -3182,6 +3279,34 @@ mod tests {
                 }]
             }
         })
+    }
+
+    #[test]
+    fn strict_bbox_ignores_synthetic_promoted_ocr_bubbles() {
+        let analysis = serde_json::json!({
+            "bubbles": [{
+                "id": "missed-line",
+                "detector_label": 2,
+                "bbox": {"x1": 1.0, "y1": 2.0, "x2": 30.0, "y2": 40.0}
+            }, {
+                "id": "dialogue",
+                "detector_label": 0,
+                "bbox": {"x1": 3.0, "y1": 4.0, "x2": 50.0, "y2": 60.0}
+            }]
+        });
+        assert_eq!(
+            analysis_bubble_bbox(&analysis, "missed-line").unwrap(),
+            None
+        );
+        assert_eq!(
+            analysis_bubble_bbox(&analysis, "dialogue").unwrap(),
+            Some(Rect {
+                x1: 3.0,
+                y1: 4.0,
+                x2: 50.0,
+                y2: 60.0,
+            })
+        );
     }
 
     #[test]
@@ -3422,10 +3547,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let source_dir = temp.path().join("comic");
         std::fs::create_dir_all(&source_dir).unwrap();
-        let source = source_dir.join("cover.png");
-        image::RgbImage::from_pixel(24, 24, image::Rgb([240, 240, 240]))
-            .save(&source)
-            .unwrap();
+        let source = source_dir.join("cover.webp");
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            24,
+            24,
+            image::Rgb([240, 240, 240]),
+        ))
+        .save_with_format(&source, image::ImageFormat::WebP)
+        .unwrap();
         let config = test_config(temp.path());
         let workflow = Workflow::new(config.jobs_dir()).unwrap();
         let registration = workflow.register_analysis(&source, None).unwrap();
@@ -3478,6 +3607,19 @@ mod tests {
                 .next_pending_page(&registration.job_dir)
                 .unwrap()
                 .is_none()
+        );
+        let resumed = server
+            .translation_start(Parameters(TranslationStartRequest {
+                job_id: Some(job_id.clone()),
+                ..Default::default()
+            }))
+            .await;
+        let resumed = extract_tool_json(resumed, "preserve-only resume").unwrap();
+        assert_eq!(resumed["status"], "review_ready");
+        assert!(
+            !resumed
+                .to_string()
+                .contains("clean stage was changed after validation")
         );
 
         // The same path handles an SFX-only analysis and records it as
@@ -3762,6 +3904,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(payloads[0].text, "原文");
+        assert_eq!(
+            payloads[0].bubble_bbox,
+            Some(Rect {
+                x1: 0.5,
+                y1: 0.5,
+                x2: 20.0,
+                y2: 20.0,
+            })
+        );
         assert_eq!(payloads[0].needs_review, Some(true));
         assert_eq!(payloads[0].flagged, None);
         assert_eq!(
@@ -3935,7 +4086,9 @@ mod tests {
             max_font_size: None,
             shape: None,
         }];
-        let fallbacks = materialize_bundled_typeset_fonts(&workflow, &job, &mut bubbles).unwrap();
+        let (fallbacks, substitutions) =
+            materialize_bundled_typeset_fonts(&workflow, &job, &mut bubbles).unwrap();
+        assert!(substitutions.is_empty());
         let default = std::path::PathBuf::from(bubbles[0].font_path.as_ref().unwrap());
         assert!(default.starts_with(&job));
         assert_eq!(
@@ -3959,8 +4112,94 @@ mod tests {
         assert!(std::path::Path::new(&fallbacks[1]).starts_with(&job));
         assert!(std::path::Path::new(&fallbacks[2]).starts_with(&job));
 
-        let second = materialize_bundled_typeset_fonts(&workflow, &job, &mut bubbles).unwrap();
+        let (second, substitutions) =
+            materialize_bundled_typeset_fonts(&workflow, &job, &mut bubbles).unwrap();
+        assert!(substitutions.is_empty());
         assert_eq!(second, fallbacks);
         assert_eq!(bubbles[0].font_path.as_deref(), default.to_str());
+    }
+
+    #[test]
+    fn generic_primary_is_substituted_with_bundled_comic_neue() {
+        let dir = tempfile::tempdir().unwrap();
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let job = workflow.root().join("job-id");
+        std::fs::create_dir_all(job.join("fonts")).unwrap();
+        let requested = job.join("fonts").join("Arial.ttf");
+        std::fs::write(&requested, crate::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+        let mut bubbles = vec![TypesetPayload {
+            id: Some("bubble-1".into()),
+            source_text: Some("source".into()),
+            kind: Some("dialogue".into()),
+            preserve_by_default: Some(false),
+            needs_review: None,
+            flagged: None,
+            preserve_source: Some(false),
+            fallback_font_paths: Vec::new(),
+            bbox: Rect {
+                x1: 20.0,
+                y1: 20.0,
+                x2: 460.0,
+                y2: 100.0,
+            },
+            bubble_bbox: None,
+            text_bbox: None,
+            padding: None,
+            text: "Tiếng Việt ❤".into(),
+            font_path: Some(requested.display().to_string()),
+            min_font_size: None,
+            max_font_size: None,
+            shape: None,
+        }];
+        let (fallbacks, substitutions) =
+            materialize_bundled_typeset_fonts(&workflow, &job, &mut bubbles).unwrap();
+        assert_eq!(substitutions.len(), 1);
+        assert_eq!(substitutions[0]["reason"], "generic_desktop_primary");
+        assert_eq!(
+            substitutions[0]["requested_font_path"],
+            requested.display().to_string()
+        );
+        assert!(
+            PathBuf::from(bubbles[0].font_path.as_ref().unwrap())
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with("-ComicNeue-Regular.ttf"))
+        );
+        assert_eq!(fallbacks.len(), 3);
+        let legacy_arial = job.join("fonts").join("0123456789abcdef-Arial.ttf");
+        std::fs::write(&legacy_arial, crate::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+        let ordered_fallbacks = crate::workflow::order_fallback_font_paths(vec![
+            legacy_arial.display().to_string(),
+            fallbacks[0].clone(),
+            fallbacks[1].clone(),
+            fallbacks[2].clone(),
+        ]);
+        assert!(ordered_fallbacks[0].ends_with("PatrickHand-Regular.ttf"));
+        let source = dir.path().join("source.png");
+        let output = dir.path().join("rendered.png");
+        image::RgbImage::from_pixel(480, 120, image::Rgb([255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let report = crate::typeset::typeset_page_with_fallbacks(
+            &source,
+            &bubbles,
+            &ordered_fallbacks,
+            &output,
+        )
+        .unwrap();
+        let runs = report["bubbles"][0]["font_runs"].as_array().unwrap();
+        assert!(runs.iter().any(|run| {
+            run["font_id"]
+                .as_str()
+                .is_some_and(|id| id.ends_with("PatrickHand-Regular.ttf"))
+                && run["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("Tiếng"))
+        }));
+        assert!(runs.iter().any(|run| {
+            run["font_id"]
+                .as_str()
+                .is_some_and(|id| id.ends_with("NotoSansSymbols2-Regular.ttf"))
+                && run["text"] == "❤"
+        }));
     }
 }

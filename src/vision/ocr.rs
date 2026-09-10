@@ -1717,7 +1717,19 @@ impl Pipeline {
                     format!("text-tmp-{}", line_index + 1),
                 )?;
                 text_lines.push(region.clone());
-                unmatched_text.push(region);
+                if is_sentence_like_latin_ocr(&region) {
+                    // A high-confidence Latin sentence outside a detector
+                    // bubble is almost certainly missed dialogue, not a
+                    // short sound effect/label.  Promote it so strict-v1
+                    // carries it through cleaning and typesetting.  Baberu
+                    // can inherit the page's Japanese route prior, so the
+                    // strong Latin evidence also corrects that source tag.
+                    let mut promoted = region;
+                    promoted.source_language = "en".into();
+                    bubbles.push(promoted);
+                } else {
+                    unmatched_text.push(region);
+                }
             }
         }
         // A single page-wide direction keeps the comparator total for mixed
@@ -3128,6 +3140,65 @@ fn aggregate_source(b: &[OcrRegion]) -> String {
     }
 }
 
+/// Conservative promotion evidence for detector-missed Latin dialogue.
+/// Short labels and Japanese/Latin onomatopoeia stay unmatched unless the
+/// OCR has enough words and sentence-like evidence to justify translation.
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+fn is_sentence_like_latin_ocr(region: &OcrRegion) -> bool {
+    const MIN_CONFIDENCE: f32 = 0.70;
+    let text = region.text.trim();
+    if region.confidence < MIN_CONFIDENCE || text.len() < 12 {
+        return false;
+    }
+    let latin_letters = text.chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+    let letters = text.chars().filter(|ch| ch.is_alphabetic()).count();
+    if latin_letters < 10 || letters == 0 || latin_letters * 100 < letters * 65 {
+        return false;
+    }
+    let words = text
+        .split_whitespace()
+        .map(|word| word.trim_matches(|ch: char| !ch.is_ascii_alphabetic()))
+        .filter(|word| !word.is_empty() && word.chars().all(|ch| ch.is_ascii_alphabetic()))
+        .collect::<Vec<_>>();
+    if words.len() < 3 {
+        return false;
+    }
+    let has_sentence_punctuation = text.chars().any(|ch| ".?!,:;'\"".contains(ch));
+    let stopword_hits = words
+        .iter()
+        .filter(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "a" | "an"
+                    | "and"
+                    | "are"
+                    | "but"
+                    | "for"
+                    | "got"
+                    | "he"
+                    | "i"
+                    | "in"
+                    | "is"
+                    | "it"
+                    | "of"
+                    | "on"
+                    | "she"
+                    | "that"
+                    | "the"
+                    | "this"
+                    | "to"
+                    | "up"
+                    | "was"
+                    | "we"
+                    | "were"
+                    | "with"
+                    | "you"
+            )
+        })
+        .count();
+    has_sentence_punctuation || stopword_hits >= 2
+}
+
 #[cfg(feature = "onnx")]
 fn rect_iou(a: Rect, b: Rect) -> f32 {
     let x1 = a.x1.max(b.x1);
@@ -3433,6 +3504,57 @@ mod tests {
             inferred_language("Latin", RecognizerKind::English, "Hello"),
             "en"
         );
+    }
+
+    #[test]
+    fn unmatched_latin_sentence_evidence_is_conservative() {
+        let region = |text: &str, confidence: f32| OcrRegion {
+            id: "text-1".into(),
+            bbox: Rect {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 20.0,
+                y2: 20.0,
+            },
+            text: text.into(),
+            source_language: "ja".into(),
+            script: "Latin".into(),
+            recognizer: RecognizerKind::Baberu.as_str().into(),
+            confidence,
+            uncertainty: 1.0 - confidence,
+            detector_label: 2,
+            detector_confidence: 0.9,
+            reading_order: 0,
+            vision_correction: VisionCorrection {
+                image_path: "page.webp".into(),
+                bbox: Rect {
+                    x1: 0.0,
+                    y1: 0.0,
+                    x2: 20.0,
+                    y2: 20.0,
+                },
+                contract: "source-image-bbox",
+            },
+        };
+        assert!(is_sentence_like_latin_ocr(&region(
+            "GOT CAUGHT UP IN THIS BUT",
+            0.88
+        )));
+        assert!(!is_sentence_like_latin_ocr(&region("NEW", 0.99)));
+        assert!(!is_sentence_like_latin_ocr(&region("フワッ", 0.99)));
+        assert!(!is_sentence_like_latin_ocr(&region(
+            "SPECIAL OFFER TODAY",
+            0.99
+        )));
+        assert!(!is_sentence_like_latin_ocr(&region(
+            "GOT CAUGHT UP IN THIS BUT",
+            0.55
+        )));
+        assert!(!is_sentence_like_latin_ocr(&region(
+            "BANG BANG BANG BANG",
+            0.99
+        )));
+        assert!(!is_sentence_like_latin_ocr(&region("HA HA HA HA", 0.99)));
     }
     #[cfg(feature = "onnx")]
     #[test]

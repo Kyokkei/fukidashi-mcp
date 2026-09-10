@@ -200,10 +200,8 @@ impl LayoutMask {
             for (x, inside) in row.iter().copied().enumerate() {
                 if inside && start.is_none() {
                     start = Some(x as i32 + self.origin_x);
-                } else if !inside {
-                    if let Some(start) = start.take() {
-                        runs.push((start, x as i32 + self.origin_x));
-                    }
+                } else if !inside && let Some(start) = start.take() {
+                    runs.push((start, x as i32 + self.origin_x));
                 }
             }
             if let Some(start) = start {
@@ -550,9 +548,9 @@ impl<'a> MultiShaper<'a> {
         }
         for (index, candidate) in self.fonts.iter().enumerate() {
             if let Some(face) = Face::from_slice(candidate.bytes, 0) {
-                let all_covered = alphabetic_chars.iter().all(|c| {
-                    face.glyph_index(*c).is_some_and(|glyph| glyph.0 != 0)
-                });
+                let all_covered = alphabetic_chars
+                    .iter()
+                    .all(|c| face.glyph_index(*c).is_some_and(|glyph| glyph.0 != 0));
                 if all_covered {
                     return index;
                 }
@@ -1196,6 +1194,7 @@ fn solve_lines(
     Ok(best)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn available_width(
     bbox: Rect,
     cx: f32,

@@ -744,10 +744,7 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
         initial_report["bubbles"][0]["fallback_fonts_used"][0],
         resolved_fallback.display().to_string()
     );
-    assert_eq!(
-        initial_report["bubbles"][0]["font_fallback_used"],
-        true
-    );
+    assert_eq!(initial_report["bubbles"][0]["font_fallback_used"], true);
     assert_eq!(
         initial_report["bubbles"][0]["mixed_font_fallback_used"],
         false

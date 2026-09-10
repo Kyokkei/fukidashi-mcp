@@ -1467,13 +1467,17 @@ impl Workflow {
         save_gray_image_atomic(&paths.mask, &GrayImage::new(dimensions.0, dimensions.1))
             .context("write pass-through clean mask")?;
         let source_sha256 = sha256_file(&source)?;
+        // Pass-through images are decoded and re-encoded as PNG.  Their bytes
+        // therefore intentionally differ from the source (which is often
+        // WebP), so the clean-stage hash must describe the artifact we wrote.
+        let cleaned_sha256 = sha256_file(&paths.cleaned)?;
         let artifact = CleanArtifact {
             stage: "cleaned".into(),
             source_image: source.clone(),
             cleaned_image: paths.cleaned.clone(),
             mask_path: paths.mask.clone(),
             source_sha256: source_sha256.clone(),
-            cleaned_sha256: source_sha256,
+            cleaned_sha256,
             masked_pixels: 0,
             changed_masked_pixels: 0,
             changed_ratio: 1.0,
@@ -2244,6 +2248,96 @@ pub fn configured_font_paths() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Return whether a font filename names a generic desktop UI face that is
+/// unsuitable as a comic bubble's requested primary.  These faces remain
+/// eligible in the last-resort fallback pool; this predicate is only for the
+/// primary selection boundary.
+pub fn is_generic_desktop_font(path: &Path) -> bool {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_generic_name = |name: &str| {
+        matches!(
+            name,
+            "arial"
+                | "ariali"
+                | "arialb"
+                | "arialbd"
+                | "arialbi"
+                | "arialbold"
+                | "calibri"
+                | "calibrib"
+                | "calibrii"
+                | "calibriz"
+                | "calibril"
+                | "calibrili"
+                | "segoeui"
+                | "segoeuib"
+                | "segoeuii"
+                | "segoeuiz"
+                | "seguisym"
+                | "tahoma"
+                | "tahomabd"
+                | "verdana"
+                | "verdanab"
+                | "verdanai"
+                | "verdanaz"
+                | "times"
+                | "timesbd"
+                | "timesbi"
+                | "timesi"
+                | "timesnewroman"
+                | "timesnewromanpsmt"
+                | "dejavusans"
+                | "dejavusansbold"
+                | "dejavusansoblique"
+                | "dejavusanscondensed"
+                | "arial-bold"
+                | "arial-regular"
+                | "calibri-bold"
+                | "calibri-regular"
+                | "segoe-ui"
+                | "tahoma-bold"
+                | "verdana-bold"
+                | "times-new-roman"
+                | "dejavu-sans"
+        )
+    };
+    if is_generic_name(&stem) {
+        return true;
+    }
+    // Managed font copies are named `<content-hash>-<original-basename>`.
+    // Require a hexadecimal prefix before treating a suffix as the original
+    // family, so names such as `MyArialComic.ttf` or `My-Arial.ttf` remain
+    // legitimate custom fonts.
+    stem.split_once('-').is_some_and(|(prefix, suffix)| {
+        prefix.len() >= 8
+            && prefix
+                .chars()
+                .all(|character| character.is_ascii_hexdigit())
+            && is_generic_name(suffix)
+    })
+}
+
+/// Keep generic desktop faces available for coverage, but after bundled and
+/// user-provided comic fallbacks so they cannot become the Vietnamese bubble
+/// face merely because an old sidecar listed one first.
+pub fn order_fallback_font_paths(paths: Vec<String>) -> Vec<String> {
+    let mut preferred = Vec::with_capacity(paths.len());
+    let mut generic = Vec::new();
+    for path in paths {
+        if is_generic_desktop_font(Path::new(&path)) {
+            generic.push(path);
+        } else {
+            preferred.push(path);
+        }
+    }
+    preferred.extend(generic);
+    preferred
+}
+
 pub fn paths_same_public(left: &Path, right: &Path) -> Result<bool> {
     paths_same(left, right)
 }
@@ -2765,6 +2859,69 @@ mod tests {
         assert_eq!(payload["percent"], 66.7);
         assert_eq!(payload["stage"], "Typesetting dialogue...");
         assert_eq!(page_progress_percent(0, 0), 0.0);
+    }
+
+    #[test]
+    fn generic_desktop_faces_are_primary_only_denylisted() {
+        assert!(is_generic_desktop_font(Path::new(
+            "C:/Windows/Fonts/Arial.ttf"
+        )));
+        assert!(is_generic_desktop_font(Path::new(
+            "C:/Windows/Fonts/segoeui.ttf"
+        )));
+        assert!(is_generic_desktop_font(Path::new(
+            "C:/Windows/Fonts/DejaVuSans.ttf"
+        )));
+        assert!(is_generic_desktop_font(Path::new(
+            "C:/jobs/fonts/0123456789abcdef-Arial.ttf"
+        )));
+        assert!(is_generic_desktop_font(Path::new(
+            "C:/jobs/fonts/0123456789abcdef-Arial-Bold.ttf"
+        )));
+        assert!(!is_generic_desktop_font(Path::new(
+            "C:/fonts/ComicNeue-Regular.ttf"
+        )));
+        assert!(!is_generic_desktop_font(Path::new(
+            "C:/fonts/MyArialComic.ttf"
+        )));
+        assert!(!is_generic_desktop_font(Path::new(
+            "C:/fonts/PatrickHand-Regular.ttf"
+        )));
+    }
+
+    #[test]
+    fn generic_fallbacks_are_relegated_after_comic_faces() {
+        let ordered = order_fallback_font_paths(vec![
+            "C:/jobs/fonts/0123456789abcdef-Arial.ttf".into(),
+            "C:/fonts/PatrickHand-Regular.ttf".into(),
+            "C:/fonts/NotoSansSymbols2-Regular.ttf".into(),
+        ]);
+        assert_eq!(
+            ordered,
+            [
+                "C:/fonts/PatrickHand-Regular.ttf",
+                "C:/fonts/NotoSansSymbols2-Regular.ttf",
+                "C:/jobs/fonts/0123456789abcdef-Arial.ttf"
+            ]
+        );
+    }
+
+    #[test]
+    fn passthrough_clean_hash_describes_reencoded_png() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("cover.webp");
+        let source_image = RgbaImage::from_pixel(12, 9, Rgba([240, 240, 240, 255]));
+        image::DynamicImage::ImageRgba8(source_image)
+            .save_with_format(&source, image::ImageFormat::WebP)
+            .unwrap();
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        workflow.register_analysis(&source, None).unwrap();
+        let (cleaned, _, _) = workflow.write_passthrough_clean_artifact(&source).unwrap();
+        let artifact = workflow.validate_clean_input(&cleaned).unwrap();
+        assert!(artifact.passthrough);
+        assert_eq!(artifact.source_sha256, sha256_file(&source).unwrap());
+        assert_eq!(artifact.cleaned_sha256, sha256_file(&cleaned).unwrap());
+        assert_ne!(artifact.source_sha256, artifact.cleaned_sha256);
     }
 
     #[test]

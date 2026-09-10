@@ -1188,12 +1188,12 @@ fn safe_project_path(root: &Path, raw: &str) -> Result<PathBuf> {
 
 fn safe_font_path(root: &Path, raw: &str) -> Result<PathBuf> {
     let input = PathBuf::from(raw);
-    if input.is_file() {
-        if let Some(ext) = input.extension().and_then(|e| e.to_str()) {
-            let ext = ext.to_ascii_lowercase();
-            if matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "woff" | "woff2") {
-                return Ok(input);
-            }
+    if input.is_file()
+        && let Some(ext) = input.extension().and_then(|e| e.to_str())
+    {
+        let ext = ext.to_ascii_lowercase();
+        if matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "woff" | "woff2") {
+            return Ok(input);
         }
     }
     safe_project_path(root, raw)
@@ -1609,6 +1609,22 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         }
     }
     let fallback_font_paths = unique_fallback_font_paths;
+    let bundled_primary =
+        workflow.materialize_bundled_font(&session.root_dir, &crate::fonts::COMIC_NEUE_REGULAR)?;
+    let bundled_fallback_paths = crate::fonts::bundled_fallbacks()
+        .into_iter()
+        .map(|font| {
+            workflow
+                .materialize_bundled_font(&session.root_dir, font)
+                .map(|path| path.display().to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let bundled_primary = bundled_primary.display().to_string();
+    let mut fallback_font_paths = fallback_font_paths;
+    fallback_font_paths.extend(bundled_fallback_paths);
+    fallback_font_paths.dedup();
+    let fallback_font_paths = crate::workflow::order_fallback_font_paths(fallback_font_paths);
+    let mut font_substitutions = Vec::new();
     let mut payloads = Vec::with_capacity(bubbles.len());
     for (bubble_index, bubble) in bubbles.iter().enumerate() {
         let bubble_id = bubble.get("id").and_then(Value::as_str);
@@ -1643,17 +1659,19 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 needs_review: bubble.get("needs_review").and_then(Value::as_bool),
                 flagged: bubble.get("flagged").and_then(Value::as_bool),
                 preserve_source: Some(true),
-                fallback_font_paths: bubble
-                    .get("fallback_font_paths")
-                    .and_then(Value::as_array)
-                    .map(|paths| {
-                        paths
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                fallback_font_paths: crate::workflow::order_fallback_font_paths(
+                    bubble
+                        .get("fallback_font_paths")
+                        .and_then(Value::as_array)
+                        .map(|paths| {
+                            paths
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ),
                 bbox,
                 bubble_bbox: bubble
                     .get("bubble_bbox")
@@ -1687,17 +1705,36 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 "bubble {bubble_index} has an empty translation; use Preserve original / remove translation box"
             );
         }
-        let font_path = bubble
+        let requested_font_path = bubble
             .get("font_path")
             .and_then(Value::as_str)
             .or_else(|| bubble.get("rendered_font_path").and_then(Value::as_str))
             .or(global_font)
-            .ok_or_else(|| anyhow!("bubble {bubble_index} has no project font_path"))?;
-        let font_path = safe_font_path(&session.root_dir, font_path)?;
+            .filter(|path| !path.trim().is_empty());
+        let (font_path, substitution_reason) = match requested_font_path {
+            Some(path) if crate::workflow::is_generic_desktop_font(std::path::Path::new(path)) => (
+                PathBuf::from(&bundled_primary),
+                Some("generic_desktop_primary"),
+            ),
+            Some(path) => (safe_font_path(&session.root_dir, path)?, None),
+            None => (PathBuf::from(&bundled_primary), Some("missing_primary")),
+        };
         let font_size = bubble
             .get("font_size")
             .and_then(Value::as_f64)
             .map(|v| v as f32);
+        let render_index = payloads.len();
+        if let Some(reason) = substitution_reason {
+            let mut substitution = serde_json::json!({
+                "index": render_index,
+                "replacement_primary_font": font_path.display().to_string(),
+                "reason": reason,
+            });
+            if let Some(requested) = requested_font_path {
+                substitution["requested_font_path"] = Value::String(requested.to_owned());
+            }
+            font_substitutions.push(substitution);
+        }
         payloads.push(TypesetPayload {
             id: bubble_id.map(str::to_owned),
             source_text: bubble
@@ -1713,17 +1750,19 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             needs_review: bubble.get("needs_review").and_then(Value::as_bool),
             flagged: bubble.get("flagged").and_then(Value::as_bool),
             preserve_source: Some(false),
-            fallback_font_paths: bubble
-                .get("fallback_font_paths")
-                .and_then(Value::as_array)
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
+            fallback_font_paths: crate::workflow::order_fallback_font_paths(
+                bubble
+                    .get("fallback_font_paths")
+                    .and_then(Value::as_array)
+                    .map(|paths| {
+                        paths
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            ),
             bbox,
             bubble_bbox: bubble
                 .get("bubble_bbox")
@@ -1763,12 +1802,40 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         .parent()
         .unwrap_or(&session.root_dir)
         .join("rendered.png");
-    let report = crate::typeset::typeset_page_with_fallbacks(
+    let mut report = crate::typeset::typeset_page_with_fallbacks(
         &source,
         &payloads,
         &fallback_font_paths,
         &output,
     )?;
+    if !font_substitutions.is_empty() {
+        let mut substitutions = font_substitutions.clone();
+        if let Some(reports) = report["bubbles"].as_array_mut() {
+            for substitution in &mut substitutions {
+                let Some(index) = substitution
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                else {
+                    continue;
+                };
+                let Some(bubble_report) = reports.get_mut(index).and_then(Value::as_object_mut)
+                else {
+                    continue;
+                };
+                if let Some(resolved) = bubble_report.get("resolved_font_path").cloned() {
+                    substitution["resolved_font_path"] = resolved;
+                }
+                for key in ["requested_font_path", "replacement_primary_font", "reason"] {
+                    if let Some(value) = substitution.get(key) {
+                        bubble_report.insert(key.to_owned(), value.clone());
+                    }
+                }
+                bubble_report.insert("font_substituted".into(), Value::Bool(true));
+            }
+        }
+        report["font_substitutions"] = Value::Array(substitutions);
+    }
     workflow.register_render_locked(
         &output,
         &workflow.validate_clean_input(&source)?,
@@ -1863,14 +1930,14 @@ fn parse_stroke_color(stroke: &Value) -> image::Rgb<u8> {
             ) {
                 return image::Rgb([r, g, b]);
             }
-        } else if hex.len() == 3 {
-            if let (Ok(r), Ok(g), Ok(b)) = (
+        } else if hex.len() == 3
+            && let (Ok(r), Ok(g), Ok(b)) = (
                 u8::from_str_radix(&hex[0..1], 16),
                 u8::from_str_radix(&hex[1..2], 16),
                 u8::from_str_radix(&hex[2..3], 16),
-            ) {
-                return image::Rgb([r * 17, g * 17, b * 17]);
-            }
+            )
+        {
+            return image::Rgb([r * 17, g * 17, b * 17]);
         }
     }
     image::Rgb([255, 255, 255])
