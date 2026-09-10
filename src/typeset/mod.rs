@@ -66,6 +66,15 @@ pub fn typeset_page_with_fallbacks(
     // an earlier bubble must not alter the pixels used to isolate a later,
     // overlapping bubble.
     let mask_source = image.clone();
+    let balloon_areas = bubbles
+        .iter()
+        .map(|payload| {
+            payload
+                .bubble_bbox
+                .filter(|area| valid_balloon_rect(*area))
+                .unwrap_or(payload.bbox)
+        })
+        .collect::<Vec<_>>();
     let mut reports = Vec::with_capacity(bubbles.len());
     for (index, payload) in bubbles.iter().enumerate() {
         payload.validate_text_color()?;
@@ -109,18 +118,14 @@ pub fn typeset_page_with_fallbacks(
         let min = payload.min_font_size.unwrap_or(8.0);
         let max = payload.max_font_size.unwrap_or(72.0);
         let shape = payload.shape.as_deref().unwrap_or("ellipse");
-        let balloon_area = payload
-            .bubble_bbox
-            .filter(|area| {
-                area.x1.is_finite()
-                    && area.y1.is_finite()
-                    && area.x2.is_finite()
-                    && area.y2.is_finite()
-                    && area.x2 > area.x1
-                    && area.y2 > area.y1
-            })
-            .unwrap_or(rect);
-        let balloon_mask = infer_balloon_mask(&mask_source, balloon_area, payload.text_bbox);
+        let balloon_area = balloon_areas[index];
+        let balloon_mask = infer_balloon_mask_owned(
+            &mask_source,
+            balloon_area,
+            payload.text_bbox,
+            &balloon_areas,
+            index,
+        );
         let layout = fit_text_with_font_candidates_masked(
             &candidates,
             &payload.text,
@@ -231,10 +236,21 @@ pub fn typeset_page_with_fallbacks(
 /// rectangles overlap, the component boundary in the cleaned page decides
 /// which pixels belong to this bubble.  A broad unbounded white page is
 /// rejected and falls back to the existing rectangle/ellipse geometry.
+#[cfg(test)]
 fn infer_balloon_mask(
     image: &RgbaImage,
     area: crate::domain::Rect,
     anchor: Option<crate::domain::Rect>,
+) -> Option<LayoutMask> {
+    infer_balloon_mask_owned(image, area, anchor, &[], 0)
+}
+
+fn infer_balloon_mask_owned(
+    image: &RgbaImage,
+    area: crate::domain::Rect,
+    anchor: Option<crate::domain::Rect>,
+    all_areas: &[crate::domain::Rect],
+    current_index: usize,
 ) -> Option<LayoutMask> {
     let area = area.clip(image.width() as f32, image.height() as f32)?;
     let origin_x = area.x1.floor().max(0.0) as u32;
@@ -273,7 +289,12 @@ fn infer_balloon_mask(
     };
     let binary = luminance
         .iter()
-        .map(|value| *value >= threshold)
+        .enumerate()
+        .map(|(index, value)| {
+            let x = origin_x + (index % width) as u32;
+            let y = origin_y + (index / width) as u32;
+            *value >= threshold && point_in_rect(x, y, area)
+        })
         .collect::<Vec<_>>();
     let anchor = anchor
         .filter(|rect| {
@@ -322,6 +343,24 @@ fn infer_balloon_mask(
             }
         }
     }
+    if !all_areas.is_empty() {
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                if component[index]
+                    && !pixel_owned_by_center(
+                        origin_x + x as u32,
+                        origin_y + y as u32,
+                        area,
+                        all_areas,
+                        current_index,
+                    )
+                {
+                    component[index] = false;
+                }
+            }
+        }
+    }
     let component_pixels = component.iter().filter(|inside| **inside).count();
     if component_pixels < 24 {
         return None;
@@ -367,7 +406,67 @@ fn infer_balloon_mask(
     if component_pixels * 100 < width.saturating_mul(height).saturating_mul(4) {
         return None;
     }
+    let ellipse_area = std::f32::consts::PI * (area.x2 - area.x1) * (area.y2 - area.y1) * 0.25;
+    if (component_pixels as f32) < ellipse_area * 0.35 {
+        return None;
+    }
     LayoutMask::from_binary(origin_x as i32, origin_y as i32, width, height, component).ok()
+}
+
+fn valid_balloon_rect(rect: crate::domain::Rect) -> bool {
+    rect.x1.is_finite()
+        && rect.y1.is_finite()
+        && rect.x2.is_finite()
+        && rect.y2.is_finite()
+        && rect.x2 > rect.x1
+        && rect.y2 > rect.y1
+}
+
+fn point_in_rect(x: u32, y: u32, rect: crate::domain::Rect) -> bool {
+    let x = x as f32 + 0.5;
+    let y = y as f32 + 0.5;
+    x >= rect.x1 && x < rect.x2 && y >= rect.y1 && y < rect.y2
+}
+
+fn pixel_owned_by_center(
+    x: u32,
+    y: u32,
+    current_area: crate::domain::Rect,
+    all_areas: &[crate::domain::Rect],
+    current_index: usize,
+) -> bool {
+    if !point_in_rect(x, y, current_area) {
+        return false;
+    }
+    let px = x as f32 + 0.5;
+    let py = y as f32 + 0.5;
+    let current_center = (
+        (current_area.x1 + current_area.x2) * 0.5,
+        (current_area.y1 + current_area.y2) * 0.5,
+    );
+    let current_distance = (px - current_center.0).powi(2) + (py - current_center.1).powi(2);
+    let mut owner = current_index;
+    let mut owner_distance = current_distance;
+    for (index, other) in all_areas.iter().copied().enumerate() {
+        if index == current_index
+            || !valid_balloon_rect(other)
+            || !point_in_rect(x, y, other)
+            || !rects_overlap(current_area, other)
+        {
+            continue;
+        }
+        let center = ((other.x1 + other.x2) * 0.5, (other.y1 + other.y2) * 0.5);
+        let distance = (px - center.0).powi(2) + (py - center.1).powi(2);
+        if distance < owner_distance || (distance == owner_distance && index < owner) {
+            owner = index;
+            owner_distance = distance;
+        }
+    }
+    owner == current_index
+}
+
+fn rects_overlap(left: crate::domain::Rect, right: crate::domain::Rect) -> bool {
+    left.x1 < right.x2 && left.x2 > right.x1 && left.y1 < right.y2 && left.y2 > right.y1
 }
 
 fn payload_skip_reason(payload: &TypesetPayload) -> Option<&'static str> {
@@ -1025,6 +1124,54 @@ mod tests {
             y2: 60.0,
         };
         assert!(infer_balloon_mask(&image, area, None).is_none());
+    }
+
+    fn draw_ellipse(image: &mut RgbaImage, bbox: Rect) {
+        let center = ((bbox.x1 + bbox.x2) * 0.5, (bbox.y1 + bbox.y2) * 0.5);
+        let radius = ((bbox.x2 - bbox.x1) * 0.5, (bbox.y2 - bbox.y1) * 0.5);
+        for y in bbox.y1 as u32..bbox.y2 as u32 {
+            for x in bbox.x1 as u32..bbox.x2 as u32 {
+                let dx = (x as f32 + 0.5 - center.0) / radius.0;
+                let dy = (y as f32 + 0.5 - center.1) / radius.1;
+                let distance = dx * dx + dy * dy;
+                if distance <= 1.0 {
+                    image.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+                }
+                if (0.92..=1.08).contains(&distance) {
+                    image.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_ellipse_masks_split_pixels_by_nearest_center() {
+        let upper = Rect {
+            x1: 20.0,
+            y1: 18.0,
+            x2: 120.0,
+            y2: 88.0,
+        };
+        let lower = Rect {
+            x1: 70.0,
+            y1: 45.0,
+            x2: 170.0,
+            y2: 115.0,
+        };
+        let mut image = RgbaImage::from_pixel(192, 132, Rgba([24, 24, 24, 255]));
+        draw_ellipse(&mut image, upper);
+        draw_ellipse(&mut image, lower);
+        let areas = [upper, lower];
+        let upper_mask = infer_balloon_mask_owned(&image, upper, None, &areas, 0)
+            .expect("upper ellipse should have a safe interior");
+        let lower_mask = infer_balloon_mask_owned(&image, lower, None, &areas, 1)
+            .expect("lower ellipse should have a safe interior");
+        // This point lies inside both detector rectangles, but closer to the
+        // lower centre. It must not remain available to the upper layout.
+        assert!(!upper_mask.contains_pixel(100, 65));
+        assert!(lower_mask.contains_pixel(100, 65));
+        assert!(upper_mask.bounds().expect("upper bounds").x2 <= upper.x2);
+        assert!(lower_mask.bounds().expect("lower bounds").x1 >= lower.x1);
     }
 
     #[test]

@@ -186,6 +186,12 @@ fn editor_gallery_variants_and_render_endpoint_are_constrained() {
         "textColor",
         "data-state-field=\"text_color\"",
         "b.text_color",
+        "#38bdf8",
+        ".bubble-box .handle",
+        "initialBubbleBBox",
+        "item.bubble_bbox={...item.bbox}",
+        "b.bubble_bbox={...b.bbox}",
+        "if(dragging)return",
         "kind==='bubble'",
         "kind==='issue'",
         "dragging.kind",
@@ -855,6 +861,16 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
         "size": 8,
         "points": [{"x": 116, "y": 116}]
     }]);
+    let moved_bbox = json!({"x1": 24.0, "y1": 12.0, "x2": 88.0, "y2": 100.0});
+    edited["pages"][0]["bubbles"][0]["bbox"] = moved_bbox.clone();
+    // Deliberately leave stale detector geometry behind: editor rendering
+    // must use the operator bbox as the containing geometry.
+    edited["pages"][0]["bubbles"][0]["bubble_bbox"] = json!({
+        "x1": 8.0,
+        "y1": 8.0,
+        "x2": 72.0,
+        "y2": 92.0
+    });
     let save = request(
         host,
         &format!("/{token}/save"),
@@ -887,6 +903,8 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
         rerender["typeset"]["bubbles"][1]["skip_reason"],
         "preserve_source"
     );
+    assert_eq!(rerender["typeset"]["bubbles"][0]["input_bbox"], moved_bbox);
+    assert_eq!(rerender["typeset"]["bubbles"][0]["bubble_bbox"], moved_bbox);
 
     let approve = json!({
         "revision": result["review_revision"],

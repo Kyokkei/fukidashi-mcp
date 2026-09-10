@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 const CLEAN_SIDECAR_SUFFIX: &str = ".fukidashi-clean.json";
 const RENDER_SIDECAR_SUFFIX: &str = ".fukidashi-render.json";
+const LORE_FILE_NAME: &str = "lore.json";
 const LEGACY_MANIFEST_NAME: &str = ".fukidashi-job.json";
 const MANIFEST_NAME: &str = "job.json";
 const MAX_INGRESS_PAGES: usize = 500;
@@ -120,6 +121,78 @@ pub struct Registration {
     pub job_dir: PathBuf,
     pub expected_pages: Vec<PathBuf>,
     pub page_state: String,
+}
+
+/// Client-authored translation context. Unknown top-level fields are retained
+/// so newer clients can add lore without making older servers discard it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LoreDocument {
+    #[serde(default = "default_lore_schema")]
+    pub schema: u32,
+    #[serde(default)]
+    pub characters: Vec<LoreCharacter>,
+    #[serde(default)]
+    pub pronouns: Vec<LorePronoun>,
+    #[serde(default)]
+    pub glossary: Vec<LoreGlossaryEntry>,
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LoreCharacter {
+    pub id: String,
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub notes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LorePronoun {
+    pub speaker: String,
+    pub addressee: String,
+    pub pair: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LoreGlossaryEntry {
+    pub source: String,
+    pub target: String,
+}
+
+fn default_lore_schema() -> u32 {
+    1
+}
+
+impl LoreDocument {
+    fn validate(self) -> Result<Self> {
+        if self.schema == 0 {
+            bail!("lore schema must be a positive integer");
+        }
+        for character in &self.characters {
+            if character.id.trim().is_empty() {
+                bail!("lore character id must not be empty");
+            }
+            if character.names.iter().any(|name| name.trim().is_empty()) {
+                bail!("lore character names must not be empty");
+            }
+        }
+        for pronoun in &self.pronouns {
+            if pronoun.speaker.trim().is_empty()
+                || pronoun.addressee.trim().is_empty()
+                || pronoun.pair.trim().is_empty()
+            {
+                bail!("lore pronoun entries require speaker, addressee, and pair");
+            }
+        }
+        for entry in &self.glossary {
+            if entry.source.trim().is_empty() || entry.target.trim().is_empty() {
+                bail!("lore glossary entries require source and target");
+            }
+        }
+        Ok(self)
+    }
 }
 
 /// One image already staged by an ingress provider. The workflow validates
@@ -265,6 +338,30 @@ impl Workflow {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Read the canonical job lore, returning an empty valid template when a
+    /// job has not received client-authored context yet.
+    pub fn read_lore(&self, job: &Path) -> Result<serde_json::Value> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let path = job.join(LORE_FILE_NAME);
+        if !path.is_file() {
+            return Ok(default_lore_value());
+        }
+        let value: serde_json::Value = serde_json::from_slice(
+            &fs::read(&path).with_context(|| format!("read lore {}", path.display()))?,
+        )
+        .with_context(|| format!("parse lore {}", path.display()))?;
+        validate_lore_value(value)
+    }
+
+    /// Validate and atomically persist client-authored lore in the selected
+    /// managed job. The returned value is normalized only by serde defaults.
+    pub fn write_lore(&self, job: &Path, value: &serde_json::Value) -> Result<serde_json::Value> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let value = validate_lore_value(value.clone())?;
+        atomic_json(&job.join(LORE_FILE_NAME), &value)?;
+        Ok(value)
     }
 
     /// Return the server-owned per-page paths for a registered source image.
@@ -1839,6 +1936,29 @@ impl Workflow {
     }
 }
 
+fn default_lore_value() -> serde_json::Value {
+    serde_json::to_value(LoreDocument {
+        schema: default_lore_schema(),
+        characters: Vec::new(),
+        pronouns: Vec::new(),
+        glossary: Vec::new(),
+        extra: std::collections::BTreeMap::new(),
+    })
+    .expect("default lore serializes")
+}
+
+fn validate_lore_value(value: serde_json::Value) -> Result<serde_json::Value> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("lore must be a JSON object"))?;
+    if object.get("schema").is_some_and(serde_json::Value::is_null) {
+        bail!("lore schema must be a positive integer");
+    }
+    let document: LoreDocument = serde_json::from_value(value)
+        .context("lore must match the forward-compatible lore schema")?;
+    serde_json::to_value(document.validate()?).context("serialize validated lore")
+}
+
 pub fn clean_sidecar(path: &Path) -> PathBuf {
     PathBuf::from(format!("{}{}", path.display(), CLEAN_SIDECAR_SUFFIX))
 }
@@ -2859,6 +2979,39 @@ mod tests {
         assert_eq!(payload["percent"], 66.7);
         assert_eq!(payload["stage"], "Typesetting dialogue...");
         assert_eq!(page_progress_percent(0, 0), 0.0);
+    }
+
+    #[test]
+    fn lore_is_validated_atomically_and_keeps_forward_fields() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("page.png");
+        RgbaImage::from_pixel(16, 16, Rgba([255, 255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+        assert_eq!(
+            workflow.read_lore(&registration.job_dir).unwrap()["schema"],
+            1
+        );
+        let authored = json!({
+            "schema": 1,
+            "characters": [{"id":"lisa","names":["Lisa"],"notes":"manager"}],
+            "pronouns": [{"speaker":"lisa","addressee":"senpai","pair":"cậu/tớ"}],
+            "glossary": [{"source":"manager","target":"quản lý"}],
+            "future_extension": {"voice": "dry"}
+        });
+        let saved = workflow
+            .write_lore(&registration.job_dir, &authored)
+            .unwrap();
+        assert_eq!(saved["future_extension"]["voice"], "dry");
+        assert_eq!(workflow.read_lore(&registration.job_dir).unwrap(), saved);
+        assert!(
+            workflow
+                .write_lore(&registration.job_dir, &json!({"schema": 0}))
+                .is_err()
+        );
+        assert!(registration.job_dir.join("lore.json").is_file());
     }
 
     #[test]

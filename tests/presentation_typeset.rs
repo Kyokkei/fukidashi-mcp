@@ -122,6 +122,70 @@ fn auto_ink_uses_clean_center_median_and_explicit_overrides() {
 }
 
 #[test]
+fn gray_screentone_hole_uses_the_detector_ellipse_envelope() {
+    let dir = tempdir().unwrap();
+    let font_path = dir.path().join("ComicNeue-Regular.ttf");
+    fs::write(&font_path, fukidashi_mcp::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+    let source = dir.path().join("screentone.png");
+    let output = dir.path().join("screentone-rendered.png");
+    let bubble = Rect {
+        x1: 10.0,
+        y1: 10.0,
+        x2: 270.0,
+        y2: 390.0,
+    };
+    let mut image = ImageBuffer::from_pixel(280, 400, Rgba::<u8>([148, 148, 148, 255]));
+    for y in 10..390 {
+        for x in 10..270 {
+            if (x + y) % 5 == 0 {
+                image.put_pixel(x, y, Rgba([126, 126, 126, 255]));
+            }
+        }
+    }
+    for y in 180..220 {
+        for x in 120..160 {
+            image.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+        }
+    }
+    image.save(&source).unwrap();
+    let report = fukidashi_mcp::typeset::typeset_page(
+        &source,
+        &[TypesetPayload {
+            id: Some("screentone".into()),
+            source_text: Some("source".into()),
+            kind: Some("dialogue".into()),
+            preserve_by_default: Some(false),
+            needs_review: None,
+            flagged: None,
+            preserve_source: Some(false),
+            fallback_font_paths: Vec::new(),
+            bbox: bubble,
+            bubble_bbox: Some(bubble),
+            text_bbox: Some(Rect {
+                x1: 105.0,
+                y1: 170.0,
+                x2: 175.0,
+                y2: 230.0,
+            }),
+            padding: Some(8.0),
+            text: "ĐẶC BIỆT".into(),
+            font_path: Some(font_path.display().to_string()),
+            min_font_size: Some(8.0),
+            max_font_size: Some(72.0),
+            text_color: None,
+            shape: Some("ellipse".into()),
+        }],
+        &output,
+    )
+    .unwrap();
+    let bubble_report = &report["bubbles"][0];
+    assert_eq!(bubble_report["mask_used"], false);
+    assert!(bubble_report["font_size"].as_f64().unwrap() > 16.0);
+    assert!(bubble_report["safe_bbox"]["x2"].as_f64().unwrap() > 220.0);
+    assert!(bubble_report["safe_bbox"]["y2"].as_f64().unwrap() > 330.0);
+}
+
+#[test]
 fn text_color_is_legacy_optional_and_rejects_unknown_values() {
     let legacy: TypesetPayload = serde_json::from_value(serde_json::json!({
         "bbox": {"x1": 1.0, "y1": 1.0, "x2": 8.0, "y2": 8.0},

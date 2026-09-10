@@ -135,6 +135,8 @@ async fn rmcp_surface_lists_tools_and_reports_tool_errors() -> anyhow::Result<()
     assert!(names.contains(&"fukidashi_typeset"));
     assert!(names.contains(&"fukidashi_translation_start"));
     assert!(names.contains(&"fukidashi_translation_submit"));
+    assert!(names.contains(&"fukidashi_get_lore"));
+    assert!(names.contains(&"fukidashi_put_lore"));
     assert!(names.contains(&"fukidashi_serve_editor"));
     assert!(names.contains(&"fukidashi_wait_for_review"));
     assert!(names.contains(&"fukidashi_review_and_export"));

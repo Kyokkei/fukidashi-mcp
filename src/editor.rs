@@ -1674,12 +1674,10 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                         .unwrap_or_default(),
                 ),
                 bbox,
-                bubble_bbox: bubble
-                    .get("bubble_bbox")
-                    .filter(|value| !value.is_null())
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()?,
+                // The operator's current bbox is authoritative during an
+                // editor render; stale detector geometry must not snap text
+                // back into its original balloon.
+                bubble_bbox: Some(bbox),
                 text_bbox: bubble
                     .get("text_bbox")
                     .filter(|value| !value.is_null())
@@ -1769,12 +1767,9 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                     .unwrap_or_default(),
             ),
             bbox,
-            bubble_bbox: bubble
-                .get("bubble_bbox")
-                .filter(|value| !value.is_null())
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()?,
+            // Keep the containing geometry synchronized with the editable
+            // bbox so rerendering honors a move or resize.
+            bubble_bbox: Some(bbox),
             text_bbox: bubble
                 .get("text_bbox")
                 .filter(|value| !value.is_null())

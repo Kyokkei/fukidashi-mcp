@@ -183,6 +183,22 @@ pub struct TranslationStartRequest {
     pub sfx_mode: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LoreRequest {
+    /// Exact managed job directory name returned by the translation flow.
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PutLoreRequest {
+    /// Exact managed job directory name returned by the translation flow.
+    pub job_id: String,
+    /// Forward-compatible lore object. The server validates known fields and
+    /// retains unknown top-level fields for newer clients.
+    #[schemars(schema_with = "json_object_schema")]
+    pub lore: serde_json::Value,
+}
+
 /// One translation decision keyed by the stable OCR item id.  `keep_source`
 /// is the explicit uncertainty-preserving choice; it is never inferred from
 /// low OCR confidence.  `needs_review` carries uncertainty through a render
@@ -822,9 +838,12 @@ impl FukidashiServer {
                 "page_number": pending.page_number,
                 "total_pages": pending.total_pages,
                 "translation_items": [],
-                "required_translation_ids": [],
-                "preserved_items": preserved_items,
-                "sfx_mode": if replace_sfx { "replace" } else { "preserve" },
+            "required_translation_ids": [],
+            "preserved_items": preserved_items,
+            "lore": self.workflow.read_lore(&pending.job_dir).map_err(|error| {
+                FukidashiError::InvalidInput(format!("read job lore: {error}"))
+            })?,
+            "sfx_mode": if replace_sfx { "replace" } else { "preserve" },
                 "error": "page has no translation items; the server will not fabricate an unchanged clean artifact",
                 "next_action": {
                     "action": "manual_scope_required",
@@ -857,6 +876,9 @@ impl FukidashiServer {
             "sfx_mode": if replace_sfx { "replace" } else { "preserve" },
             "translation_items": strict_response_items(&items),
             "preserved_items": preserved_items,
+            "lore": self.workflow.read_lore(&pending.job_dir).map_err(|error| {
+                FukidashiError::InvalidInput(format!("read job lore: {error}"))
+            })?,
             "required_translation_ids": ids,
             "work_token": token,
             "next_action": {
@@ -1625,6 +1647,52 @@ fn checkpoint_text_regions(
 
 #[tool_router]
 impl FukidashiServer {
+    #[tool(
+        name = "fukidashi_get_lore",
+        description = "Read the canonical lore context for a managed job. Call this before the first translation submit; an untouched job returns an empty valid template."
+    )]
+    pub async fn get_lore(&self, Parameters(req): Parameters<LoreRequest>) -> CallToolResult {
+        let job = match self.workflow.resolve_managed_job_id(&req.job_id) {
+            Ok(job) => job,
+            Err(error) => {
+                return json_result(&serde_json::json!({"error": error.to_string()}), true);
+            }
+        };
+        match self.workflow.read_lore(&job) {
+            Ok(lore) => json_result(
+                &serde_json::json!({"job_id": req.job_id, "lore": lore}),
+                false,
+            ),
+            Err(error) => json_result(
+                &serde_json::json!({"job_id": req.job_id, "error": error.to_string()}),
+                true,
+            ),
+        }
+    }
+
+    #[tool(
+        name = "fukidashi_put_lore",
+        description = "Validate and atomically write canonical lore context for a managed job. This stores client-authored names, pronouns, glossary, and forward-compatible fields; it never invokes an LLM."
+    )]
+    pub async fn put_lore(&self, Parameters(req): Parameters<PutLoreRequest>) -> CallToolResult {
+        let job = match self.workflow.resolve_managed_job_id(&req.job_id) {
+            Ok(job) => job,
+            Err(error) => {
+                return json_result(&serde_json::json!({"error": error.to_string()}), true);
+            }
+        };
+        match self.workflow.write_lore(&job, &req.lore) {
+            Ok(lore) => json_result(
+                &serde_json::json!({"job_id": req.job_id, "lore": lore}),
+                false,
+            ),
+            Err(error) => json_result(
+                &serde_json::json!({"job_id": req.job_id, "error": error.to_string()}),
+                true,
+            ),
+        }
+    }
+
     #[tool(
         name = "fukidashi_translation_start",
         description = "Strict-v1 server-owned translation loop. Start from one source image or resume with job_id/job_path. The server analyzes or reuses the first unfinished page and returns compact stable translation items plus an opaque work_token. sfx_mode=preserve (default) keeps structurally unmatched text-* items out of translation, cleaning, and typesetting; preserve-only pages receive a verified pass-through stage and advance automatically; use replace only explicitly. Do not inspect managed job files or construct artifact paths; the submit call accepts only that token and the exact item IDs."
@@ -3140,6 +3208,9 @@ impl ServerHandler for FukidashiServer {
             .with_instructions(
                 "Local managed comic-translation workflow. Prefer the strict-v1 two-call loop: call \
                 fukidashi_translation_start with one source image, job_path, or job_id, then call \
+                fukidashi_get_lore (or use the page_ready lore template) before the first submit and \
+                fukidashi_put_lore for known names, pronouns, and glossary terms; flag unknown speakers \
+                with needs_review=true. Lore is client-authored and this server never invokes an LLM. \
                 fukidashi_translation_submit with only the returned work_token and one structured decision for \
                 each required_translation_ids entry. The server owns page selection, analysis, clean, typeset, \
                 stage reuse, model release, and advancement. sfx_mode=preserve is the default: structurally \
@@ -3495,6 +3566,28 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let server = FukidashiServer::new(config).unwrap();
+        let initial_lore = extract_tool_json(
+            server
+                .get_lore(Parameters(LoreRequest {
+                    job_id: job_id.clone(),
+                }))
+                .await,
+            "get lore",
+        )
+        .unwrap();
+        assert_eq!(initial_lore["lore"]["schema"], 1);
+        let authored_lore = server
+            .put_lore(Parameters(PutLoreRequest {
+                job_id: job_id.clone(),
+                lore: serde_json::json!({
+                    "schema": 1,
+                    "characters": [{"id":"lisa","names":["Lisa"]}],
+                    "future": {"tone": "dry"}
+                }),
+            }))
+            .await;
+        let authored_lore = extract_tool_json(authored_lore, "put lore").unwrap();
+        assert_eq!(authored_lore["lore"]["future"]["tone"], "dry");
         let result = server
             .translation_start(Parameters(TranslationStartRequest {
                 job_id: Some(job_id.clone()),
@@ -3504,6 +3597,7 @@ mod tests {
         let value = extract_tool_json(result, "strict start").unwrap();
         assert_eq!(value["protocol"], "strict-v1");
         assert_eq!(value["status"], "page_ready");
+        assert_eq!(value["lore"]["characters"][0]["id"], "lisa");
         assert_eq!(value["sfx_mode"], "preserve");
         assert_eq!(value["translation_items"][0]["id"], "bubble-1");
         assert_eq!(value["current_page"], 1);
