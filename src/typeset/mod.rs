@@ -134,9 +134,16 @@ pub fn typeset_page_with_fallbacks(
             balloon_mask,
         )
         .with_context(|| format!("fit text for bubble {index}"))?;
-        let sampled_luminance = sample_center_luminance(&mask_source, &layout);
-        let resolved_text_color =
-            resolve_text_color(payload.text_color.as_deref(), sampled_luminance);
+        // An explicit override is authoritative and does not need (or report)
+        // a clean-image sample. Auto mode alone performs contrast detection.
+        let (resolved_text_color, sampled_luminance) = match payload.text_color.as_deref() {
+            Some("white") => ("white", None),
+            Some("black") => ("black", None),
+            _ => {
+                let sampled = sample_center_luminance(&mask_source, &layout);
+                (resolve_auto_text_color(sampled), sampled)
+            }
+        };
         raster_layout(&mut image, &candidates, &layout, resolved_text_color)?;
         let ink_bbox = layout_ink_bbox(&layout);
         let mut used = HashSet::new();
@@ -624,12 +631,11 @@ fn raster_layout(
     Ok(())
 }
 
-fn resolve_text_color(requested: Option<&str>, sampled_luminance: Option<u8>) -> &'static str {
-    match requested {
-        Some("white") => "white",
-        Some("black") => "black",
-        _ if sampled_luminance.is_some_and(|luma| luma < AUTO_INK_LUMA_THRESHOLD) => "white",
-        _ => "black",
+fn resolve_auto_text_color(sampled_luminance: Option<u8>) -> &'static str {
+    if sampled_luminance.is_some_and(|luma| luma < AUTO_INK_LUMA_THRESHOLD) {
+        "white"
+    } else {
+        "black"
     }
 }
 
@@ -639,6 +645,25 @@ fn resolve_text_color(requested: Option<&str>, sampled_luminance: Option<u8>) ->
 /// border pixels and broad detector padding; the renderer never uses the
 /// balloon mask as a contrast detector.
 fn sample_center_luminance(image: &RgbaImage, layout: &LayoutResult) -> Option<u8> {
+    if image.width() == 0 || image.height() == 0 {
+        return None;
+    }
+    if ![
+        layout.safe_bbox.x1,
+        layout.safe_bbox.y1,
+        layout.safe_bbox.x2,
+        layout.safe_bbox.y2,
+        layout.placement_center.0,
+        layout.placement_center.1,
+    ]
+    .into_iter()
+    .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    if layout.safe_bbox.x2 <= layout.safe_bbox.x1 || layout.safe_bbox.y2 <= layout.safe_bbox.y1 {
+        return None;
+    }
     let cx = layout.placement_center.0.round() as i32;
     let cy = layout.placement_center.1.round() as i32;
     let safe_x1 = layout.safe_bbox.x1.ceil() as i32;
@@ -693,11 +718,38 @@ mod tests {
 
     #[test]
     fn auto_ink_uses_one_documented_mid_gray_threshold() {
-        assert_eq!(resolve_text_color(None, Some(109)), "white");
-        assert_eq!(resolve_text_color(None, Some(110)), "black");
-        assert_eq!(resolve_text_color(None, Some(180)), "black");
-        assert_eq!(resolve_text_color(Some("black"), Some(0)), "black");
-        assert_eq!(resolve_text_color(Some("white"), Some(255)), "white");
+        assert_eq!(resolve_auto_text_color(Some(109)), "white");
+        assert_eq!(resolve_auto_text_color(Some(110)), "black");
+        assert_eq!(resolve_auto_text_color(Some(180)), "black");
+        assert_eq!(resolve_auto_text_color(None), "black");
+    }
+
+    #[test]
+    fn auto_ink_sampling_rejects_empty_images_and_invalid_safe_geometry() {
+        let layout = LayoutResult {
+            font_size: 12.0,
+            lines: Vec::new(),
+            safe_bbox: Rect {
+                x1: 8.0,
+                y1: 8.0,
+                x2: 8.0,
+                y2: 8.0,
+            },
+            padding: 0.0,
+            placement_center: (8.0, 8.0),
+            safe_mask: None,
+        };
+        assert_eq!(
+            sample_center_luminance(&RgbaImage::new(0, 0), &layout),
+            None
+        );
+        assert_eq!(
+            sample_center_luminance(
+                &RgbaImage::from_pixel(16, 16, Rgba([0, 0, 0, 255])),
+                &layout
+            ),
+            None
+        );
     }
 
     #[test]

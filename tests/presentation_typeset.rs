@@ -25,15 +25,9 @@ fn ink_fixture(
     center_disk: bool,
     text_color: Option<&str>,
 ) -> (image::RgbaImage, serde_json::Value) {
-    let Some((_bytes, _font)) = font_fixture() else {
-        panic!("font fixture is required for ink tests");
-    };
-    let font_path = if fs::metadata(r"C:\Windows\Fonts\arial.ttf").is_ok() {
-        r"C:\Windows\Fonts\arial.ttf"
-    } else {
-        r"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    };
     let dir = tempdir().unwrap();
+    let font_path = dir.path().join("ComicNeue-Regular.ttf");
+    fs::write(&font_path, fukidashi_mcp::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
     let source = dir.path().join("source.png");
     let output = dir.path().join("rendered.png");
     let mut original = ImageBuffer::<Rgba<u8>, _>::from_pixel(64, 64, fill);
@@ -71,7 +65,7 @@ fn ink_fixture(
             text_bbox: None,
             padding: Some(4.0),
             text: "ABC".into(),
-            font_path: Some(font_path.into()),
+            font_path: Some(font_path.display().to_string()),
             min_font_size: Some(8.0),
             max_font_size: Some(18.0),
             text_color: text_color.map(str::to_owned),
@@ -118,11 +112,13 @@ fn auto_ink_uses_clean_center_median_and_explicit_overrides() {
         ink_fixture(Rgba([255, 255, 255, 255]), false, Some("white"));
     assert_eq!(override_report["requested_text_color"], "white");
     assert_eq!(override_report["resolved_text_color"], "white");
+    assert!(override_report["sampled_luminance"].is_null());
 
     let (black_override_page, black_override_report) =
         ink_fixture(Rgba([0, 0, 0, 255]), false, Some("black"));
     assert!(black_override_page.pixels().all(|pixel| pixel[0] == 0));
     assert_eq!(black_override_report["resolved_text_color"], "black");
+    assert!(black_override_report["sampled_luminance"].is_null());
 }
 
 #[test]

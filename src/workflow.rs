@@ -3461,7 +3461,9 @@ mod tests {
                 }],
                 "report": {"bubbles": [{
                     "fallback_font_paths": ["primary-used.ttf", "symbol-unused.ttf"],
-                    "fallback_fonts_used": ["primary-used.ttf"]
+                    "fallback_fonts_used": ["primary-used.ttf"],
+                    "resolved_text_color": "white",
+                    "sampled_luminance": 23
                 }]}
             }),
             "page-1",
@@ -3471,6 +3473,8 @@ mod tests {
             json!(["primary-used.ttf", "symbol-unused.ttf"])
         );
         assert_eq!(bubbles[0]["text_color"], "white");
+        assert_eq!(bubbles[0]["resolved_text_color"], "white");
+        assert_eq!(bubbles[0]["sampled_luminance"], 23);
     }
 
     #[test]
