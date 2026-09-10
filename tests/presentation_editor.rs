@@ -141,6 +141,22 @@ fn editor_gallery_variants_and_render_endpoint_are_constrained() {
         "brushHex",
         "#22d3ee",
         "Ctrl+Y",
+        "id=\"eyedropper\"",
+        "aria-pressed",
+        "sampleSize",
+        "3×3",
+        "5×5",
+        "recentColors",
+        "averagePixelData",
+        "pushRecentColor",
+        "localStorage",
+        "temporarySampling",
+        "e.key==='Alt'",
+        "stageWrap",
+        "panGesture",
+        "startPan",
+        "pointercancel",
+        "Space",
     ] {
         assert!(html.contains(marker), "editor HTML missing {marker}");
     }
