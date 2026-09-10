@@ -115,7 +115,23 @@ pub struct TypesetPayload {
     pub font_path: Option<String>,
     pub min_font_size: Option<f32>,
     pub max_font_size: Option<f32>,
+    /// Requested glyph ink. Missing/null selects contrast-aware auto ink.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_color: Option<String>,
     pub shape: Option<String>,
+}
+
+impl TypesetPayload {
+    pub fn validate_text_color(&self) -> Result<()> {
+        if let Some(color) = self.text_color.as_deref()
+            && !matches!(color, "black" | "white")
+        {
+            return Err(FukidashiError::InvalidInput(format!(
+                "unsupported text_color {color:?}; expected black, white, or null"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

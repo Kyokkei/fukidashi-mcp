@@ -20,6 +20,124 @@ fn font_fixture() -> Option<(Vec<u8>, fontdue::Font)> {
     None
 }
 
+fn ink_fixture(
+    fill: Rgba<u8>,
+    center_disk: bool,
+    text_color: Option<&str>,
+) -> (image::RgbaImage, serde_json::Value) {
+    let Some((_bytes, _font)) = font_fixture() else {
+        panic!("font fixture is required for ink tests");
+    };
+    let font_path = if fs::metadata(r"C:\Windows\Fonts\arial.ttf").is_ok() {
+        r"C:\Windows\Fonts\arial.ttf"
+    } else {
+        r"/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    };
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.png");
+    let output = dir.path().join("rendered.png");
+    let mut original = ImageBuffer::<Rgba<u8>, _>::from_pixel(64, 64, fill);
+    if center_disk {
+        for y in 24..40 {
+            for x in 24..40 {
+                original.put_pixel(x, y, Rgba([0, 0, 0, 255]));
+            }
+        }
+    }
+    original.save(&source).unwrap();
+    let report = typeset_page(
+        &source,
+        &[TypesetPayload {
+            id: Some("ink-fixture".into()),
+            source_text: Some("ABC".into()),
+            kind: Some("dialogue".into()),
+            preserve_by_default: Some(false),
+            needs_review: None,
+            flagged: None,
+            preserve_source: Some(false),
+            fallback_font_paths: Vec::new(),
+            bbox: Rect {
+                x1: 4.0,
+                y1: 4.0,
+                x2: 60.0,
+                y2: 60.0,
+            },
+            bubble_bbox: Some(Rect {
+                x1: 4.0,
+                y1: 4.0,
+                x2: 60.0,
+                y2: 60.0,
+            }),
+            text_bbox: None,
+            padding: Some(4.0),
+            text: "ABC".into(),
+            font_path: Some(font_path.into()),
+            min_font_size: Some(8.0),
+            max_font_size: Some(18.0),
+            text_color: text_color.map(str::to_owned),
+            shape: Some("rectangle".into()),
+        }],
+        &output,
+    )
+    .unwrap();
+    (
+        image::open(&output).unwrap().to_rgba8(),
+        report["bubbles"][0].clone(),
+    )
+}
+
+#[test]
+fn auto_ink_uses_clean_center_median_and_explicit_overrides() {
+    let (black_page, black_report) = ink_fixture(Rgba([0, 0, 0, 255]), false, None);
+    let black_changed = black_page.pixels().filter(|pixel| pixel[0] > 180).count();
+    assert!(
+        black_changed > 0,
+        "black balloon should receive white glyph pixels"
+    );
+    assert_eq!(black_report["resolved_text_color"], "white");
+    assert_eq!(black_report["sampled_luminance"], 0);
+
+    let (white_page, white_report) = ink_fixture(Rgba([255, 255, 255, 255]), false, None);
+    let white_changed = white_page.pixels().filter(|pixel| pixel[0] < 80).count();
+    assert!(
+        white_changed > 0,
+        "white balloon should receive black glyph pixels"
+    );
+    assert_eq!(white_report["resolved_text_color"], "black");
+    assert_eq!(white_report["sampled_luminance"], 255);
+
+    let (mixed_page, mixed_report) = ink_fixture(Rgba([255, 255, 255, 255]), true, None);
+    let mixed_changed = mixed_page.pixels().filter(|pixel| pixel[0] > 180).count();
+    assert!(
+        mixed_changed > 0,
+        "central dark balloon should receive white glyph pixels"
+    );
+    assert_eq!(mixed_report["resolved_text_color"], "white");
+
+    let (_override_page, override_report) =
+        ink_fixture(Rgba([255, 255, 255, 255]), false, Some("white"));
+    assert_eq!(override_report["requested_text_color"], "white");
+    assert_eq!(override_report["resolved_text_color"], "white");
+
+    let (black_override_page, black_override_report) =
+        ink_fixture(Rgba([0, 0, 0, 255]), false, Some("black"));
+    assert!(black_override_page.pixels().all(|pixel| pixel[0] == 0));
+    assert_eq!(black_override_report["resolved_text_color"], "black");
+}
+
+#[test]
+fn text_color_is_legacy_optional_and_rejects_unknown_values() {
+    let legacy: TypesetPayload = serde_json::from_value(serde_json::json!({
+        "bbox": {"x1": 1.0, "y1": 1.0, "x2": 8.0, "y2": 8.0},
+        "text": "ABC"
+    }))
+    .unwrap();
+    assert_eq!(legacy.text_color, None);
+    let mut invalid = legacy;
+    invalid.text_color = Some("red".into());
+    assert!(invalid.validate_text_color().is_err());
+}
+
 #[test]
 fn narrow_tall_comic_bubble_fits_vietnamese_dialogue() {
     if fs::metadata(r"C:\Windows\Fonts\comic.ttf").is_err() {
@@ -56,6 +174,7 @@ fn narrow_tall_comic_bubble_fits_vietnamese_dialogue() {
             font_path: Some(r"C:\Windows\Fonts\comic.ttf".into()),
             min_font_size: Some(1.0),
             max_font_size: Some(24.0),
+            text_color: None,
             shape: Some("ellipse".into()),
         }],
         &[],
@@ -202,6 +321,7 @@ fn raster_output_is_png_and_does_not_modify_source() {
         font_path: Some(font_path.into()),
         min_font_size: Some(8.0),
         max_font_size: Some(18.0),
+        text_color: None,
         shape: Some("rectangle".into()),
     };
     let report = typeset_page(&source, &[payload], &output).unwrap();
@@ -246,6 +366,7 @@ fn preserved_and_empty_payloads_skip_layout_fitting() {
                 font_path: None,
                 min_font_size: None,
                 max_font_size: None,
+                text_color: None,
                 shape: None,
             },
             TypesetPayload {
@@ -270,6 +391,7 @@ fn preserved_and_empty_payloads_skip_layout_fitting() {
                 font_path: None,
                 min_font_size: None,
                 max_font_size: None,
+                text_color: None,
                 shape: None,
             },
         ],

@@ -3456,7 +3456,8 @@ mod tests {
                 "request_bubbles": [{
                     "id": "b1",
                     "bbox": {"x1":1,"y1":1,"x2":8,"y2":8},
-                    "text": "Hello"
+                    "text": "Hello",
+                    "text_color": "white"
                 }],
                 "report": {"bubbles": [{
                     "fallback_font_paths": ["primary-used.ttf", "symbol-unused.ttf"],
@@ -3469,6 +3470,7 @@ mod tests {
             bubbles[0]["fallback_font_paths"],
             json!(["primary-used.ttf", "symbol-unused.ttf"])
         );
+        assert_eq!(bubbles[0]["text_color"], "white");
     }
 
     #[test]

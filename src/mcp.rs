@@ -1310,6 +1310,10 @@ impl FukidashiServer {
                 font_path: None,
                 min_font_size: None,
                 max_font_size: None,
+                text_color: item
+                    .get("text_color")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
                 shape: None,
             });
         }
@@ -4034,6 +4038,7 @@ mod tests {
                 font_path: None,
                 min_font_size: Some(7.0),
                 max_font_size: None,
+                text_color: None,
                 shape: None,
             }],
             font_path: Some("E:/fonts/default.ttf".into()),
@@ -4084,6 +4089,7 @@ mod tests {
             font_path: None,
             min_font_size: None,
             max_font_size: None,
+            text_color: None,
             shape: None,
         }];
         let (fallbacks, substitutions) =
@@ -4149,6 +4155,7 @@ mod tests {
             font_path: Some(requested.display().to_string()),
             min_font_size: None,
             max_font_size: None,
+            text_color: None,
             shape: None,
         }];
         let (fallbacks, substitutions) =

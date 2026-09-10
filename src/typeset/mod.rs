@@ -17,6 +17,11 @@ use std::path::Path;
 use crate::domain::TypesetPayload;
 use crate::workflow::CleanArtifact;
 
+const AUTO_INK_LUMA_THRESHOLD: u8 = 110;
+const AUTO_INK_SAMPLE_FRACTION: f32 = 0.4;
+const AUTO_INK_MIN_WINDOW: i32 = 5;
+const AUTO_INK_MAX_WINDOW: i32 = 128;
+
 #[derive(Debug)]
 struct FontAsset {
     path: String,
@@ -63,6 +68,7 @@ pub fn typeset_page_with_fallbacks(
     let mask_source = image.clone();
     let mut reports = Vec::with_capacity(bubbles.len());
     for (index, payload) in bubbles.iter().enumerate() {
+        payload.validate_text_color()?;
         // A preserved item is deliberately left as source pixels. Empty text
         // is also non-renderable: it must not reach layout fitting, where a
         // legacy state can turn an otherwise valid rerender into a fit error.
@@ -78,6 +84,10 @@ pub fn typeset_page_with_fallbacks(
                 "preserve_by_default": payload.preserve_by_default,
                 "preserve_source": payload.preserve_source,
                 "text": payload.text,
+                "text_color": payload.text_color,
+                "requested_text_color": payload.text_color,
+                "resolved_text_color": serde_json::Value::Null,
+                "sampled_luminance": serde_json::Value::Null,
                 "skipped": true,
                 "skip_reason": skip_reason,
             }));
@@ -124,7 +134,10 @@ pub fn typeset_page_with_fallbacks(
             balloon_mask,
         )
         .with_context(|| format!("fit text for bubble {index}"))?;
-        raster_layout(&mut image, &candidates, &layout)?;
+        let sampled_luminance = sample_center_luminance(&mask_source, &layout);
+        let resolved_text_color =
+            resolve_text_color(payload.text_color.as_deref(), sampled_luminance);
+        raster_layout(&mut image, &candidates, &layout, resolved_text_color)?;
         let ink_bbox = layout_ink_bbox(&layout);
         let mut used = HashSet::new();
         let mut font_runs = Vec::new();
@@ -165,6 +178,10 @@ pub fn typeset_page_with_fallbacks(
             "line_count": layout.lines.len(),
             "ink_bbox": ink_bbox,
             "shape": shape,
+            "text_color": payload.text_color,
+            "requested_text_color": payload.text_color,
+            "resolved_text_color": resolved_text_color,
+            "sampled_luminance": sampled_luminance,
             "requested_font_path": requested_font_path,
             "requested_primary_font": requested_font_path,
             // `font_path` remains the requested primary for sidecar/editor
@@ -548,9 +565,14 @@ fn raster_layout(
     image: &mut image::RgbaImage,
     fonts: &[FontCandidate<'_>],
     layout: &LayoutResult,
+    resolved_text_color: &str,
 ) -> Result<()> {
     let cx = layout.placement_center.0;
-    let rgba = Rgba([0_u8, 0_u8, 0_u8, 255_u8]);
+    let rgba = if resolved_text_color == "white" {
+        Rgba([255_u8, 255_u8, 255_u8, 255_u8])
+    } else {
+        Rgba([0_u8, 0_u8, 0_u8, 255_u8])
+    };
     for line in &layout.lines {
         let origin_x = cx - (line.ink_left + line.ink_right) * 0.5;
         for glyph in &line.glyphs {
@@ -602,10 +624,81 @@ fn raster_layout(
     Ok(())
 }
 
+fn resolve_text_color(requested: Option<&str>, sampled_luminance: Option<u8>) -> &'static str {
+    match requested {
+        Some("white") => "white",
+        Some("black") => "black",
+        _ if sampled_luminance.is_some_and(|luma| luma < AUTO_INK_LUMA_THRESHOLD) => "white",
+        _ => "black",
+    }
+}
+
+/// Auto ink samples an adaptive central window around the layout anchor from
+/// the clean page. The window covers about 40% of each usable safe dimension,
+/// with a 128-pixel cap. Median integer luma and the 110 threshold resist
+/// border pixels and broad detector padding; the renderer never uses the
+/// balloon mask as a contrast detector.
+fn sample_center_luminance(image: &RgbaImage, layout: &LayoutResult) -> Option<u8> {
+    let cx = layout.placement_center.0.round() as i32;
+    let cy = layout.placement_center.1.round() as i32;
+    let safe_x1 = layout.safe_bbox.x1.ceil() as i32;
+    let safe_y1 = layout.safe_bbox.y1.ceil() as i32;
+    let safe_x2 = layout.safe_bbox.x2.floor() as i32 - 1;
+    let safe_y2 = layout.safe_bbox.y2.floor() as i32 - 1;
+    let safe_width = (safe_x2 - safe_x1 + 1).max(1);
+    let safe_height = (safe_y2 - safe_y1 + 1).max(1);
+    let window_width = ((safe_width as f32 * AUTO_INK_SAMPLE_FRACTION).round() as i32)
+        .clamp(AUTO_INK_MIN_WINDOW, AUTO_INK_MAX_WINDOW)
+        .min(safe_width);
+    let window_height = ((safe_height as f32 * AUTO_INK_SAMPLE_FRACTION).round() as i32)
+        .clamp(AUTO_INK_MIN_WINDOW, AUTO_INK_MAX_WINDOW)
+        .min(safe_height);
+    let x1 = (cx - window_width / 2)
+        .max(safe_x1)
+        .max(0)
+        .min(image.width() as i32 - 1);
+    let y1 = (cy - window_height / 2)
+        .max(safe_y1)
+        .max(0)
+        .min(image.height() as i32 - 1);
+    let x2 = (x1 + window_width - 1)
+        .min(safe_x2)
+        .min(image.width() as i32 - 1);
+    let y2 = (y1 + window_height - 1)
+        .min(safe_y2)
+        .min(image.height() as i32 - 1);
+    if x1 > x2 || y1 > y2 {
+        return None;
+    }
+    let mut values = Vec::with_capacity(((x2 - x1 + 1) * (y2 - y1 + 1)) as usize);
+    for y in y1..=y2 {
+        for x in x1..=x2 {
+            let pixel = image.get_pixel(x as u32, y as u32);
+            values.push(
+                ((u32::from(pixel[0]) * 299
+                    + u32::from(pixel[1]) * 587
+                    + u32::from(pixel[2]) * 114)
+                    / 1000) as u8,
+            );
+        }
+    }
+    values.sort_unstable();
+    values.get(values.len() / 2).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::Rect;
+
+    #[test]
+    fn auto_ink_uses_one_documented_mid_gray_threshold() {
+        assert_eq!(resolve_text_color(None, Some(109)), "white");
+        assert_eq!(resolve_text_color(None, Some(110)), "black");
+        assert_eq!(resolve_text_color(None, Some(180)), "black");
+        assert_eq!(resolve_text_color(Some("black"), Some(0)), "black");
+        assert_eq!(resolve_text_color(Some("white"), Some(255)), "white");
+    }
 
     #[test]
     fn per_grapheme_fallback_keeps_primary_and_uses_fallback_for_missing_cluster() {
@@ -807,6 +900,7 @@ mod tests {
             font_path: Some(primary.display().to_string()),
             min_font_size: Some(8.0),
             max_font_size: Some(28.0),
+            text_color: None,
             shape: Some("rectangle".into()),
         };
         let first =
@@ -919,6 +1013,7 @@ mod tests {
             font_path: Some(font_path.display().to_string()),
             min_font_size: Some(8.0),
             max_font_size: Some(18.0),
+            text_color: None,
             shape: Some("rectangle".into()),
         };
         let report =

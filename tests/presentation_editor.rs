@@ -180,6 +180,22 @@ fn editor_gallery_variants_and_render_endpoint_are_constrained() {
         "Number(input.max)||160",
         "current+delta",
         "isTypingTarget(e.target)",
+        "textColor",
+        "data-state-field=\"text_color\"",
+        "b.text_color",
+        "kind==='bubble'",
+        "kind==='issue'",
+        "dragging.kind",
+        "clampDragRect",
+        "Math.hypot(dx,dy)<3",
+        "moved:false",
+        "markDirty(true);renderInspector();drawBoxes();renderGallery()",
+        "lostpointercapture",
+        "cancelDrag",
+        "brushMode||eyedropperMode||drawMode||spaceHeld",
+        "startDrag(e,i,dir,'bubble')",
+        "startDrag(e,i,'move','bubble')",
+        "startDrag(e,i,dir,'issue')",
     ] {
         assert!(html.contains(marker), "editor HTML missing {marker}");
     }
@@ -558,6 +574,7 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
         font_path: Some(font.display().to_string()),
         min_font_size: Some(1.0),
         max_font_size: Some(8.0),
+        text_color: None,
         shape: Some("rectangle".into()),
     };
     let payload2 = TypesetPayload {
@@ -582,6 +599,7 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
         font_path: Some(font.display().to_string()),
         min_font_size: Some(1.0),
         max_font_size: Some(8.0),
+        text_color: None,
         shape: Some("rectangle".into()),
     };
     let payloads = [payload.clone(), payload2];
@@ -741,6 +759,7 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
         font_path: Some(requested_font.display().to_string()),
         min_font_size: Some(1.0),
         max_font_size: Some(38.0),
+        text_color: None,
         shape: Some("rectangle".into()),
     };
     let preserved_sfx = TypesetPayload {
@@ -765,6 +784,7 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
         font_path: None,
         min_font_size: None,
         max_font_size: None,
+        text_color: None,
         shape: None,
     };
     let initial_report = fukidashi_mcp::typeset::typeset_page_with_fallbacks(
@@ -939,6 +959,7 @@ fn editor_reconstructs_missing_primary_and_substitutes_legacy_hash_arial() {
         font_path: Some(requested_font.display().to_string()),
         min_font_size: Some(1.0),
         max_font_size: Some(28.0),
+        text_color: Some("white".into()),
         shape: Some("rectangle".into()),
     };
     let initial_report = fukidashi_mcp::typeset::typeset_page_with_fallbacks(
@@ -948,6 +969,11 @@ fn editor_reconstructs_missing_primary_and_substitutes_legacy_hash_arial() {
         &rendered_path,
     )
     .unwrap();
+    assert_eq!(
+        initial_report["bubbles"][0]["requested_text_color"],
+        "white"
+    );
+    assert_eq!(initial_report["bubbles"][0]["resolved_text_color"], "white");
     workflow
         .register_render(
             &rendered_path,
@@ -1008,6 +1034,7 @@ fn editor_reconstructs_missing_primary_and_substitutes_legacy_hash_arial() {
     let rendered_missing: serde_json::Value =
         serde_json::from_str(render.split_once("\r\n\r\n").unwrap().1).unwrap();
     let missing_report = &rendered_missing["typeset"]["bubbles"][0];
+    assert_eq!(missing_report["resolved_text_color"], "white");
     assert_eq!(missing_report["font_substituted"], true);
     assert_eq!(missing_report["reason"], "missing_primary");
     assert!(

@@ -1416,6 +1416,7 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                         "flag_reason",
                         "problem_reason",
                         "needs_review",
+                        "text_color",
                     ] {
                         if let Some(value) = saved_bubble.get(key) {
                             base_bubble_object.insert(key.to_owned(), value.clone());
@@ -1693,6 +1694,10 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 font_path: None,
                 min_font_size: None,
                 max_font_size: None,
+                text_color: bubble
+                    .get("text_color")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 shape: bubble
                     .get("shape")
                     .and_then(Value::as_str)
@@ -1792,6 +1797,10 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 .and_then(Value::as_f64)
                 .map(|v| v as f32)
                 .or(font_size),
+            text_color: bubble
+                .get("text_color")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
             shape: bubble
                 .get("shape")
                 .and_then(Value::as_str)
