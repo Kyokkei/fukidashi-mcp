@@ -1408,6 +1408,8 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                     for key in [
                         "translation",
                         "bbox",
+                        "bubble_bbox",
+                        "text_bbox",
                         "font_size",
                         "padding",
                         "reading_order",
@@ -1509,6 +1511,49 @@ fn bubble_preserve_for_render(bubble: &Value) -> bool {
             .get("id")
             .and_then(Value::as_str)
             .is_some_and(|id| id.starts_with("text-"))
+}
+
+fn rects_match(left: Rect, right: Rect) -> bool {
+    const EPSILON: f32 = 0.001;
+    (left.x1 - right.x1).abs() <= EPSILON
+        && (left.y1 - right.y1).abs() <= EPSILON
+        && (left.x2 - right.x2).abs() <= EPSILON
+        && (left.y2 - right.y2).abs() <= EPSILON
+}
+
+/// A browser geometry edit copies `bbox` into `bubble_bbox`. That gives the
+/// render boundary an explicit marker that any detector-era text anchor is
+/// stale; legacy state with a distinct detector box keeps its old anchor.
+fn editor_text_bbox(bubble: &Value, bbox: Rect) -> Result<Option<Rect>> {
+    let operator_geometry = bubble
+        .get("bubble_bbox")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Rect>(value).ok())
+        .is_some_and(|bubble_bbox| rects_match(bubble_bbox, bbox));
+    if operator_geometry {
+        return Ok(None);
+    }
+    bubble
+        .get("text_bbox")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn synchronize_rendered_bubbles(page: &mut Value) {
+    let Some(bubbles) = page.get_mut("bubbles").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for bubble in bubbles {
+        let Some(object) = bubble.as_object_mut() else {
+            continue;
+        };
+        if let Some(bbox) = object.get("bbox").cloned() {
+            object.insert("bubble_bbox".to_owned(), bbox);
+        }
+    }
 }
 
 fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> {
@@ -1678,12 +1723,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 // editor render; stale detector geometry must not snap text
                 // back into its original balloon.
                 bubble_bbox: Some(bbox),
-                text_bbox: bubble
-                    .get("text_bbox")
-                    .filter(|value| !value.is_null())
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()?,
+                text_bbox: editor_text_bbox(bubble, bbox)?,
                 padding: bubble
                     .get("padding")
                     .and_then(Value::as_f64)
@@ -1770,12 +1810,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             // Keep the containing geometry synchronized with the editable
             // bbox so rerendering honors a move or resize.
             bubble_bbox: Some(bbox),
-            text_bbox: bubble
-                .get("text_bbox")
-                .filter(|value| !value.is_null())
-                .cloned()
-                .map(serde_json::from_value)
-                .transpose()?,
+            text_bbox: editor_text_bbox(bubble, bbox)?,
             padding: bubble
                 .get("padding")
                 .and_then(Value::as_f64)
@@ -1860,6 +1895,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         .and_then(Value::as_array_mut)
         .and_then(|pages| pages.get_mut(index))
     {
+        synchronize_rendered_bubbles(page);
         page["rendered_image_path"] = Value::String(
             output
                 .strip_prefix(&session.root_dir)
@@ -2195,6 +2231,88 @@ mod tests {
                 .contains("const renderState=JSON.stringify({page_index:renderPageIndex,state})")
         );
         assert!(EDITOR_HTML.contains("e.status===409"));
+    }
+
+    #[test]
+    fn operator_geometry_drops_stale_text_anchor_and_render_normalizes_bbox() {
+        let bbox = Rect {
+            x1: 24.0,
+            y1: 12.0,
+            x2: 88.0,
+            y2: 100.0,
+        };
+        let stale_text_bbox = json!({
+            "x1": 8.0,
+            "y1": 8.0,
+            "x2": 40.0,
+            "y2": 30.0
+        });
+        let operator_bubble = json!({
+            "bbox": bbox,
+            "bubble_bbox": bbox,
+            "text_bbox": stale_text_bbox
+        });
+        assert_eq!(editor_text_bbox(&operator_bubble, bbox).unwrap(), None);
+
+        let legacy_bubble = json!({
+            "bbox": bbox,
+            "bubble_bbox": {"x1": 8.0, "y1": 8.0, "x2": 72.0, "y2": 92.0},
+            "text_bbox": stale_text_bbox
+        });
+        assert_eq!(
+            editor_text_bbox(&legacy_bubble, bbox).unwrap(),
+            Some(Rect {
+                x1: 8.0,
+                y1: 8.0,
+                x2: 40.0,
+                y2: 30.0
+            })
+        );
+
+        let mut page = json!({
+            "bubbles": [{
+                "bbox": bbox,
+                "bubble_bbox": {"x1": 8.0, "y1": 8.0, "x2": 72.0, "y2": 92.0}
+            }]
+        });
+        synchronize_rendered_bubbles(&mut page);
+        assert_eq!(page["bubbles"][0]["bubble_bbox"], json!(bbox));
+
+        let original_bbox = json!({"x1": 8.0, "y1": 8.0, "x2": 72.0, "y2": 92.0});
+        let mut reopened = normalize_editor_state(json!({
+            "state_revision": 3,
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{
+                    "id": "bubble-1",
+                    "bbox": original_bbox,
+                    "bubble_bbox": {"x1": 8.0, "y1": 8.0, "x2": 72.0, "y2": 92.0},
+                    "text_bbox": stale_text_bbox
+                }]
+            }]
+        }))
+        .unwrap();
+        let saved = json!({
+            "state_revision": 4,
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{
+                    "id": "bubble-1",
+                    "bbox": bbox,
+                    "bubble_bbox": bbox,
+                    "text_bbox": {"x1": 30.0, "y1": 20.0, "x2": 62.0, "y2": 50.0}
+                }]
+            }]
+        });
+        merge_saved_edits(&mut reopened, &saved);
+        assert_eq!(
+            reopened["pages"][0]["bubbles"][0]["bubble_bbox"],
+            json!(bbox)
+        );
+        assert_eq!(
+            reopened["pages"][0]["bubbles"][0]["text_bbox"],
+            json!({"x1": 30.0, "y1": 20.0, "x2": 62.0, "y2": 50.0})
+        );
     }
 
     #[test]

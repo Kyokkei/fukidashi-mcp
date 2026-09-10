@@ -75,6 +75,7 @@ pub struct LayoutMask {
     width: usize,
     height: usize,
     pixels: Vec<bool>,
+    layout_erosion_radius: usize,
 }
 
 impl LayoutMask {
@@ -94,7 +95,27 @@ impl LayoutMask {
             width,
             height,
             pixels,
+            layout_erosion_radius: 2,
         })
+    }
+
+    pub(crate) fn from_binary_geometry(
+        origin_x: i32,
+        origin_y: i32,
+        width: usize,
+        height: usize,
+        pixels: Vec<bool>,
+    ) -> Result<Self> {
+        let mut mask = Self::from_binary(origin_x, origin_y, width, height, pixels)?;
+        // Geometry ownership already provides the requested shape boundary;
+        // the regular four-pixel solver padding is its clearance. A second
+        // contour erosion would erase narrow legacy overlap regions.
+        mask.layout_erosion_radius = 0;
+        Ok(mask)
+    }
+
+    fn layout_erosion_radius(&self) -> usize {
+        self.layout_erosion_radius
     }
 
     pub(crate) fn eroded(&self, radius: usize) -> Option<Self> {
@@ -137,6 +158,7 @@ impl LayoutMask {
             width: self.width,
             height: self.height,
             pixels,
+            layout_erosion_radius: self.layout_erosion_radius,
         };
         result.bounds().map(|_| result)
     }
@@ -880,11 +902,12 @@ where
     }
     // A mask is authoritative for the individual balloon, while the
     // detector geometry still bounds any accidental component recovery.
-    // Erosion uses a 5x5 Chebyshev kernel (radius 2), matching the minimum
-    // visible contour clearance used by the renderer.
+    // Pixel-inferred masks use a 5x5 Chebyshev erosion (radius 2), matching
+    // the visible contour clearance. Geometry-only overlap masks already have
+    // a shape boundary and use their four-pixel solver padding as clearance.
     let mask = match mask {
         Some(mask) => Some(
-            mask.eroded(2)
+            mask.eroded(mask.layout_erosion_radius())
                 .ok_or_else(|| anyhow!("balloon mask has no safe interior after erosion"))?,
         ),
         None => None,

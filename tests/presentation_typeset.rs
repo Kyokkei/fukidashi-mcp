@@ -186,6 +186,119 @@ fn gray_screentone_hole_uses_the_detector_ellipse_envelope() {
 }
 
 #[test]
+fn overlapping_dark_and_colored_bubbles_use_shape_ownership_fallback() {
+    let dir = tempdir().unwrap();
+    let font_path = dir.path().join("ComicNeue-Regular.ttf");
+    fs::write(&font_path, fukidashi_mcp::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+    let source = dir.path().join("overlap.png");
+    let output = dir.path().join("overlap-rendered.png");
+    let areas = [
+        Rect {
+            x1: 20.0,
+            y1: 10.0,
+            x2: 130.0,
+            y2: 110.0,
+        },
+        Rect {
+            x1: 90.0,
+            y1: 10.0,
+            x2: 210.0,
+            y2: 110.0,
+        },
+        Rect {
+            x1: 170.0,
+            y1: 10.0,
+            x2: 280.0,
+            y2: 110.0,
+        },
+    ];
+    let mut image = ImageBuffer::<Rgba<u8>, _>::from_pixel(300, 120, Rgba([72, 72, 72, 255]));
+    let fills = [
+        Rgba([72, 72, 72, 255]),
+        Rgba([34, 34, 34, 255]),
+        Rgba([42, 66, 74, 255]),
+    ];
+    for (area, fill) in areas.iter().zip(fills) {
+        let center = ((area.x1 + area.x2) * 0.5, (area.y1 + area.y2) * 0.5);
+        let radius = ((area.x2 - area.x1) * 0.5, (area.y2 - area.y1) * 0.5);
+        for y in area.y1 as u32..area.y2 as u32 {
+            for x in area.x1 as u32..area.x2 as u32 {
+                let dx = (x as f32 + 0.5 - center.0) / radius.0;
+                let dy = (y as f32 + 0.5 - center.1) / radius.1;
+                if dx * dx + dy * dy <= 1.0 {
+                    image.put_pixel(x, y, fill);
+                }
+            }
+        }
+    }
+    image.save(&source).unwrap();
+    let payloads = areas
+        .into_iter()
+        .enumerate()
+        .map(|(index, bbox)| TypesetPayload {
+            id: Some(format!("overlap-{index}")),
+            source_text: Some("source".into()),
+            kind: Some("dialogue".into()),
+            preserve_by_default: Some(false),
+            needs_review: None,
+            flagged: None,
+            preserve_source: Some(false),
+            fallback_font_paths: Vec::new(),
+            bbox,
+            bubble_bbox: Some(bbox),
+            text_bbox: None,
+            padding: Some(4.0),
+            text: format!("BUBBLE {index}"),
+            font_path: Some(font_path.display().to_string()),
+            min_font_size: Some(8.0),
+            max_font_size: Some(20.0),
+            text_color: Some(if index == 1 { "black" } else { "white" }.into()),
+            shape: Some("ellipse".into()),
+        })
+        .collect::<Vec<_>>();
+    let report = typeset_page(&source, &payloads, &output).unwrap();
+    let rendered = image::open(&output).unwrap().to_rgba8();
+    let bubble_reports = report["bubbles"].as_array().unwrap();
+    assert!(
+        bubble_reports
+            .iter()
+            .all(|bubble| bubble["mask_used"] == true)
+    );
+    assert!(bubble_reports[0]["safe_mask_bbox"]["x2"].as_f64().unwrap() <= 113.0);
+    assert!(bubble_reports[1]["safe_mask_bbox"]["x1"].as_f64().unwrap() >= 112.0);
+    assert!(bubble_reports[1]["safe_mask_bbox"]["x2"].as_f64().unwrap() <= 189.0);
+    assert!(bubble_reports[2]["safe_mask_bbox"]["x1"].as_f64().unwrap() >= 187.0);
+    assert!(bubble_reports[0]["safe_bbox"]["x2"].as_f64().unwrap() <= 113.0);
+    assert!(bubble_reports[1]["safe_bbox"]["x1"].as_f64().unwrap() >= 112.0);
+    assert!(bubble_reports[1]["safe_bbox"]["x2"].as_f64().unwrap() <= 189.0);
+    assert!(bubble_reports[2]["safe_bbox"]["x1"].as_f64().unwrap() >= 187.0);
+
+    assert!(rendered.pixels().any(|pixel| pixel[0] > 220));
+    // White glyphs from the first and third bubbles cannot enter the overlap
+    // strips owned by the middle/neighboring detector centres.
+    for (x, y, pixel) in rendered.enumerate_pixels() {
+        if pixel[0] > 220 {
+            assert!(
+                !(113..188).contains(&x),
+                "white ink invaded middle owner at {x},{y}"
+            );
+            assert!(
+                !(170..188).contains(&x),
+                "white ink invaded right owner at {x},{y}"
+            );
+        }
+    }
+    for (x, _y, pixel) in rendered.enumerate_pixels() {
+        if pixel[0] < 10 {
+            assert!(
+                (113..188).contains(&x),
+                "black ink escaped middle owner at {x}"
+            );
+        }
+    }
+}
+
+#[test]
 fn text_color_is_legacy_optional_and_rejects_unknown_values() {
     let legacy: TypesetPayload = serde_json::from_value(serde_json::json!({
         "bbox": {"x1": 1.0, "y1": 1.0, "x2": 8.0, "y2": 8.0},

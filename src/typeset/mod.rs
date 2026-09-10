@@ -125,7 +125,28 @@ pub fn typeset_page_with_fallbacks(
             payload.text_bbox,
             &balloon_areas,
             index,
-        );
+        )
+        .or_else(|| {
+            // A dark or heavily occluded balloon may not yield a reliable
+            // connected component.  If its detector rectangle overlaps a
+            // neighbor, keep ownership explicit with the requested shape so
+            // layout and raster containment cannot fall back to the full
+            // shared rectangle.  Non-overlapping failures intentionally use
+            // the existing full shape envelope in the solver.
+            let overlaps_other = balloon_areas
+                .iter()
+                .enumerate()
+                .any(|(other_index, other)| {
+                    other_index != index
+                        && valid_balloon_rect(*other)
+                        && rects_overlap(balloon_area, *other)
+                });
+            if overlaps_other {
+                synthetic_balloon_mask(&mask_source, balloon_area, shape, &balloon_areas, index)
+            } else {
+                None
+            }
+        });
         let layout = fit_text_with_font_candidates_masked(
             &candidates,
             &payload.text,
@@ -411,6 +432,52 @@ fn infer_balloon_mask_owned(
         return None;
     }
     LayoutMask::from_binary(origin_x as i32, origin_y as i32, width, height, component).ok()
+}
+
+/// Build a geometry-only ownership mask when pixels cannot identify a
+/// balloon. The detector supplies rectangles, so the requested shape is the
+/// only safe envelope available. Overlap pixels are assigned by nearest
+/// detector centre, matching connected-component ownership above.
+fn synthetic_balloon_mask(
+    image: &RgbaImage,
+    area: crate::domain::Rect,
+    shape: &str,
+    all_areas: &[crate::domain::Rect],
+    current_index: usize,
+) -> Option<LayoutMask> {
+    if shape != "ellipse" && shape != "rectangle" {
+        return None;
+    }
+    let area = area.clip(image.width() as f32, image.height() as f32)?;
+    let origin_x = area.x1.floor().max(0.0) as u32;
+    let origin_y = area.y1.floor().max(0.0) as u32;
+    let end_x = area.x2.ceil().min(image.width() as f32) as u32;
+    let end_y = area.y2.ceil().min(image.height() as f32) as u32;
+    let width = usize::try_from(end_x.saturating_sub(origin_x)).ok()?;
+    let height = usize::try_from(end_y.saturating_sub(origin_y)).ok()?;
+    if width < 8 || height < 8 {
+        return None;
+    }
+    let center = ((area.x1 + area.x2) * 0.5, (area.y1 + area.y2) * 0.5);
+    let radius = ((area.x2 - area.x1) * 0.5, (area.y2 - area.y1) * 0.5);
+    let mut pixels = vec![false; width.saturating_mul(height)];
+    for y in origin_y..end_y {
+        for x in origin_x..end_x {
+            let inside_shape = if shape == "rectangle" {
+                point_in_rect(x, y, area)
+            } else {
+                let dx = (x as f32 + 0.5 - center.0) / radius.0;
+                let dy = (y as f32 + 0.5 - center.1) / radius.1;
+                dx * dx + dy * dy <= 1.0
+            };
+            if inside_shape && pixel_owned_by_center(x, y, area, all_areas, current_index) {
+                let local_x = (x - origin_x) as usize;
+                let local_y = (y - origin_y) as usize;
+                pixels[local_y * width + local_x] = true;
+            }
+        }
+    }
+    LayoutMask::from_binary_geometry(origin_x as i32, origin_y as i32, width, height, pixels).ok()
 }
 
 fn valid_balloon_rect(rect: crate::domain::Rect) -> bool {

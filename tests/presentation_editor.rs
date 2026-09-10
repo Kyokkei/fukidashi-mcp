@@ -189,6 +189,9 @@ fn editor_gallery_variants_and_render_endpoint_are_constrained() {
         "#38bdf8",
         ".bubble-box .handle",
         "initialBubbleBBox",
+        "initialTextBBox",
+        "transformRect",
+        "dragging.initialTextBBox",
         "item.bubble_bbox={...item.bbox}",
         "b.bubble_bbox={...b.bbox}",
         "if(dragging)return",
@@ -899,6 +902,16 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
     let rerender: serde_json::Value =
         serde_json::from_str(render.split_once("\r\n\r\n").unwrap().1).unwrap();
     assert_eq!(rerender["state"]["pages"][0]["render_dirty"], false);
+    assert_eq!(
+        rerender["state"]["pages"][0]["bubbles"][0]["bubble_bbox"],
+        moved_bbox
+    );
+    let persisted_after_render: serde_json::Value =
+        serde_json::from_slice(&fs::read(persisted_path).unwrap()).unwrap();
+    assert_eq!(
+        persisted_after_render["pages"][0]["bubbles"][0]["bubble_bbox"],
+        moved_bbox
+    );
     assert_eq!(
         rerender["typeset"]["bubbles"][1]["skip_reason"],
         "preserve_source"
