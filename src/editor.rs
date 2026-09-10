@@ -1186,6 +1186,19 @@ fn safe_project_path(root: &Path, raw: &str) -> Result<PathBuf> {
     safe_project_path_with_allowlist(root, raw, &[])
 }
 
+fn safe_font_path(root: &Path, raw: &str) -> Result<PathBuf> {
+    let input = PathBuf::from(raw);
+    if input.is_file() {
+        if let Some(ext) = input.extension().and_then(|e| e.to_str()) {
+            let ext = ext.to_ascii_lowercase();
+            if matches!(ext.as_str(), "ttf" | "otf" | "ttc" | "woff" | "woff2") {
+                return Ok(input);
+            }
+        }
+    }
+    safe_project_path(root, raw)
+}
+
 fn safe_project_path_with_allowlist(
     root: &Path,
     raw: &str,
@@ -1680,7 +1693,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             .or_else(|| bubble.get("rendered_font_path").and_then(Value::as_str))
             .or(global_font)
             .ok_or_else(|| anyhow!("bubble {bubble_index} has no project font_path"))?;
-        let font_path = safe_project_path(&session.root_dir, font_path)?;
+        let font_path = safe_font_path(&session.root_dir, font_path)?;
         let font_size = bubble
             .get("font_size")
             .and_then(Value::as_f64)
@@ -1838,6 +1851,31 @@ fn restore_source_bubbles(
     Ok(())
 }
 
+fn parse_stroke_color(stroke: &Value) -> image::Rgb<u8> {
+    if let Some(raw) = stroke.get("color").and_then(Value::as_str) {
+        let raw = raw.trim();
+        let hex = raw.strip_prefix('#').unwrap_or(raw);
+        if hex.len() == 6 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) {
+                return image::Rgb([r, g, b]);
+            }
+        } else if hex.len() == 3 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..1], 16),
+                u8::from_str_radix(&hex[1..2], 16),
+                u8::from_str_radix(&hex[2..3], 16),
+            ) {
+                return image::Rgb([r * 17, g * 17, b * 17]);
+            }
+        }
+    }
+    image::Rgb([255, 255, 255])
+}
+
 fn apply_correction_strokes(cleaned: &Path, strokes: &[Value]) -> Result<image::RgbImage> {
     let base = image::open(cleaned)
         .with_context(|| format!("read cleaned image {}", cleaned.display()))?
@@ -1851,6 +1889,7 @@ fn apply_correction_strokes(cleaned: &Path, strokes: &[Value]) -> Result<image::
         if mode != "cover" && mode != "restore" {
             bail!("correction stroke mode must be cover or restore");
         }
+        let color = parse_stroke_color(stroke);
         let radius = (stroke.get("size").and_then(Value::as_f64).unwrap_or(24.0) / 2.0)
             .clamp(1.0, 80.0) as f32;
         let points = stroke
@@ -1886,11 +1925,12 @@ fn apply_correction_strokes(cleaned: &Path, strokes: &[Value]) -> Result<image::
                     pair[0].1 + (pair[1].1 - pair[0].1) * t,
                     radius,
                     mode == "restore",
+                    color,
                 );
             }
         }
         if let Some(&(x, y)) = points.first() {
-            paint_circle(&mut output, &base, x, y, radius, mode == "restore");
+            paint_circle(&mut output, &base, x, y, radius, mode == "restore", color);
         }
     }
     Ok(output)
@@ -1903,6 +1943,7 @@ fn paint_circle(
     y: f32,
     radius: f32,
     restore: bool,
+    color: image::Rgb<u8>,
 ) {
     let left = (x - radius).floor().max(0.0) as u32;
     let top = (y - radius).floor().max(0.0) as u32;
@@ -1917,7 +1958,7 @@ fn paint_circle(
                 *output.get_pixel_mut(px, py) = if restore {
                     *base.get_pixel(px, py)
                 } else {
-                    image::Rgb([255, 255, 255])
+                    color
                 };
             }
         }

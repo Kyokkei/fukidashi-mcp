@@ -136,11 +136,17 @@ fn editor_gallery_variants_and_render_endpoint_are_constrained() {
         "errorPanel",
         "showError",
         "bubbleAdvisory",
+        "redoStack",
+        "function redo",
+        "brushHex",
+        "#22d3ee",
+        "Ctrl+Y",
     ] {
         assert!(html.contains(marker), "editor HTML missing {marker}");
     }
     assert!(html.contains("fetch(endpoint('save'),"));
     assert!(html.contains("Fukidashi editor review"));
+    assert!(!html.contains("paintUndo"));
 }
 
 #[test]
@@ -739,8 +745,12 @@ fn brush_only_rerender_reuses_resolved_layout_and_allows_approval() {
         resolved_fallback.display().to_string()
     );
     assert_eq!(
-        initial_report["bubbles"][0]["mixed_font_fallback_used"],
+        initial_report["bubbles"][0]["font_fallback_used"],
         true
+    );
+    assert_eq!(
+        initial_report["bubbles"][0]["mixed_font_fallback_used"],
+        false
     );
     let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
     workflow

@@ -316,7 +316,9 @@ impl MangaDexClient {
         let manga_title = self.manga_title(&chapter.manga_id).await?;
         if chapter.external_url.is_some() {
             if let Some(title) = manga_title.as_deref() {
-                if let Ok(mirror_url) = resolve_aggregator_mirror(title, chapter.chapter.as_deref()).await {
+                if let Ok(mirror_url) =
+                    resolve_aggregator_mirror(title, chapter.chapter.as_deref()).await
+                {
                     let direct_req = PullChapterRequest {
                         source: "direct".to_owned(),
                         url: Some(mirror_url),

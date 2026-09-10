@@ -540,6 +540,39 @@ impl<'a> MultiShaper<'a> {
         }
         Ok((glyphs, x, left, right, top, bottom))
     }
+    fn choose_base_font_for_text(&self, text: &str) -> usize {
+        let alphabetic_chars = text
+            .chars()
+            .filter(|c| requires_font_glyph(*c) && c.is_alphabetic())
+            .collect::<Vec<_>>();
+        if alphabetic_chars.is_empty() {
+            return 0;
+        }
+        for (index, candidate) in self.fonts.iter().enumerate() {
+            if let Some(face) = Face::from_slice(candidate.bytes, 0) {
+                let all_covered = alphabetic_chars.iter().all(|c| {
+                    face.glyph_index(*c).is_some_and(|glyph| glyph.0 != 0)
+                });
+                if all_covered {
+                    return index;
+                }
+            }
+        }
+        0
+    }
+
+    fn font_covers_cluster(&self, font_index: usize, cluster: &str) -> bool {
+        let Some(candidate) = self.fonts.get(font_index) else {
+            return false;
+        };
+        let Some(face) = Face::from_slice(candidate.bytes, 0) else {
+            return false;
+        };
+        cluster
+            .chars()
+            .filter(|c| requires_font_glyph(*c))
+            .all(|c| face.glyph_index(c).is_some_and(|glyph| glyph.0 != 0))
+    }
 }
 
 impl TextShaper for MultiShaper<'_> {
@@ -561,9 +594,14 @@ impl TextShaper for MultiShaper<'_> {
                 bottom: self.metrics.descent,
             });
         }
+        let base_font_index = self.choose_base_font_for_text(text);
         let mut runs = Vec::<(usize, String)>::new();
         for cluster in UnicodeSegmentation::graphemes(text, true) {
-            let index = choose_font_index(self.fonts, cluster)?;
+            let index = if self.font_covers_cluster(base_font_index, cluster) {
+                base_font_index
+            } else {
+                choose_font_index(self.fonts, cluster)?
+            };
             if let Some((last_index, last_text)) = runs.last_mut()
                 && *last_index == index
             {

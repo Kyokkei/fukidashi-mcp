@@ -663,6 +663,55 @@ mod tests {
     }
 
     #[test]
+    fn vietnamese_text_unifies_to_fallback_font_without_midword_splitting() {
+        let primary_bytes = crate::fonts::COMIC_NEUE_REGULAR.bytes;
+        let fallback_bytes = crate::fonts::PATRICK_HAND_REGULAR.bytes;
+        let primary_font =
+            fontdue::Font::from_bytes(primary_bytes, fontdue::FontSettings::default()).unwrap();
+        let fallback_font =
+            fontdue::Font::from_bytes(fallback_bytes, fontdue::FontSettings::default()).unwrap();
+        let candidates = [
+            FontCandidate {
+                id: "comic-neue",
+                bytes: primary_bytes,
+                font: &primary_font,
+            },
+            FontCandidate {
+                id: "patrick-hand",
+                bytes: fallback_bytes,
+                font: &fallback_font,
+            },
+        ];
+        let layout = fit_text_with_font_candidates(
+            &candidates,
+            "Thằng nhóc dễ thương ghê~",
+            Rect {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 500.0,
+                y2: 200.0,
+            },
+            None,
+            None,
+            "rectangle",
+            8.0,
+            24.0,
+            None,
+        )
+        .unwrap();
+        // The entire Vietnamese sentence must be unified into Patrick Hand (font index 1)
+        // rather than splitting Latin and accented graphemes across Comic Neue and Patrick Hand.
+        for line in &layout.lines {
+            for run in &line.font_runs {
+                assert_eq!(
+                    run.font_index, 1,
+                    "all font runs in Vietnamese dialogue must use the Vietnamese font: {run:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn unused_fallback_does_not_change_primary_metrics() {
         let primary_bytes = crate::fonts::COMIC_NEUE_REGULAR.bytes;
         let fallback_bytes = crate::fonts::NOTO_SANS_SYMBOLS2_REGULAR.bytes;

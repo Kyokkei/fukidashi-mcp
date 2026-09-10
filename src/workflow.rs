@@ -145,6 +145,52 @@ pub struct PendingPage {
     pub analysis_path: PathBuf,
 }
 
+/// Operator-facing page fraction for CLI/MCP stderr: current / total * 100.
+pub fn page_progress_percent(current_page: usize, total_pages: usize) -> f64 {
+    if total_pages == 0 {
+        0.0
+    } else {
+        (current_page as f64) * 100.0 / (total_pages as f64)
+    }
+}
+
+/// `[FUKIDASHI] [Page 4/6] (66.7%) Analyzing layout & OCR...`
+pub fn format_page_progress(current_page: usize, total_pages: usize, stage: &str) -> String {
+    format!(
+        "[FUKIDASHI] [Page {current_page}/{total_pages}] ({:.1}%) {stage}",
+        page_progress_percent(current_page, total_pages)
+    )
+}
+
+/// Structured progress object attached to strict-v1 start/submit payloads.
+pub fn page_progress_json(
+    current_page: usize,
+    total_pages: usize,
+    stage: &str,
+) -> serde_json::Value {
+    json!({
+        "current_page": current_page,
+        "total_pages": total_pages,
+        "percent": (page_progress_percent(current_page, total_pages) * 10.0).round() / 10.0,
+        "stage": stage,
+        "message": format_page_progress(current_page, total_pages, stage),
+    })
+}
+
+/// Stream `[Page X/Y]` status on stderr so a terminal operator is not staring
+/// into a silent MCP/CLI process. JSON-RPC stays on stdout.
+pub fn emit_page_progress(current_page: usize, total_pages: usize, stage: &str) {
+    let line = format_page_progress(current_page, total_pages, stage);
+    eprintln!("{line}");
+    tracing::info!(
+        target: "fukidashi.progress",
+        current_page,
+        total_pages,
+        stage,
+        "{line}"
+    );
+}
+
 /// The server-owned paths and state for one page in a managed job.  Clients
 /// normally receive only the page number and an opaque translation token; the
 /// record is kept public for the strict loop implementation and diagnostics.
@@ -861,6 +907,18 @@ impl Workflow {
             bail!("{label} does not exist: {}", path.display());
         }
         sha256_file(&path)
+    }
+
+    /// Total inventory size for `[Page X/Y]` progress, including already
+    /// rendered pages. Empty expected_pages falls back to the manifest map.
+    pub fn managed_job_page_count(&self, job: &Path) -> Result<usize> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let manifest = load_manifest(&job)?;
+        if manifest.expected_pages.is_empty() {
+            Ok(manifest.pages.len())
+        } else {
+            Ok(manifest.expected_pages.len())
+        }
     }
 
     pub fn next_pending_page(&self, job: &Path) -> Result<Option<PendingPage>> {
@@ -2690,6 +2748,24 @@ mod tests {
     use super::*;
     use image::{Rgba, RgbaImage};
     use tempfile::tempdir;
+
+    #[test]
+    fn page_progress_reports_current_over_total() {
+        assert_eq!(
+            format_page_progress(4, 6, "Analyzing layout & OCR..."),
+            "[FUKIDASHI] [Page 4/6] (66.7%) Analyzing layout & OCR..."
+        );
+        assert_eq!(
+            format_page_progress(1, 6, "Inpainting clean mask..."),
+            "[FUKIDASHI] [Page 1/6] (16.7%) Inpainting clean mask..."
+        );
+        let payload = page_progress_json(4, 6, "Typesetting dialogue...");
+        assert_eq!(payload["current_page"], 4);
+        assert_eq!(payload["total_pages"], 6);
+        assert_eq!(payload["percent"], 66.7);
+        assert_eq!(payload["stage"], "Typesetting dialogue...");
+        assert_eq!(page_progress_percent(0, 0), 0.0);
+    }
 
     #[test]
     fn clean_artifact_rejects_unchanged_mask() {

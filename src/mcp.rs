@@ -21,7 +21,7 @@ use crate::{
     domain::{Rect, TypesetPayload},
     error::FukidashiError,
     ingress::{PullChapterRequest, SearchMangaRequest},
-    workflow::{PendingPage, ScopeSpec, Workflow},
+    workflow::{PendingPage, ScopeSpec, Workflow, emit_page_progress, page_progress_json},
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -289,6 +289,17 @@ fn json_result<T: Serialize>(value: &T, is_error: bool) -> CallToolResult {
     } else {
         CallToolResult::success(vec![ContentBlock::text(text)])
     }
+}
+
+fn attach_page_progress(
+    value: &mut serde_json::Value,
+    current_page: usize,
+    total_pages: usize,
+    stage: &str,
+) {
+    value["current_page"] = serde_json::json!(current_page);
+    value["total_pages"] = serde_json::json!(total_pages);
+    value["progress"] = page_progress_json(current_page, total_pages, stage);
 }
 
 fn launch_default_browser(url: &str) -> Result<(), FukidashiError> {
@@ -801,7 +812,7 @@ impl FukidashiServer {
         };
         let job_id = pending.job_id.clone();
         if items.is_empty() {
-            return Ok(serde_json::json!({
+            let mut value = serde_json::json!({
                 "protocol": "strict-v1",
                 "status": "needs_manual_scope",
                 "job_id": job_id,
@@ -816,7 +827,14 @@ impl FukidashiServer {
                     "action": "manual_scope_required",
                     "reason": "start a new job with a scope that excludes this page, or review it manually",
                 },
-            }));
+            });
+            attach_page_progress(
+                &mut value,
+                pending.page_number,
+                pending.total_pages,
+                "Manual scope required",
+            );
+            return Ok(value);
         }
         let token = self.issue_translation_claim(
             pending,
@@ -826,7 +844,7 @@ impl FukidashiServer {
             replace_sfx,
         )?;
         let ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
-        Ok(serde_json::json!({
+        let mut value = serde_json::json!({
             "protocol": "strict-v1",
             "status": "page_ready",
             "job_id": job_id,
@@ -845,7 +863,19 @@ impl FukidashiServer {
                 },
                 "required_ids": ids,
             },
-        }))
+        });
+        emit_page_progress(
+            pending.page_number,
+            pending.total_pages,
+            "Waiting for translations...",
+        );
+        attach_page_progress(
+            &mut value,
+            pending.page_number,
+            pending.total_pages,
+            "Waiting for translations...",
+        );
+        Ok(value)
     }
 
     async fn analyze_strict_page(
@@ -1023,6 +1053,12 @@ impl FukidashiServer {
         let mut pending = pending;
         let mut auto_preserved_pages = Vec::new();
         loop {
+            let analyzing = if pending.analysis_path.is_file() {
+                "Resuming saved analysis..."
+            } else {
+                "Analyzing layout & OCR..."
+            };
+            emit_page_progress(pending.page_number, pending.total_pages, analyzing);
             let analysis = if pending.analysis_path.is_file() {
                 read_saved_analysis(&self.workflow, &pending.analysis_path)?
             } else {
@@ -1031,6 +1067,11 @@ impl FukidashiServer {
             let all_items = saved_translation_items(&analysis)?;
             let items = translatable_items(&all_items, replace_sfx);
             if !replace_sfx && items.is_empty() {
+                emit_page_progress(
+                    pending.page_number,
+                    pending.total_pages,
+                    "Preserving source page (no dialogue)...",
+                );
                 self.complete_preserved_page(&pending, &analysis).await?;
                 auto_preserved_pages.push(pending.page_number);
                 match self.workflow.next_pending_page(&pending.job_dir) {
@@ -1039,8 +1080,19 @@ impl FukidashiServer {
                         continue;
                     }
                     Ok(None) => {
+                        emit_page_progress(
+                            pending.total_pages,
+                            pending.total_pages,
+                            "Review ready",
+                        );
                         let mut response = self.strict_review_ready(&pending.job_dir)?;
                         response["auto_preserved_pages"] = serde_json::json!(auto_preserved_pages);
+                        attach_page_progress(
+                            &mut response,
+                            pending.total_pages,
+                            pending.total_pages,
+                            "Review ready",
+                        );
                         return Ok(response);
                     }
                     Err(error) => return Err(FukidashiError::InvalidInput(error.to_string())),
@@ -1366,6 +1418,51 @@ fn rects_overlap(left: Rect, right: Rect) -> bool {
     left.x1 < right.x2 && right.x1 < left.x2 && left.y1 < right.y2 && right.y1 < left.y2
 }
 
+fn json_bbox(item: &serde_json::Value) -> Option<Rect> {
+    serde_json::from_value::<Rect>(item.get("bbox").cloned()?)
+        .ok()
+        .and_then(|rect| rect.validate().ok())
+}
+
+fn checkpoint_item_is_preserved(item: &serde_json::Value, replace_sfx: bool) -> bool {
+    let keep_source = item
+        .get("keep_source")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if keep_source {
+        return true;
+    }
+    if replace_sfx {
+        return false;
+    }
+    item.get("preserve_by_default")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || item
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| kind == "unmatched_text")
+        || item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id.starts_with("text-"))
+}
+
+fn checkpoint_item_is_translatable_dialogue(item: &serde_json::Value, replace_sfx: bool) -> bool {
+    if checkpoint_item_is_preserved(item, replace_sfx) {
+        return false;
+    }
+    let id = item
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let kind = item
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("dialogue");
+    !id.starts_with("text-") && kind != "unmatched_text"
+}
+
 fn checkpoint_text_regions(
     path: &std::path::Path,
     replace_sfx: bool,
@@ -1378,67 +1475,89 @@ fn checkpoint_text_regions(
         ));
     }
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-    let preserved_bboxes = if replace_sfx {
-        Vec::new()
-    } else {
-        value
-            .get("translation_handoff")
-            .and_then(|handoff| handoff.get("items"))
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|item| {
-                item.get("keep_source")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(false)
-                    || item
-                        .get("preserve_by_default")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-                    || item
-                        .get("kind")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|kind| kind == "unmatched_text")
-                    || item
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|id| id.starts_with("text-"))
-            })
-            .filter_map(|item| serde_json::from_value::<Rect>(item.get("bbox").cloned()?).ok())
-            .filter_map(|rect| rect.validate().ok())
-            .collect::<Vec<_>>()
-    };
+    let handoff_items = value
+        .get("translation_handoff")
+        .and_then(|handoff| handoff.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| items.as_slice())
+        .unwrap_or(&[]);
+    let mut preserved_bboxes = Vec::new();
+    let mut translatable_bboxes = Vec::new();
+    let mut preserved_ids = BTreeSet::new();
+    for item in handoff_items {
+        let Some(rect) = json_bbox(item) else {
+            continue;
+        };
+        let id = item
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        if checkpoint_item_is_preserved(item, replace_sfx) {
+            preserved_bboxes.push(rect);
+            if !id.is_empty() {
+                preserved_ids.insert(id.to_owned());
+            }
+        } else if checkpoint_item_is_translatable_dialogue(item, replace_sfx) {
+            translatable_bboxes.push(rect);
+        }
+    }
+    // Dialogue strokes must stay in the inpaint mask even when a nearby
+    // preserved SFX/unmatched box overlaps them. Dropping those lines leaves
+    // source glyphs under the typeset translation.
+    if let Some(bubbles) = value.get("bubbles").and_then(serde_json::Value::as_array) {
+        for bubble in bubbles {
+            let Some(rect) = json_bbox(bubble) else {
+                continue;
+            };
+            let id = bubble
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if preserved_ids.contains(id) {
+                preserved_bboxes.push(rect);
+            } else if !id.starts_with("text-") {
+                translatable_bboxes.push(rect);
+            }
+        }
+    }
     let lines = value
         .get("text_lines")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| {
             FukidashiError::InvalidInput("analysis checkpoint has no text_lines array".into())
         })?;
-    let regions = lines
-        .iter()
+    let mut regions = Vec::with_capacity(lines.len());
+    for line in lines {
+        let rect = serde_json::from_value::<Rect>(line.get("bbox").cloned().unwrap_or_default())
+            .map_err(FukidashiError::from)
+            .and_then(Rect::validate)?;
+        let belongs_to_dialogue = translatable_bboxes
+            .iter()
+            .any(|bubble| rects_overlap(rect, *bubble));
+        if belongs_to_dialogue {
+            regions.push(rect);
+            continue;
+        }
         // Low-confidence unmatched detections are commonly art/sfx geometry
         // (for example the dots on a chastity device), not text strokes.  Do
         // not feed those broad boxes into a destructive cleaning mask.
-        .filter(|line| {
-            line.get("confidence")
-                .and_then(serde_json::Value::as_f64)
-                .map(|confidence| confidence >= 0.5)
-                .unwrap_or(true)
-        })
-        .map(|line| {
-            serde_json::from_value::<Rect>(line.get("bbox").cloned().unwrap_or_default())
-                .map_err(FukidashiError::from)
-                .and_then(Rect::validate)
-        })
-        .collect::<std::result::Result<Vec<_>, FukidashiError>>()?;
-    Ok(regions
-        .into_iter()
-        .filter(|rect| {
-            !preserved_bboxes
-                .iter()
-                .any(|preserved| rects_overlap(*rect, *preserved))
-        })
-        .collect())
+        let confident = line
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .map(|confidence| confidence >= 0.5)
+            .unwrap_or(true);
+        if !confident {
+            continue;
+        }
+        if preserved_bboxes
+            .iter()
+            .any(|preserved| rects_overlap(rect, *preserved))
+        {
+            continue;
+        }
+        regions.push(rect);
+    }
+    Ok(regions)
 }
 
 #[tool_router]
@@ -1499,7 +1618,12 @@ impl FukidashiServer {
             Ok(Some(page)) => page,
             Ok(None) => {
                 return match self.strict_review_ready(&job) {
-                    Ok(value) => json_result(&value, false),
+                    Ok(mut value) => {
+                        let total = self.workflow.managed_job_page_count(&job).unwrap_or(0);
+                        emit_page_progress(total, total, "Review ready");
+                        attach_page_progress(&mut value, total, total, "Review ready");
+                        json_result(&value, false)
+                    }
                     Err(error) => json_result(
                         &serde_json::json!({"protocol":"strict-v1","error":error.to_string()}),
                         true,
@@ -1517,16 +1641,19 @@ impl FukidashiServer {
                 );
             }
         };
+        let page_number = pending.page_number;
+        let total_pages = pending.total_pages;
         match self.prepare_strict_page(pending, &req).await {
             Ok(value) => json_result(&value, false),
-            Err(error) => json_result(
-                &serde_json::json!({
+            Err(error) => {
+                let mut value = serde_json::json!({
                     "protocol": "strict-v1",
                     "error": error.to_string(),
                     "next_step": "fix the reported runtime/model issue and call fukidashi_translation_start again with the same job_id"
-                }),
-                true,
-            ),
+                });
+                attach_page_progress(&mut value, page_number, total_pages, "Error");
+                json_result(&value, true)
+            }
         }
     }
 
@@ -1553,16 +1680,15 @@ impl FukidashiServer {
         };
         let fail = |server: &FukidashiServer, error: FukidashiError| {
             server.reset_translation_claim(&req.work_token);
-            json_result(
-                &serde_json::json!({
-                    "protocol": "strict-v1",
-                    "error": error.to_string(),
-                    "retryable": true,
-                    "work_token": req.work_token,
-                    "next_step": "correct the submission or runtime issue and retry the same work_token; call start again only after a stale-token error"
-                }),
-                true,
-            )
+            let mut value = serde_json::json!({
+                "protocol": "strict-v1",
+                "error": error.to_string(),
+                "retryable": true,
+                "work_token": req.work_token,
+                "next_step": "correct the submission or runtime issue and retry the same work_token; call start again only after a stale-token error"
+            });
+            attach_page_progress(&mut value, claim.page_number, claim.total_pages, "Error");
+            json_result(&value, true)
         };
 
         let pending = match self.workflow.next_pending_page(&claim.job_dir) {
@@ -1654,6 +1780,11 @@ impl FukidashiServer {
         let cleaned_path = if let Some(path) = cleaned_path {
             path
         } else {
+            emit_page_progress(
+                claim.page_number,
+                claim.total_pages,
+                "Inpainting clean mask...",
+            );
             let clean_request = CleanRequest {
                 image_path: claim.source_image.display().to_string(),
                 mask_path: None,
@@ -1689,6 +1820,11 @@ impl FukidashiServer {
                 Err(error) => return fail(self, error),
             }
         };
+        emit_page_progress(
+            claim.page_number,
+            claim.total_pages,
+            "Typesetting dialogue...",
+        );
         let typeset_request = TypesetRequest {
             image_path: cleaned_path.display().to_string(),
             bubbles: payloads,
@@ -1752,10 +1888,15 @@ impl FukidashiServer {
         match response {
             Ok(mut value) => {
                 value["completed_page"] = serde_json::json!(claim.page_number);
+                if value.get("current_page").is_none() {
+                    let total = claim.total_pages;
+                    emit_page_progress(total, total, "Review ready");
+                    attach_page_progress(&mut value, total, total, "Review ready");
+                }
                 json_result(&value, false)
             }
-            Err(error) => json_result(
-                &serde_json::json!({
+            Err(error) => {
+                let mut value = serde_json::json!({
                     "protocol": "strict-v1",
                     "status": "page_complete",
                     "job_id": claim
@@ -1773,9 +1914,15 @@ impl FukidashiServer {
                             .and_then(|name| name.to_str())
                             .unwrap_or_default()},
                     }
-                }),
-                true,
-            ),
+                });
+                attach_page_progress(
+                    &mut value,
+                    claim.page_number,
+                    claim.total_pages,
+                    "Page complete",
+                );
+                json_result(&value, true)
+            }
         }
     }
 
@@ -3055,6 +3202,108 @@ mod tests {
         assert_eq!(preserved_item_json(&items[1])["translation_allowed"], false);
     }
 
+    fn write_checkpoint(value: &serde_json::Value) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("analysis.json");
+        std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        (dir, path)
+    }
+
+    fn overlapping_double_text_checkpoint() -> serde_json::Value {
+        serde_json::json!({
+            "bubbles": [{
+                "id": "bubble-1",
+                "bbox": {"x1": 10.0, "y1": 10.0, "x2": 80.0, "y2": 80.0}
+            }],
+            "text_lines": [
+                {
+                    "id": "line-dialogue",
+                    "confidence": 0.91,
+                    "bbox": {"x1": 20.0, "y1": 20.0, "x2": 60.0, "y2": 40.0}
+                },
+                {
+                    "id": "line-low-conf-dialogue",
+                    "confidence": 0.21,
+                    "bbox": {"x1": 22.0, "y1": 42.0, "x2": 58.0, "y2": 55.0}
+                },
+                {
+                    "id": "line-sfx",
+                    "confidence": 0.96,
+                    "bbox": {"x1": 82.0, "y1": 82.0, "x2": 110.0, "y2": 110.0}
+                },
+                {
+                    "id": "line-noise",
+                    "confidence": 0.18,
+                    "bbox": {"x1": 1.0, "y1": 1.0, "x2": 8.0, "y2": 8.0}
+                }
+            ],
+            "translation_handoff": {
+                "items": [{
+                    "id": "bubble-1",
+                    "kind": "dialogue",
+                    "source_text": "原文",
+                    "bbox": {"x1": 10.0, "y1": 10.0, "x2": 80.0, "y2": 80.0}
+                }, {
+                    "id": "text-sfx",
+                    "kind": "unmatched_text",
+                    "preserve_by_default": true,
+                    "source_text": "ドン",
+                    "bbox": {"x1": 50.0, "y1": 25.0, "x2": 95.0, "y2": 95.0}
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn overlapping_preserved_sfx_does_not_drop_dialogue_inpaint_regions() {
+        let (_dir, path) = write_checkpoint(&overlapping_double_text_checkpoint());
+        let regions = checkpoint_text_regions(&path, false).unwrap();
+        assert!(
+            regions.iter().any(|rect| {
+                (rect.x1 - 20.0).abs() < f32::EPSILON && (rect.y1 - 20.0).abs() < f32::EPSILON
+            }),
+            "dialogue text line overlapping preserved SFX must stay in the inpaint mask: {regions:?}"
+        );
+        assert!(
+            regions.iter().any(|rect| {
+                (rect.x1 - 22.0).abs() < f32::EPSILON && (rect.y1 - 42.0).abs() < f32::EPSILON
+            }),
+            "low-confidence dialogue inside a translatable bubble must still be inpainted: {regions:?}"
+        );
+        assert!(
+            !regions.iter().any(|rect| rect.x1 > 80.0 && rect.y1 > 80.0),
+            "unmatched SFX outside a bubble must stay out of the inpaint mask: {regions:?}"
+        );
+        assert!(
+            !regions.iter().any(|rect| rect.x2 <= 8.0),
+            "low-confidence unmatched noise must stay out of the inpaint mask: {regions:?}"
+        );
+    }
+
+    #[test]
+    fn keep_source_dialogue_is_excluded_from_inpaint_mask() {
+        let mut analysis = overlapping_double_text_checkpoint();
+        analysis["translation_handoff"]["items"][0]["keep_source"] = serde_json::json!(true);
+        let (_dir, path) = write_checkpoint(&analysis);
+        let regions = checkpoint_text_regions(&path, false).unwrap();
+        assert!(
+            !regions.iter().any(|rect| rect.x1 < 80.0 && rect.y1 < 80.0),
+            "keep_source dialogue must not be inpainted: {regions:?}"
+        );
+    }
+
+    #[test]
+    fn replace_sfx_keeps_unmatched_text_in_the_inpaint_mask() {
+        let (_dir, path) = write_checkpoint(&overlapping_double_text_checkpoint());
+        let regions = checkpoint_text_regions(&path, true).unwrap();
+        assert!(
+            regions.iter().any(|rect| {
+                (rect.x1 - 82.0).abs() < f32::EPSILON && (rect.y1 - 82.0).abs() < f32::EPSILON
+            }),
+            "replace mode must inpaint unmatched SFX: {regions:?}"
+        );
+    }
+
     #[test]
     fn strict_submission_updates_dialogue_by_id_when_preserved_text_is_first() {
         let mut analysis = strict_fixture_analysis();
@@ -3128,6 +3377,16 @@ mod tests {
         assert_eq!(value["status"], "page_ready");
         assert_eq!(value["sfx_mode"], "preserve");
         assert_eq!(value["translation_items"][0]["id"], "bubble-1");
+        assert_eq!(value["current_page"], 1);
+        assert_eq!(value["total_pages"], 1);
+        assert_eq!(value["progress"]["current_page"], 1);
+        assert_eq!(value["progress"]["total_pages"], 1);
+        assert!(
+            value["progress"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("[FUKIDASHI] [Page 1/1]")
+        );
         assert_eq!(
             value["required_translation_ids"],
             serde_json::json!(["bubble-1"])
