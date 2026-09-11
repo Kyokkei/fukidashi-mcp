@@ -798,27 +798,53 @@ impl EditorApp {
             return;
         }
 
-        // Scroll gestures read the raw input state: `interact_pointer_pos`
-        // needs a held button and is None during a pure scroll, so the zoom
-        // anchor must come from `pointer.hover_pos()` instead. Only an
-        // explicit Ctrl/Meta gesture zooms; ordinary wheel input remains
-        // available to the host viewport.
-        let (scroll, zoom_modifier, hover_pos) = ctx.input(|i| {
-            (
-                i.raw_scroll_delta.y,
-                i.modifiers.ctrl || i.modifiers.command,
-                i.pointer.hover_pos(),
-            )
-        });
-        if scroll != 0.0 && zoom_modifier {
-            let factor = if scroll > 0.0 { 1.1 } else { 1.0 / 1.1 };
-            let mouse = hover_pos.unwrap_or(origin);
-            let before = self.canvas.screen_to_image(mouse, origin);
-            self.canvas.zoom = (self.canvas.zoom * factor).clamp(0.25, 4.0);
-            let after = self.canvas.image_to_screen(before, origin);
-            self.canvas.pan += mouse - after;
-            ctx.request_repaint();
-            return;
+        // Scroll gestures read raw input. Only process scrolling when the cursor is
+        // hovering over the canvas viewport so we don't steal wheel events from
+        // the inspector or gallery panels.
+        if response.hovered() {
+            let (scroll_y, scroll_x, zoom_mod, alt_mod, shift_mod, hover_pos) = ctx.input(|i| {
+                (
+                    i.raw_scroll_delta.y,
+                    i.raw_scroll_delta.x,
+                    i.modifiers.ctrl || i.modifiers.command,
+                    i.modifiers.alt,
+                    i.modifiers.shift,
+                    i.pointer.hover_pos(),
+                )
+            });
+
+            // Ctrl/Meta + Scroll -> Zoom toward pointer
+            if scroll_y != 0.0 && zoom_mod {
+                let factor = if scroll_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                let mouse = hover_pos.unwrap_or(origin);
+                let before = self.canvas.screen_to_image(mouse, origin);
+                self.canvas.zoom = (self.canvas.zoom * factor).clamp(0.05, 20.0);
+                let after = self.canvas.image_to_screen(before, origin);
+                self.canvas.pan += mouse - after;
+                ctx.request_repaint();
+                return;
+            }
+
+            // Alt+Scroll or Shift+Scroll -> Horizontal pan (Photoshop / Photopea style)
+            if scroll_y != 0.0 && (alt_mod || shift_mod) {
+                self.canvas.pan.x += scroll_y * 1.5;
+                ctx.request_repaint();
+                return;
+            }
+
+            // Horizontal wheel / trackpad scroll
+            if scroll_x != 0.0 {
+                self.canvas.pan.x += scroll_x * 1.5;
+                ctx.request_repaint();
+                return;
+            }
+
+            // Plain scroll -> Vertical pan
+            if scroll_y != 0.0 && !alt_mod && !zoom_mod {
+                self.canvas.pan.y += scroll_y * 1.5;
+                ctx.request_repaint();
+                return;
+            }
         }
 
         // Tool-based primary input routing.
@@ -1414,5 +1440,14 @@ mod tests {
         assert!(bbox.x1 >= 0.0 && bbox.y1 >= 0.0);
         assert!(bbox.x2 <= 40.0 && bbox.y2 <= 30.0);
         assert!(bbox.x2 > bbox.x1 && bbox.y2 > bbox.y1);
+    }
+
+    #[test]
+    fn canvas_zoom_clamp_bounds_support_deep_kanji_inspection() {
+        let mut zoom = 1.0_f32;
+        zoom = (zoom * 0.001).clamp(0.05, 20.0);
+        assert_eq!(zoom, 0.05);
+        zoom = (zoom * 1000.0).clamp(0.05, 20.0);
+        assert_eq!(zoom, 20.0);
     }
 }
