@@ -1521,6 +1521,45 @@ fn rects_match(left: Rect, right: Rect) -> bool {
         && (left.y2 - right.y2).abs() <= EPSILON
 }
 
+const DEFAULT_EDITOR_MIN_FONT: f32 = 8.0;
+const DEFAULT_EDITOR_MAX_FONT: f32 = 72.0;
+
+fn finite_font_size(value: Option<f32>) -> Option<f32> {
+    value.filter(|size| size.is_finite() && *size >= 0.5 && *size <= 512.0)
+}
+
+/// Inspector `font_size` is a preferred cap, not a locked floor.
+/// Using the last fitted size as both min and max made any drag/resize
+/// overflow instead of shrinking to the new box.
+fn editor_font_size_range(bubble: &Value) -> (f32, f32) {
+    let font_size = finite_font_size(
+        bubble
+            .get("font_size")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32),
+    );
+    let explicit_min = finite_font_size(
+        bubble
+            .get("min_font_size")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32),
+    );
+    let explicit_max = finite_font_size(
+        bubble
+            .get("max_font_size")
+            .and_then(Value::as_f64)
+            .map(|value| value as f32),
+    );
+    let max_font_size = font_size
+        .or(explicit_max)
+        .unwrap_or(DEFAULT_EDITOR_MAX_FONT);
+    let mut min_font_size = explicit_min.unwrap_or(DEFAULT_EDITOR_MIN_FONT);
+    if min_font_size > max_font_size {
+        min_font_size = max_font_size;
+    }
+    (min_font_size, max_font_size)
+}
+
 /// A browser geometry edit copies `bbox` into `bubble_bbox`. That gives the
 /// render boundary an explicit marker that any detector-era text anchor is
 /// stale; legacy state with a distinct detector box keeps its old anchor.
@@ -1762,10 +1801,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             Some(path) => (safe_font_path(&session.root_dir, path)?, None),
             None => (PathBuf::from(&bundled_primary), Some("missing_primary")),
         };
-        let font_size = bubble
-            .get("font_size")
-            .and_then(Value::as_f64)
-            .map(|v| v as f32);
+        let (min_font_size, max_font_size) = editor_font_size_range(bubble);
         let render_index = payloads.len();
         if let Some(reason) = substitution_reason {
             let mut substitution = serde_json::json!({
@@ -1817,16 +1853,8 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 .map(|v| v as f32),
             text,
             font_path: Some(font_path.display().to_string()),
-            min_font_size: bubble
-                .get("min_font_size")
-                .and_then(Value::as_f64)
-                .map(|v| v as f32)
-                .or(font_size),
-            max_font_size: bubble
-                .get("max_font_size")
-                .and_then(Value::as_f64)
-                .map(|v| v as f32)
-                .or(font_size),
+            min_font_size: Some(min_font_size),
+            max_font_size: Some(max_font_size),
             text_color: bubble
                 .get("text_color")
                 .and_then(Value::as_str)
@@ -2181,6 +2209,26 @@ mod tests {
         assert!(EDITOR_HTML.contains("const visible=$('variant').value==='cleaned'"));
         assert!(EDITOR_HTML.contains("paintCanvas.hidden=true"));
         assert!(EDITOR_HTML.contains("redrawPaint();$('brush').disabled=chosen!=='cleaned'"));
+    }
+
+    #[test]
+    fn fitted_font_size_is_a_cap_not_a_locked_floor() {
+        let fitted = json!({"font_size": 47.5});
+        assert_eq!(
+            editor_font_size_range(&fitted),
+            (DEFAULT_EDITOR_MIN_FONT, 47.5)
+        );
+        let explicit = json!({"min_font_size": 1.0, "max_font_size": 38.0, "font_size": 12.0});
+        assert_eq!(editor_font_size_range(&explicit), (1.0, 12.0));
+        let tiny = json!({"font_size": 4.0});
+        assert_eq!(editor_font_size_range(&tiny), (4.0, 4.0));
+        let defaults = json!({});
+        assert_eq!(
+            editor_font_size_range(&defaults),
+            (DEFAULT_EDITOR_MIN_FONT, DEFAULT_EDITOR_MAX_FONT)
+        );
+        let range_only = json!({"min_font_size": 1.0, "max_font_size": 38.0});
+        assert_eq!(editor_font_size_range(&range_only), (1.0, 38.0));
     }
 
     #[test]

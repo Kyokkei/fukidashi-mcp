@@ -209,6 +209,11 @@ fn editor_gallery_variants_and_render_endpoint_are_constrained() {
         "startDrag(e,i,dir,'bubble')",
         "startDrag(e,i,'move','bubble')",
         "startDrag(e,i,dir,'issue')",
+        "touch-action:none",
+        "if(!(e.buttons>0))return",
+        "captureTarget=stage||boxTarget",
+        "el.addEventListener('input'",
+        "$('fontSize')",
     ] {
         assert!(html.contains(marker), "editor HTML missing {marker}");
     }
@@ -1133,6 +1138,133 @@ fn editor_reconstructs_missing_primary_and_substitutes_legacy_hash_arial() {
         hash_report["resolved_font_path"]
             .as_str()
             .is_some_and(|path| path.ends_with("-ComicNeue-Regular.ttf"))
+    );
+}
+
+#[test]
+fn editor_render_shrinks_fitted_font_instead_of_overflowing() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("page.png");
+    let mut source_image = ImageBuffer::<Rgb<u8>, _>::from_pixel(96, 96, Rgb([255, 255, 255]));
+    for y in 12..84 {
+        for x in 12..84 {
+            source_image.put_pixel(x, y, Rgb([20, 20, 20]));
+        }
+    }
+    source_image.save(&source).unwrap();
+    let jobs = dir.path().join("jobs");
+    let workflow = Workflow::new(jobs).unwrap();
+    let registration = workflow.register_analysis(&source, None).unwrap();
+    let cleaned = ImageBuffer::<Rgb<u8>, _>::from_pixel(96, 96, Rgb([255, 255, 255]));
+    let mut mask = image::GrayImage::new(96, 96);
+    for y in 12..84 {
+        for x in 12..84 {
+            mask.put_pixel(x, y, image::Luma([255]));
+        }
+    }
+    let (cleaned_path, _, _) = workflow
+        .write_clean_artifact(&source, &cleaned, &mask, 0, "full")
+        .unwrap();
+    let rendered_path = workflow.page_artifacts_for_source(&source).unwrap().4;
+    let font = workflow
+        .materialize_bundled_font(
+            &registration.job_dir,
+            &fukidashi_mcp::fonts::COMIC_NEUE_REGULAR,
+        )
+        .unwrap();
+    let payload = TypesetPayload {
+        id: Some("b1".into()),
+        source_text: Some("Hi".into()),
+        kind: Some("dialogue".into()),
+        preserve_by_default: Some(false),
+        needs_review: Some(false),
+        flagged: Some(false),
+        preserve_source: Some(false),
+        fallback_font_paths: Vec::new(),
+        bbox: Rect {
+            x1: 8.0,
+            y1: 8.0,
+            x2: 88.0,
+            y2: 88.0,
+        },
+        bubble_bbox: None,
+        text_bbox: None,
+        padding: Some(4.0),
+        text: "Hi".into(),
+        font_path: Some(font.display().to_string()),
+        min_font_size: None,
+        max_font_size: None,
+        text_color: Some("black".into()),
+        shape: Some("rectangle".into()),
+    };
+    let report =
+        fukidashi_mcp::typeset::typeset_page(&cleaned_path, &[payload.clone()], &rendered_path)
+            .unwrap();
+    let fitted = report["bubbles"][0]["font_size"].as_f64().unwrap();
+    assert!(
+        fitted > 24.0,
+        "fixture should fit a large initial size, got {fitted}"
+    );
+    workflow
+        .register_render(
+            &rendered_path,
+            &workflow.validate_clean_input(&cleaned_path).unwrap(),
+            json!({"request_bubbles":[payload],"report":report}),
+            json!({}),
+        )
+        .unwrap();
+    let state = workflow.editor_state(&rendered_path, None).unwrap();
+    let result = serve_editor_with_allowed_sources(
+        &rendered_path,
+        state,
+        vec![fs::canonicalize(&source).unwrap()],
+    )
+    .unwrap();
+    let endpoint = result["url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://")
+        .unwrap();
+    let (host, _) = endpoint.split_once('/').unwrap();
+    let token = result["session_token"].as_str().unwrap();
+    let mut edited: serde_json::Value =
+        serde_json::from_slice(&fs::read(result["persistence_path"].as_str().unwrap()).unwrap())
+            .unwrap();
+    edited["pages"][0]["bubbles"][0]["bbox"] = json!({"x1":16.0,"y1":16.0,"x2":52.0,"y2":52.0});
+    edited["pages"][0]["bubbles"][0]["bubble_bbox"] =
+        json!({"x1":16.0,"y1":16.0,"x2":52.0,"y2":52.0});
+    edited["pages"][0]["bubbles"][0]["font_size"] = json!(fitted);
+    edited["pages"][0]["bubbles"][0]["min_font_size"] = serde_json::Value::Null;
+    edited["pages"][0]["bubbles"][0]["max_font_size"] = serde_json::Value::Null;
+    edited["pages"][0]["bubbles"][0]["padding"] = json!(4.0);
+    let save = request(
+        host,
+        &format!("/{token}/save"),
+        "POST",
+        Some(&edited.to_string()),
+        host,
+    );
+    assert!(save.starts_with("HTTP/1.1 200"), "unexpected save: {save}");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(result["persistence_path"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let render = request(
+        host,
+        &format!("/{token}/render"),
+        "POST",
+        Some(&json!({"page_index":0,"state":saved}).to_string()),
+        host,
+    );
+    assert!(
+        render.starts_with("HTTP/1.1 200"),
+        "unexpected render: {render}"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(render.split_once("\r\n\r\n").unwrap().1).unwrap();
+    let rerendered = body["typeset"]["bubbles"][0]["font_size"].as_f64().unwrap();
+    assert!(
+        rerendered < fitted,
+        "shrunk box should fit below the previous locked size {fitted}, got {rerendered}"
     );
 }
 
