@@ -10,6 +10,7 @@ default = ["onnx", "cuda"]
 onnx = ["dep:ort"]
 cuda = ["onnx", "ort/cuda"]
 directml = ["onnx", "ort/directml"]
+editor = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]
 
 [dependencies]
 anyhow = "1"
@@ -38,6 +39,13 @@ zip = { version = "4", default-features = false, features = ["deflate"] }
 tempfile = "3"
 sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+which = "6"
+
+# Editor-only deps (feature-gated so the headless MCP binary stays lean).
+eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "persistence"] }
+egui = { version = "0.31", optional = true }
+egui_extras = { version = "0.31", optional = true, features = ["image"] }
+rfd = { version = "0.15", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
@@ -49,3 +57,10 @@ approx = "0.5"
 lto = "thin"
 codegen-units = 1
 strip = "debuginfo"
+
+# Native egui QA editor. Built separately so the headless MCP binary stays lean:
+#   cargo build --features editor --bin fukidashi-editor
+[[bin]]
+name = "fukidashi-editor"
+path = "src/bin/editor_main.rs"
+required-features = ["editor"]

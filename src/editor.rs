@@ -27,20 +27,20 @@ const REVIEW_FILE: &str = "review.json";
 const REVIEW_AUDIT_FILE: &str = "review-audit.json";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct ReviewState {
-    review_session_id: String,
-    revision: u64,
-    status: String,
+pub struct ReviewState {
+    pub review_session_id: String,
+    pub revision: u64,
+    pub status: String,
     #[serde(default)]
-    action: Option<String>,
+    pub action: Option<String>,
     #[serde(default)]
-    feedback: Vec<Value>,
+    pub feedback: Vec<Value>,
     #[serde(default)]
-    approved_pages: Vec<usize>,
+    pub approved_pages: Vec<usize>,
     #[serde(default)]
-    consumed: bool,
+    pub consumed: bool,
     #[serde(default)]
-    audit: Vec<Value>,
+    pub audit: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -96,6 +96,7 @@ pub fn serve_editor_with_allowed_sources(
         .parent()
         .ok_or_else(|| anyhow!("editor image has no parent"))?;
     let root_dir = managed_editor_root(parent);
+    track_editor_root(&root_dir);
     let state_path = root_dir.join("project.json");
     let mut initial_state = normalize_editor_state(json_data)?;
     if state_path.exists()
@@ -137,6 +138,33 @@ pub fn serve_editor_with_allowed_sources(
     review_state.approved_pages.clear();
     review_state.consumed = false;
     save_review(&root_dir, &review_state)?;
+    // Prefer one editor surface per review. When the companion native binary
+    // is available, it owns the review and writes the same review.json consumed
+    // by wait_for_review/export_gate. The HTTP editor is started only when the
+    // native process cannot be launched, preventing two competing UIs from
+    // submitting actions for one revision.
+    if let Some(editor_bin) = find_editor_binary() {
+        match std::process::Command::new(&editor_bin)
+            .arg("--review-session-id")
+            .arg(&review_state.review_session_id)
+            .arg(&root_dir)
+            .spawn()
+        {
+            Ok(_) => {
+                return Ok(json!({
+                    "editor_kind": "native",
+                    "url": format!("native://{}", root_dir.display()),
+                    "native_binary": editor_bin,
+                    "persistence_path": state_path,
+                    "session_token": Value::Null,
+                    "review_session_id": review_state.review_session_id,
+                    "review_revision": review_state.revision,
+                    "review_path": review_path,
+                }));
+            }
+            Err(error) => tracing::warn!(%error, "native editor launch failed; using HTTP editor"),
+        }
+    }
     let review = {
         let mut channels = review_channels()
             .lock()
@@ -526,12 +554,28 @@ pub async fn wait_for_review(
     revision: u64,
     timeout_seconds: u64,
 ) -> Result<Value> {
-    let channel = review_channels()
+    // In-memory channel covers the HTTP loopback editor (same process). Clone the
+    // channel out from under the lock first so we never hold a non-`Send`
+    // `MutexGuard` across an `.await`.
+    let maybe_channel = review_channels()
         .lock()
         .map_err(|_| anyhow!("review channel lock poisoned"))?
         .get(review_session_id)
-        .cloned()
-        .ok_or_else(|| anyhow!("review session is not active; serve the editor again to resume"))?;
+        .cloned();
+    if let Some(channel) = maybe_channel {
+        return wait_for_review_via_channel(channel, revision, timeout_seconds).await;
+    }
+    // The native `fukidashi-editor` binary runs in a separate process and has no
+    // in-memory channel here. Poll review.json on disk instead — the same file
+    // the editor writes and export_gate reads.
+    wait_for_review_via_file(review_session_id, revision, timeout_seconds).await
+}
+
+async fn wait_for_review_via_channel(
+    channel: Arc<ReviewChannel>,
+    revision: u64,
+    timeout_seconds: u64,
+) -> Result<Value> {
     let timeout = Duration::from_secs(timeout_seconds.clamp(1, 24 * 60 * 60));
     tokio::time::timeout(timeout, async {
         loop {
@@ -580,6 +624,101 @@ pub async fn wait_for_review(
     .map_err(|_| anyhow!("review wait timed out"))?
 }
 
+async fn wait_for_review_via_file(
+    review_session_id: &str,
+    revision: u64,
+    timeout_seconds: u64,
+) -> Result<Value> {
+    let timeout = Duration::from_secs(timeout_seconds.clamp(1, 24 * 60 * 60));
+    tokio::time::timeout(timeout, async {
+        loop {
+            // The native editor writes its review.json next to the job; we must
+            // discover which job root owns this session id. The loopback server
+            // records the mapping in the channel registry, but for a
+            // cross-process editor we scan the review file's parent via the
+            // session id recorded inside the file itself.
+            if let Some(root_dir) = find_review_root_for_session(review_session_id)
+                && let Some(state) = read_review(&root_dir)
+            {
+                if state.revision != revision {
+                    bail!(
+                        "stale review revision {revision}; current revision is {}",
+                        state.revision
+                    );
+                }
+                if state.action.is_some() {
+                    let mut consumed = state.clone();
+                    if consumed.consumed {
+                        bail!("review action for this revision was already consumed");
+                    }
+                    consumed.consumed = true;
+                    consumed.status = "consumed".to_owned();
+                    consumed
+                        .audit
+                        .push(json!({"event":"waiter_consumed","revision":revision}));
+                    let _ = save_review(&root_dir, &consumed);
+                    return Ok(serde_json::json!({
+                        "review_session_id": consumed.review_session_id,
+                        "revision": consumed.revision,
+                        "action": consumed.action,
+                        "feedback": consumed.feedback,
+                        "approved_pages": consumed.approved_pages,
+                        "artifact_paths": [root_dir.display().to_string()],
+                        "review_path": review_file(&root_dir),
+                    }));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("review wait timed out"))?
+}
+
+/// Scan candidate job roots for a `review.json` whose `review_session_id`
+/// matches. We search the editor's known managed roots (under the user's jobs
+/// dir) and any directory recorded by the loopback `serve_editor` calls.
+fn find_review_root_for_session(session_id: &str) -> Option<PathBuf> {
+    let mut visited = std::collections::HashSet::new();
+    // Recently served jobs are tracked by the loopback server; mirror that set.
+    recent_editor_roots()
+        .into_iter()
+        .find(|root| visited.insert(root.clone()) && matches_review_session(root, session_id))
+}
+
+fn matches_review_session(root: &Path, session_id: &str) -> bool {
+    let path = review_file(root);
+    let Ok(bytes) = fs::read(&path) else {
+        return false;
+    };
+    let Ok(state) = serde_json::from_slice::<ReviewState>(&bytes) else {
+        return false;
+    };
+    state.review_session_id == session_id
+}
+
+/// Roots recently passed through `serve_editor_with_allowed_sources`, so the
+/// cross-process wait can locate a native editor's review.json without a global
+/// filesystem scan.
+fn recent_editor_roots() -> Vec<PathBuf> {
+    RECENT_EDITOR_ROOTS
+        .get_or_init(Default::default)
+        .lock()
+        .map(|set| set.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+static RECENT_EDITOR_ROOTS: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+
+fn track_editor_root(root: &Path) {
+    let _ = RECENT_EDITOR_ROOTS
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut set| {
+            set.insert(root.to_path_buf());
+        });
+}
+
 /// Export may proceed only after the latest review revision was explicitly approved.
 /// Review findings remain advisory once the operator has submitted approval.
 pub fn export_gate(project_dir: &Path) -> Result<()> {
@@ -594,6 +733,174 @@ pub fn export_gate(project_dir: &Path) -> Result<()> {
         bail!("export is blocked until the latest review revision is explicitly approved");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Native editor bridge
+//
+// The `fukidashi-editor` binary is a **separate process** from the MCP server.
+// For the cross-process review contract to hold, the editor must read and write
+// the exact same `review.json` that `wait_for_review` / `export_gate` read, and
+// it must render pages through the exact same logic the loopback server used.
+// Everything below is the public surface the binary calls into.
+// ---------------------------------------------------------------------------
+
+/// File path (relative to the job root) of the review state written by the editor.
+pub const REVIEW_FILE_NAME: &str = REVIEW_FILE;
+
+/// Resolve the `review.json` path for a job directory, honoring the same layout
+/// the loopback server used.
+pub fn resolved_review_file(root: &Path) -> PathBuf {
+    review_file(root)
+}
+
+/// Read the persisted `ReviewState` for a job directory.
+///
+/// Returns `None` when no review file exists yet (the editor has not been served).
+pub fn read_review(root: &Path) -> Option<ReviewState> {
+    let path = review_file(root);
+    let bytes = fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Persist a `ReviewState` to the job directory (atomic write) and mirror it to
+/// the audit file, exactly like the loopback server's `save_review`.
+pub fn write_review(root: &Path, state: &ReviewState) -> Result<()> {
+    validate_review_state_minimal(state)?;
+    save_review(root, state)
+}
+
+fn validate_review_state_minimal(state: &ReviewState) -> Result<()> {
+    if state.review_session_id.trim().is_empty() {
+        bail!("review_session_id must not be empty");
+    }
+    if !matches!(
+        state.status.as_str(),
+        "new" | "awaiting_review" | "approved" | "fixes_requested" | "consumed"
+    ) {
+        bail!("unknown review status {:?}", state.status);
+    }
+    if let Some(action) = &state.action
+        && !matches!(action.as_str(), "approve_export" | "request_fixes")
+    {
+        bail!("unknown review action {action:?}");
+    }
+    Ok(())
+}
+
+/// Render a single page for the native editor.
+///
+/// This reuses the loopback server's `render_page` logic verbatim — including
+/// the brush/restore pipeline, bundled-font materialization, and the
+/// `project.json` writeback — so the headless and native editors are
+/// indistinguishable to downstream export.
+///
+/// `session_token`/`review_session_id` are accepted only to keep the on-disk
+/// `project.json` shape identical; they do not open any network port.
+pub fn render_editor_page(
+    root_dir: &Path,
+    image_path: &Path,
+    state: &Value,
+    index: usize,
+) -> Result<Value> {
+    if !root_dir.exists() {
+        bail!(
+            "editor job directory does not exist: {}",
+            root_dir.display()
+        );
+    }
+    let image_path = fs::canonicalize(image_path)
+        .with_context(|| format!("resolve editor image {}", image_path.display()))?;
+    let root_dir = managed_editor_root(root_dir);
+    let session = Arc::new(Session {
+        token: "native-editor".to_owned(),
+        host: String::new(),
+        image_path,
+        root_dir: root_dir.clone(),
+        state_path: root_dir.join("project.json"),
+        initial_state: normalize_editor_state(state.clone())?,
+        allowed_source_paths: Vec::new(),
+        review: Arc::new(ReviewChannel {
+            state: Mutex::new(ReviewState {
+                review_session_id: "native".to_owned(),
+                revision: 0,
+                status: "awaiting_review".to_owned(),
+                action: None,
+                feedback: Vec::new(),
+                approved_pages: Vec::new(),
+                consumed: false,
+                audit: Vec::new(),
+            }),
+            notify: Notify::new(),
+            root_dir: root_dir.clone(),
+        }),
+    });
+    let current = load_state(&session)?;
+    if !state_revision_matches(&current, state) {
+        bail!("stale editor state: reload the project before rendering");
+    }
+    if validate_state(state).is_err() || validate_project_paths(&session, state).is_err() {
+        bail!("invalid editor state");
+    }
+    render_page(&session, state, index)
+}
+
+/// Locate a `fukidashi-editor` executable to auto-spawn from the MCP server.
+///
+/// Resolution order (mirrors `which` + sibling-binary detection from the plan):
+/// 1. `fukidashi-editor` / `fukidashi-editor.exe` on `PATH`.
+/// 2. A binary next to the currently running `fukidashi-mcp` executable
+///    (covers `target/release` and installed bundles).
+pub fn find_editor_binary() -> Option<PathBuf> {
+    let base = if cfg!(windows) {
+        "fukidashi-editor.exe"
+    } else {
+        "fukidashi-editor"
+    };
+    let test_process = running_under_cargo_test();
+    if let Ok(found) = which::which(base)
+        && !(test_process && is_development_artifact(&found))
+    {
+        return Some(found);
+    }
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.join(base)))
+        .filter(|candidate| candidate.is_file());
+    sibling.filter(|candidate| !(test_process && is_development_artifact(candidate)))
+}
+
+fn is_development_artifact(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case("target")
+    })
+}
+
+fn running_under_cargo_test() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .and_then(|parent| parent.file_name().map(|name| name.to_owned()))
+        .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case("deps"))
+}
+
+/// Re-apply correction strokes to a cleaned image and return the corrected RGB
+/// buffer. Used by the native editor to render a live brush overlay (and to
+/// rebuild it after undo) without touching the on-disk PNG.
+pub fn build_corrected_clean_rgb(
+    cleaned: &Path,
+    strokes: &[serde_json::Value],
+) -> Result<image::RgbImage> {
+    if strokes.is_empty() {
+        let base = image::open(cleaned)
+            .with_context(|| format!("read cleaned image {}", cleaned.display()))?
+            .to_rgb8();
+        return Ok(base);
+    }
+    apply_correction_strokes(cleaned, strokes)
 }
 
 fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
@@ -2506,5 +2813,15 @@ mod tests {
             EDITOR_HTML
                 .contains("No saved bubbles on this page — recover/import typeset data first")
         );
+    }
+
+    #[test]
+    fn native_editor_resolution_ignores_cargo_target_binaries() {
+        assert!(is_development_artifact(Path::new(
+            "C:/work/target/debug/fukidashi-editor.exe"
+        )));
+        assert!(!is_development_artifact(Path::new(
+            "C:/Users/me/AppData/Local/Fukidashi/bin/fukidashi-editor.exe"
+        )));
     }
 }

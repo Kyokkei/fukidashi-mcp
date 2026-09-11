@@ -2797,7 +2797,11 @@ impl FukidashiServer {
                 );
             }
         };
-        if let Err(error) = launch(&url) {
+        let native_editor = served
+            .get("editor_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("native");
+        if !native_editor && let Err(error) = launch(&url) {
             return json_result(
                 &serde_json::json!({
                     "protocol": "review-v1",

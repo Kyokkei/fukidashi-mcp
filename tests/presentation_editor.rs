@@ -1197,9 +1197,12 @@ fn editor_render_shrinks_fitted_font_instead_of_overflowing() {
         text_color: Some("black".into()),
         shape: Some("rectangle".into()),
     };
-    let report =
-        fukidashi_mcp::typeset::typeset_page(&cleaned_path, &[payload.clone()], &rendered_path)
-            .unwrap();
+    let report = fukidashi_mcp::typeset::typeset_page(
+        &cleaned_path,
+        std::slice::from_ref(&payload),
+        &rendered_path,
+    )
+    .unwrap();
     let fitted = report["bubbles"][0]["font_size"].as_f64().unwrap();
     assert!(
         fitted > 24.0,

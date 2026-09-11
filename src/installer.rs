@@ -1,8 +1,8 @@
 //! Cross-client installation and rollback for the Fukidashi MCP server.
 //!
-//! The installer owns one native executable and writes only the Fukidashi MCP
-//! entry in each client's user configuration.  Project-local configuration is
-//! deliberately never discovered or modified.
+//! The installer owns the MCP/editor executable pair and writes only the
+//! Fukidashi MCP entry in each client's user configuration. Project-local
+//! configuration is deliberately never discovered or modified.
 
 use std::{
     env, fs,
@@ -19,7 +19,7 @@ use tempfile::NamedTempFile;
 use crate::error::{FukidashiError, Result};
 
 const PRODUCT: &str = "Fukidashi";
-const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_VERSION: u32 = 2;
 const MANIFEST_NAME: &str = "install-manifest.json";
 const DATA_DIR_ENV: &str = "FUKIDASHI_DATA_DIR";
 const MANAGED_START: &str = "<!-- fukidashi:begin -->";
@@ -89,6 +89,7 @@ pub struct ClientStatus {
 pub struct InstallReport {
     pub data_root: PathBuf,
     pub executable: PathBuf,
+    pub editor_executable: PathBuf,
     pub clients: Vec<ClientStatus>,
     pub context_path: PathBuf,
     pub manifest_path: PathBuf,
@@ -106,6 +107,7 @@ pub struct MutationReport {
 pub struct InstallationStatus {
     pub data_root: PathBuf,
     pub executable: PathBuf,
+    pub editor_executable: PathBuf,
     pub installed: bool,
     pub manifest_path: PathBuf,
     pub clients: Vec<ClientStatus>,
@@ -118,6 +120,12 @@ struct Manifest {
     executable_sha256: String,
     #[serde(default)]
     executable_backup_path: Option<PathBuf>,
+    #[serde(default)]
+    editor_executable: Option<PathBuf>,
+    #[serde(default)]
+    editor_executable_sha256: Option<String>,
+    #[serde(default)]
+    editor_executable_backup_path: Option<PathBuf>,
     context_path: PathBuf,
     clients: Vec<ManifestClient>,
 }
@@ -143,6 +151,7 @@ fn default_owned() -> bool {
 struct InstallPaths {
     data_root: PathBuf,
     executable: PathBuf,
+    editor_executable: PathBuf,
     context: PathBuf,
     manifest: PathBuf,
     backup_dir: PathBuf,
@@ -155,9 +164,12 @@ struct InstallPaths {
 /// where necessary.
 pub fn install(requested: &[Client], all: bool) -> Result<InstallReport> {
     let paths = install_paths()?;
+    let source = env::current_exe()?;
+    let editor_source = companion_binary_source(&source)?;
     fs::create_dir_all(paths.executable.parent().expect("executable has parent"))?;
     fs::create_dir_all(&paths.backup_dir)?;
     let previous_executable = fs::read(&paths.executable).ok();
+    let previous_editor = fs::read(&paths.editor_executable).ok();
     let previous_context = fs::read(&paths.context).ok();
     let executable_backup_path = if let Some(bytes) = previous_executable.as_ref() {
         let path = paths.backup_dir.join("previous-fukidashi-mcp.bin");
@@ -168,8 +180,25 @@ pub fn install(requested: &[Client], all: bool) -> Result<InstallReport> {
     } else {
         None
     };
-    install_executable(&paths.executable)?;
-    write_atomic(&paths.context, workflow_context().as_bytes())?;
+    let editor_executable_backup_path = if let Some(bytes) = previous_editor.as_ref() {
+        let path = paths.backup_dir.join("previous-fukidashi-editor.bin");
+        if !path.is_file() {
+            write_atomic(&path, bytes)?;
+        }
+        Some(path)
+    } else {
+        None
+    };
+    install_binary(&source, &paths.executable)?;
+    if let Err(error) = install_binary(&editor_source, &paths.editor_executable) {
+        restore_installed_binary(&paths.executable, previous_executable.as_deref());
+        return Err(error);
+    }
+    if let Err(error) = write_atomic(&paths.context, workflow_context().as_bytes()) {
+        restore_installed_binary(&paths.executable, previous_executable.as_deref());
+        restore_installed_binary(&paths.editor_executable, previous_editor.as_deref());
+        return Err(error);
+    }
 
     let clients = select_clients(requested, all);
     let previous_manifest = load_manifest(&paths.manifest)?;
@@ -302,6 +331,9 @@ pub fn install(requested: &[Client], all: bool) -> Result<InstallReport> {
             executable: paths.executable.clone(),
             executable_sha256: digest_file(&paths.executable)?,
             executable_backup_path,
+            editor_executable: Some(paths.editor_executable.clone()),
+            editor_executable_sha256: Some(digest_file(&paths.editor_executable)?),
+            editor_executable_backup_path,
             context_path: paths.context.clone(),
             clients: installed.clone(),
         };
@@ -349,6 +381,14 @@ pub fn install(requested: &[Client], all: bool) -> Result<InstallReport> {
                 let _ = fs::remove_file(&paths.executable);
             }
         }
+        match previous_editor {
+            Some(bytes) => {
+                let _ = write_atomic(&paths.editor_executable, &bytes);
+            }
+            None => {
+                let _ = fs::remove_file(&paths.editor_executable);
+            }
+        }
         return Err(error);
     }
 
@@ -360,6 +400,7 @@ pub fn install(requested: &[Client], all: bool) -> Result<InstallReport> {
     Ok(InstallReport {
         data_root: paths.data_root,
         executable: paths.executable,
+        editor_executable: paths.editor_executable,
         clients: statuses,
         context_path: paths.context,
         manifest_path: paths.manifest,
@@ -417,6 +458,19 @@ pub fn uninstall() -> Result<MutationReport> {
             "{}: executable changed after installation; left in place",
             manifest.executable.display()
         ));
+    }
+    if let (Some(editor), Some(editor_hash)) = (
+        manifest.editor_executable.as_deref(),
+        manifest.editor_executable_sha256.as_deref(),
+    ) {
+        if digest_file(editor).ok().as_deref() == Some(editor_hash) {
+            remove_owned_file(editor, &mut changed, &mut skipped);
+        } else {
+            skipped.push(format!(
+                "{}: companion editor changed after installation; left in place",
+                editor.display()
+            ));
+        }
     }
     // Keep backups for explicit rollback and recovery; only the active
     // manifest is removed after a successful uninstall.
@@ -488,6 +542,22 @@ pub fn rollback() -> Result<MutationReport> {
             ));
         }
     }
+    if let (Some(editor), Some(editor_hash), Some(backup)) = (
+        manifest.editor_executable.as_deref(),
+        manifest.editor_executable_sha256.as_deref(),
+        manifest.editor_executable_backup_path.as_deref(),
+    ) {
+        if digest_file(editor).ok().as_deref() == Some(editor_hash) {
+            let bytes = fs::read(backup)?;
+            write_atomic(editor, &bytes)?;
+            changed.push(editor.to_path_buf());
+        } else {
+            skipped.push(format!(
+                "{}: companion editor changed since installation; backup not restored",
+                editor.display()
+            ));
+        }
+    }
     Ok(MutationReport {
         data_root: paths.data_root,
         changed,
@@ -511,7 +581,10 @@ pub fn installation_status() -> Result<InstallationStatus> {
     Ok(InstallationStatus {
         data_root: paths.data_root,
         executable: paths.executable.clone(),
-        installed: paths.executable.is_file() && paths.manifest.is_file(),
+        editor_executable: paths.editor_executable.clone(),
+        installed: paths.executable.is_file()
+            && paths.editor_executable.is_file()
+            && paths.manifest.is_file(),
         manifest_path: paths.manifest,
         clients: status()?,
     })
@@ -520,9 +593,10 @@ pub fn installation_status() -> Result<InstallationStatus> {
 pub fn doctor_lines() -> Result<Vec<String>> {
     let installation = installation_status()?;
     let mut lines = vec![format!(
-        "Fukidashi engine: installed={}, executable={}, data_root={}",
+        "Fukidashi engine: installed={}, executable={}, editor={}, data_root={}",
         installation.installed,
         installation.executable.display(),
+        installation.editor_executable.display(),
         installation.data_root.display()
     )];
     lines.extend(
@@ -565,12 +639,18 @@ fn install_paths() -> Result<InstallPaths> {
     } else {
         "fukidashi-mcp"
     });
+    let editor_executable = data_root.join("bin").join(if cfg!(windows) {
+        "fukidashi-editor.exe"
+    } else {
+        "fukidashi-editor"
+    });
     Ok(InstallPaths {
         context: data_root.join("context").join("fukidashi-workflow.md"),
         manifest: data_root.join(MANIFEST_NAME),
         backup_dir: data_root.join("backups"),
         data_root,
         executable,
+        editor_executable,
     })
 }
 
@@ -584,14 +664,13 @@ fn validate_data_root(path: PathBuf) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn install_executable(destination: &Path) -> Result<()> {
-    let source = env::current_exe()?;
+fn install_binary(source: &Path, destination: &Path) -> Result<()> {
     if source.canonicalize().ok() == destination.canonicalize().ok() {
         return Ok(());
     }
     let parent = destination.parent().expect("destination has parent");
     let mut temp = NamedTempFile::new_in(parent)?;
-    let mut input = fs::File::open(&source)?;
+    let mut input = fs::File::open(source)?;
     std::io::copy(&mut input, &mut temp)?;
     temp.flush()?;
     #[cfg(unix)]
@@ -604,6 +683,45 @@ fn install_executable(destination: &Path) -> Result<()> {
     }
     temp.as_file().sync_all()?;
     replace_temp(temp, destination)
+}
+
+fn restore_installed_binary(destination: &Path, previous: Option<&[u8]>) {
+    match previous {
+        Some(bytes) => {
+            let _ = write_atomic(destination, bytes);
+        }
+        None => {
+            let _ = fs::remove_file(destination);
+        }
+    }
+}
+
+fn companion_binary_source(mcp_source: &Path) -> Result<PathBuf> {
+    let name = if cfg!(windows) {
+        "fukidashi-editor.exe"
+    } else {
+        "fukidashi-editor"
+    };
+    let parent = mcp_source.parent().ok_or_else(|| {
+        FukidashiError::InvalidInput(format!(
+            "cannot locate companion editor beside {}",
+            mcp_source.display()
+        ))
+    })?;
+    let candidates = [
+        parent.join(name),
+        parent.join("..").join("libexec").join(name),
+    ];
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.canonicalize().unwrap_or(candidate))
+        .ok_or_else(|| {
+            FukidashiError::InvalidInput(format!(
+                "companion editor {name} is missing beside {}; build or install fukidashi-editor alongside fukidashi-mcp",
+                mcp_source.display()
+            ))
+        })
 }
 
 fn config_path(client: Client) -> Result<PathBuf> {
@@ -1183,5 +1301,32 @@ mod tests {
         assert!(skill.is_file());
         assert!(changed.is_empty());
         assert_eq!(skipped.len(), 1);
+    }
+
+    #[test]
+    fn companion_binary_is_resolved_beside_mcp_and_missing_is_actionable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mcp_name = if cfg!(windows) {
+            "fukidashi-mcp.exe"
+        } else {
+            "fukidashi-mcp"
+        };
+        let editor_name = if cfg!(windows) {
+            "fukidashi-editor.exe"
+        } else {
+            "fukidashi-editor"
+        };
+        let mcp = temp.path().join(mcp_name);
+        let editor = temp.path().join(editor_name);
+        std::fs::write(&mcp, b"mcp").unwrap();
+        std::fs::write(&editor, b"editor").unwrap();
+        assert_eq!(
+            companion_binary_source(&mcp).unwrap(),
+            editor.canonicalize().unwrap()
+        );
+        std::fs::remove_file(&editor).unwrap();
+        let error = companion_binary_source(&mcp).unwrap_err().to_string();
+        assert!(error.contains("companion editor"));
+        assert!(error.contains("alongside"));
     }
 }
