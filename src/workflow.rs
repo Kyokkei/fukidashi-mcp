@@ -966,6 +966,43 @@ impl Workflow {
             .collect())
     }
 
+    /// Return the source images approved by the server-owned job manifest.
+    ///
+    /// The native editor runs in a separate process, so it cannot retain the
+    /// in-memory allowlist captured while the review server was started.  It
+    /// must reconstruct that list from the managed marker instead of trusting
+    /// editable `project.json` paths.  Source hashes are checked before the
+    /// list is exposed so a replaced source cannot be smuggled into a render.
+    pub fn managed_source_paths_for_editor(&self, job: &Path) -> Result<Vec<PathBuf>> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let manifest = load_manifest(&job)?;
+        validate_source_hashes(&manifest)?;
+        let sources = if manifest.expected_pages.is_empty() {
+            manifest
+                .pages
+                .values()
+                .map(|page| page.source_image.clone())
+                .collect::<Vec<_>>()
+        } else {
+            manifest.expected_pages.clone()
+        };
+        let mut approved = Vec::with_capacity(sources.len());
+        for source in sources {
+            let source = canonical_path(&source)
+                .with_context(|| format!("resolve managed source {}", source.display()))?;
+            let page = manifest.pages.get(&page_key(&source)).ok_or_else(|| {
+                anyhow!("managed manifest is missing source {}", source.display())
+            })?;
+            if !paths_same(&page.source_image, &source)? {
+                bail!("managed manifest source does not match its page record");
+            }
+            if !approved.iter().any(|path| path == &source) {
+                approved.push(source);
+            }
+        }
+        Ok(approved)
+    }
+
     /// Resolve the deterministic artifacts for one page without allocating a
     /// new job from the source path.  Strict translation calls use this to
     /// resume a partially completed page and to avoid exposing path choices

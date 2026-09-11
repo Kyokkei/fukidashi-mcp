@@ -9,6 +9,7 @@
 
 use egui::{Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 use fukidashi_mcp::domain::Rect as DomainRect;
+use image::RgbImage;
 
 use super::EditorApp;
 use super::state::{CorrectionStroke, PageView};
@@ -84,6 +85,9 @@ pub struct CanvasState {
     pub brush_mode: BrushMode,
     pub brush_radius: f32,
     pub brush_color: egui::Color32,
+    pub eyedropper_active: bool,
+    pub sample_size: u32,
+    pub recent_colors: Vec<egui::Color32>,
     pub undo_stack: std::collections::VecDeque<usize>,
     pub brush_overlay: Option<egui::TextureHandle>,
     pub brush_overlay_dirty: bool,
@@ -109,6 +113,9 @@ impl Default for CanvasState {
             brush_mode: BrushMode::Cover,
             brush_radius: 24.0,
             brush_color: egui::Color32::WHITE,
+            eyedropper_active: false,
+            sample_size: 5,
+            recent_colors: Vec::new(),
             undo_stack: std::collections::VecDeque::new(),
             brush_overlay: None,
             brush_overlay_dirty: false,
@@ -192,6 +199,57 @@ impl CanvasState {
         bbox.x2 = (bbox.x1 + width).min(image_size.x.max(width));
         bbox.y2 = (bbox.y1 + height).min(image_size.y.max(height));
         bbox
+    }
+
+    pub(crate) fn average_color_in_neighborhood(
+        image: &RgbImage,
+        center: Pos2,
+        sample_size: u32,
+    ) -> Option<egui::Color32> {
+        if image.width() == 0
+            || image.height() == 0
+            || !center.x.is_finite()
+            || !center.y.is_finite()
+        {
+            return None;
+        }
+        let size = if sample_size >= 5 { 5 } else { 3 };
+        let half = size / 2;
+        let cx = center.x.floor() as i32;
+        let cy = center.y.floor() as i32;
+        let max_x = image.width() as i32 - 1;
+        let max_y = image.height() as i32 - 1;
+        let x1 = (cx - half).clamp(0, max_x);
+        let x2 = (cx + half).clamp(0, max_x);
+        let y1 = (cy - half).clamp(0, max_y);
+        let y2 = (cy + half).clamp(0, max_y);
+        if x1 > x2 || y1 > y2 {
+            return None;
+        }
+        let mut sum = [0_u64; 3];
+        let mut count = 0_u64;
+        for y in y1..=y2 {
+            for x in x1..=x2 {
+                let pixel = image.get_pixel(x as u32, y as u32).0;
+                sum[0] += u64::from(pixel[0]);
+                sum[1] += u64::from(pixel[1]);
+                sum[2] += u64::from(pixel[2]);
+                count += 1;
+            }
+        }
+        (count > 0).then(|| {
+            egui::Color32::from_rgb(
+                (sum[0] / count) as u8,
+                (sum[1] / count) as u8,
+                (sum[2] / count) as u8,
+            )
+        })
+    }
+
+    pub(crate) fn push_recent_color(colors: &mut Vec<egui::Color32>, color: egui::Color32) {
+        colors.retain(|recent| *recent != color);
+        colors.insert(0, color);
+        colors.truncate(4);
     }
 }
 
@@ -330,12 +388,20 @@ impl EditorApp {
             }
         }
 
-        // Live brush cursor ring when active on cleaned variant.
-        if self.canvas.brush_active && self.current_variant_is_cleaned() {
+        // Live brush/eyedropper cursor ring.  The eyedropper ring shows the
+        // neighborhood that will be averaged, while brush radius remains the
+        // actual correction diameter.
+        if (self.canvas.brush_active && self.current_variant_is_cleaned())
+            || self.canvas.eyedropper_active
+        {
             if let Some(hover_pos) = response.hover_pos() {
                 painter.circle_stroke(
                     hover_pos,
-                    self.canvas.brush_radius * self.canvas.zoom,
+                    if self.canvas.eyedropper_active {
+                        self.canvas.sample_size as f32 * self.canvas.zoom / 2.0
+                    } else {
+                        self.canvas.brush_radius * self.canvas.zoom
+                    },
                     egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(255, 90, 90)),
                 );
             }
@@ -373,6 +439,10 @@ impl EditorApp {
                 Handle::Tc | Handle::Bc => egui::CursorIcon::ResizeVertical,
                 Handle::Ml | Handle::Mr => egui::CursorIcon::ResizeHorizontal,
             });
+        } else if self.canvas.eyedropper_active
+            || (self.canvas.brush_active && ctx.input(|i| i.modifiers.alt))
+        {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         } else if self.canvas.brush_active && self.current_variant_is_cleaned() {
             ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         } else if let Some((pi, bi)) = self.canvas.selected {
@@ -407,20 +477,38 @@ impl EditorApp {
             return;
         }
 
+        // Space + primary drag and middle drag pan the viewport. Space owns
+        // the primary gesture before brush, eyedropper, or bubble handling.
+        let space_pan = ctx.input(|i| i.key_down(egui::Key::Space));
+        let space_primary_drag = space_pan
+            && (response.drag_started_by(egui::PointerButton::Primary)
+                || response.dragged_by(egui::PointerButton::Primary));
+        let space_primary_click = space_pan && response.clicked_by(egui::PointerButton::Primary);
+        if space_primary_drag || space_primary_click {
+            if !matches!(self.canvas.drag, DragState::Pan) {
+                self.canvas.drag = DragState::Pan;
+                self.canvas.pan_start = Some(self.canvas.pan);
+            }
+            if response.dragged_by(egui::PointerButton::Primary) {
+                self.canvas.pan = CanvasState::pan_from_drag(
+                    self.canvas.pan_start.unwrap_or(self.canvas.pan),
+                    response.drag_delta(),
+                );
+            }
+            return;
+        }
+
         // A right-button gesture is Restore while brush is active. Otherwise
-        // secondary and middle drags are viewport pan gestures.
+        // secondary and middle drags are viewport pan gestures. Middle owns
+        // the gesture even while Alt is held.
         let right_brush = self.canvas.brush_active
             && self.current_variant_is_cleaned()
             && (response.dragged_by(egui::PointerButton::Secondary)
                 || response.drag_started_by(egui::PointerButton::Secondary));
-        if right_brush {
-            self.paint_at(pointer, origin, BrushMode::Restore, response);
-            return;
-        }
         if response.drag_started_by(egui::PointerButton::Middle)
             || response.drag_started_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Middle)
-            || response.dragged_by(egui::PointerButton::Secondary)
+            || (response.dragged_by(egui::PointerButton::Secondary) && !right_brush)
         {
             if !matches!(self.canvas.drag, DragState::Pan) {
                 self.canvas.drag = DragState::Pan;
@@ -430,6 +518,21 @@ impl EditorApp {
                 self.canvas.pan_start.unwrap_or(self.canvas.pan),
                 response.drag_delta(),
             );
+            return;
+        }
+
+        // Persistent eyedropper and Alt + Brush consume the primary gesture
+        // before painting or bubble actions. Alt is read directly each frame,
+        // so releasing it or losing window focus cannot leave a stuck mode.
+        let alt_sampling = self.canvas.brush_active && ctx.input(|i| i.modifiers.alt);
+        if self.canvas.eyedropper_active || alt_sampling {
+            if response.clicked_by(egui::PointerButton::Primary) {
+                self.sample_at(pointer, origin, image_size, _image_path);
+            }
+            return;
+        }
+        if right_brush {
+            self.paint_at(pointer, origin, BrushMode::Restore, response);
             return;
         }
 
@@ -652,6 +755,41 @@ impl EditorApp {
         }
     }
 
+    fn sample_at(
+        &mut self,
+        pointer: Pos2,
+        origin: Pos2,
+        image_size: Vec2,
+        image_path: &std::path::Path,
+    ) {
+        let image_point = self.canvas.screen_to_image(pointer, origin);
+        if image_point.x < 0.0
+            || image_point.y < 0.0
+            || image_point.x >= image_size.x
+            || image_point.y >= image_size.y
+        {
+            return;
+        }
+        let image = match image::open(image_path) {
+            Ok(image) => image.to_rgb8(),
+            Err(error) => {
+                self.error_message = Some(format!("eyedropper could not read image: {error}"));
+                return;
+            }
+        };
+        let Some(color) = CanvasState::average_color_in_neighborhood(
+            &image,
+            image_point,
+            self.canvas.sample_size,
+        ) else {
+            self.error_message = Some("eyedropper found no pixels at that location".to_owned());
+            return;
+        };
+        self.canvas.brush_color = color;
+        CanvasState::push_recent_color(&mut self.canvas.recent_colors, color);
+        self.error_message = None;
+    }
+
     fn finish_drag(&mut self) {
         match std::mem::replace(&mut self.canvas.drag, DragState::None) {
             DragState::BrushStroke {
@@ -754,7 +892,7 @@ fn hex_to_color32(hex: String) -> Option<egui::Color32> {
     }
 }
 
-fn color32_to_hex(color: egui::Color32) -> String {
+pub(crate) fn color32_to_hex(color: egui::Color32) -> String {
     let [r, g, b, _] = color.to_srgba_unmultiplied();
     format!("#{:02x}{:02x}{:02x}", r, g, b)
 }
@@ -762,6 +900,7 @@ fn color32_to_hex(color: egui::Color32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::Rgb;
 
     #[test]
     fn pan_anchor_does_not_accumulate_cumulative_drag_delta() {
@@ -786,5 +925,35 @@ mod tests {
         assert!(clamped.x2 <= 64.0 && clamped.y2 <= 64.0);
         assert!(clamped.x2 - clamped.x1 >= 2.0);
         assert!(clamped.y2 - clamped.y1 >= 2.0);
+    }
+
+    #[test]
+    fn eyedropper_averages_bounded_3x3_and_5x5_neighborhoods() {
+        let image = RgbImage::from_pixel(3, 3, Rgb([10, 20, 30]));
+        let color =
+            CanvasState::average_color_in_neighborhood(&image, Pos2::new(0.0, 0.0), 5).unwrap();
+        assert_eq!(color, egui::Color32::from_rgb(10, 20, 30));
+        let mut image = RgbImage::from_pixel(7, 7, Rgb([0, 0, 0]));
+        image.put_pixel(3, 3, Rgb([255, 255, 255]));
+        let three =
+            CanvasState::average_color_in_neighborhood(&image, Pos2::new(3.0, 3.0), 3).unwrap();
+        let five =
+            CanvasState::average_color_in_neighborhood(&image, Pos2::new(3.0, 3.0), 5).unwrap();
+        assert!(three.r() > five.r());
+    }
+
+    #[test]
+    fn recent_colors_are_deduplicated_most_recent_first_and_bounded() {
+        let mut recent = Vec::new();
+        for channel in 0..=4 {
+            CanvasState::push_recent_color(
+                &mut recent,
+                egui::Color32::from_rgb(channel * 20, 0, 0),
+            );
+        }
+        CanvasState::push_recent_color(&mut recent, egui::Color32::from_rgb(40, 0, 0));
+        assert_eq!(recent.len(), 4);
+        assert_eq!(recent[0], egui::Color32::from_rgb(40, 0, 0));
+        assert!(!recent.contains(&egui::Color32::from_rgb(0, 0, 0)));
     }
 }

@@ -39,6 +39,65 @@ impl EditorApp {
                 }
 
                 ui.separator();
+                ui.collapsing("Color palette", |ui| {
+                    let eye_label = if self.canvas.eyedropper_active {
+                        "Eyedropper active (I)"
+                    } else {
+                        "Eyedropper (I)"
+                    };
+                    if ui.button(eye_label).clicked() {
+                        self.cancel_drag();
+                        self.canvas.eyedropper_active = !self.canvas.eyedropper_active;
+                        if self.canvas.eyedropper_active {
+                            self.canvas.brush_active = false;
+                        }
+                    }
+                    ComboBox::from_label("Sample neighborhood")
+                        .selected_text(format!(
+                            "{}×{}",
+                            self.canvas.sample_size, self.canvas.sample_size
+                        ))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.canvas.sample_size, 3, "3×3");
+                            ui.selectable_value(&mut self.canvas.sample_size, 5, "5×5");
+                        });
+                    ui.label("Defaults and recent colors");
+                    ui.horizontal_wrapped(|ui| {
+                        for (label, color) in [
+                            ("White", egui::Color32::WHITE),
+                            ("Black", egui::Color32::BLACK),
+                        ] {
+                            if ui
+                                .add(
+                                    egui::Button::new(label)
+                                        .fill(color)
+                                        .min_size(egui::vec2(48.0, 24.0)),
+                                )
+                                .clicked()
+                            {
+                                self.canvas.brush_color = color;
+                            }
+                        }
+                        for color in self.canvas.recent_colors.clone() {
+                            if ui
+                                .add(
+                                    egui::Button::new("Recent")
+                                        .fill(color)
+                                        .min_size(egui::vec2(48.0, 24.0)),
+                                )
+                                .clicked()
+                            {
+                                self.canvas.brush_color = color;
+                            }
+                        }
+                    });
+                    ui.label(format!(
+                        "Current: {}",
+                        super::canvas::color32_to_hex(self.canvas.brush_color)
+                    ));
+                });
+
+                ui.separator();
                 ui.label("Font Path");
                 let mut font = self
                     .state
@@ -74,8 +133,10 @@ impl EditorApp {
                 ui.collapsing("Brush", |ui| {
                     let mut active = self.canvas.brush_active;
                     if ui.checkbox(&mut active, "Brush tool (B)").changed() {
+                        self.cancel_drag();
                         self.canvas.brush_active = active;
                         if active {
+                            self.canvas.eyedropper_active = false;
                             self.canvas.current_variant = super::canvas::Variant::Cleaned;
                         }
                     }

@@ -1,5 +1,7 @@
 use fukidashi_mcp::domain::{Rect, TypesetPayload};
-use fukidashi_mcp::editor::{serve_editor, serve_editor_with_allowed_sources, wait_for_review};
+use fukidashi_mcp::editor::{
+    render_editor_page, serve_editor, serve_editor_with_allowed_sources, wait_for_review,
+};
 use fukidashi_mcp::workflow::Workflow;
 use image::{ImageBuffer, Rgb};
 use serde_json::json;
@@ -544,6 +546,52 @@ fn approval_overrides_flags_issues_and_dirty_render_state() {
     );
     let export = fukidashi_mcp::export::export_project(dir.path(), "zip");
     assert!(export.is_ok(), "unexpected export result: {export:?}");
+}
+
+#[test]
+fn native_render_uses_manifest_source_allowlist_for_external_source_pages() {
+    let dir = tempdir().unwrap();
+    let source = dir.path().join("source.png");
+    ImageBuffer::<Rgb<u8>, _>::from_pixel(16, 16, Rgb([0, 0, 0]))
+        .save(&source)
+        .unwrap();
+    let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+    let registration = workflow.register_analysis(&source, None).unwrap();
+    let cleaned = ImageBuffer::<Rgb<u8>, _>::from_pixel(16, 16, Rgb([255, 255, 255]));
+    let mut mask = image::GrayImage::new(16, 16);
+    mask.put_pixel(2, 2, image::Luma([255]));
+    workflow
+        .write_clean_artifact(&source, &cleaned, &mask, 0, "full")
+        .unwrap();
+    let artifacts = workflow.page_artifacts_for_source(&source).unwrap();
+    let clean_path = artifacts.2;
+    let rendered_path = artifacts.4;
+    cleaned.save(&rendered_path).unwrap();
+    workflow
+        .register_render(
+            &rendered_path,
+            &workflow.validate_clean_input(&clean_path).unwrap(),
+            json!({"request_bubbles": [], "report": {"bubbles": []}}),
+            json!({}),
+        )
+        .unwrap();
+    let state = workflow.editor_state(&rendered_path, None).unwrap();
+    let rendered = render_editor_page(&registration.job_dir, &rendered_path, &state, 0)
+        .expect("marker-approved external source should render natively");
+    assert_eq!(rendered["saved"], true);
+
+    let substituted = dir.path().join("substituted.png");
+    ImageBuffer::<Rgb<u8>, _>::from_pixel(16, 16, Rgb([128, 128, 128]))
+        .save(&substituted)
+        .unwrap();
+    let mut tampered = rendered["state"].clone();
+    tampered["pages"][0]["image_path"] = json!(substituted);
+    let error = render_editor_page(&registration.job_dir, &rendered_path, &tampered, 0)
+        .expect_err("unregistered external source must remain rejected");
+    assert!(
+        format!("{error:#}").contains("escapes the project directory"),
+        "unexpected rejection: {error:#}"
+    );
 }
 
 #[test]

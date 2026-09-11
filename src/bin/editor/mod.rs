@@ -212,51 +212,82 @@ impl EditorApp {
     }
 
     fn rerender_current_page(&mut self) {
-        let image_path = match self.state.as_ref().and_then(|s| {
-            s.pages().into_iter().nth(self.current_page).map(|p| {
-                let path = p
-                    .rendered_image_path
-                    .clone()
-                    .or_else(|| Some(p.cleaned_image_path.clone()))
-                    .or_else(|| Some(p.source_image_path.clone()));
-                path
+        if let Err(error) = self.rerender_page_at(self.current_page) {
+            self.error_message = Some(format!("render failed: {error}"));
+        }
+    }
+
+    /// Render one page after saving the current in-memory edits, then reload
+    /// the server-normalized state.  Approval uses this same path for every
+    /// dirty page so it cannot record a review against stale bitmaps.
+    fn rerender_page_at(&mut self, page_index: usize) -> anyhow::Result<()> {
+        let image_path = self
+            .state
+            .as_ref()
+            .and_then(|state| state.pages().into_iter().nth(page_index))
+            .and_then(|page| {
+                page.rendered_image_path
+                    .or(Some(page.cleaned_image_path))
+                    .or(Some(page.source_image_path))
             })
-        }) {
-            Some(Some(path)) => path,
-            _ => {
-                self.error_message = Some("page has no image path".to_owned());
-                return;
-            }
-        };
+            .ok_or_else(|| anyhow::anyhow!("page has no image path"))?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("editor state is unavailable"))?;
         // Inspector edits are debounced for normal work, but an explicit
         // render must include every edit made immediately before the click.
-        if let Some(state) = self.state.as_ref()
-            && let Err(error) = state::save_project(state)
-        {
-            self.error_message = Some(format!("save failed before render: {error}"));
-            return;
+        state::save_project(state)
+            .map_err(|error| anyhow::anyhow!("save failed before render: {error}"))?;
+        render::rerender_page(state, page_index, &image_path)?;
+
+        let bytes = std::fs::read(self.job_dir.join("project.json"))
+            .map_err(|error| anyhow::anyhow!("reload rendered project: {error}"))?;
+        let value = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|error| anyhow::anyhow!("parse rendered project: {error}"))?;
+        if let Some(state) = self.state.as_mut() {
+            state.value = value;
         }
-        let state_ref = self.state.as_ref().unwrap();
-        match render::rerender_page(state_ref, self.current_page, &image_path) {
-            Ok(_) => {
-                if let Ok(bytes) = std::fs::read(self.job_dir.join("project.json")) {
-                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                        if let Some(s) = self.state.as_mut() {
-                            s.value = value;
-                        }
-                    }
-                }
-                self.page_textures.clear();
-                self.thumb_textures.clear();
-                self.canvas.brush_overlay = None;
-                self.canvas.brush_overlay_dirty = true;
-                self.error_message = None;
-                self.dirty_since = None;
-            }
-            Err(e) => {
-                self.error_message = Some(format!("render failed: {e}"));
-            }
+        self.page_textures.clear();
+        self.thumb_textures.clear();
+        self.canvas.brush_overlay = None;
+        self.canvas.brush_overlay_dirty = true;
+        self.dirty_since = None;
+        Ok(())
+    }
+
+    fn rerender_dirty_pages_before_approval(&mut self) -> anyhow::Result<()> {
+        let dirty_pages = self
+            .state
+            .as_ref()
+            .map(render_dirty_page_indices)
+            .unwrap_or_default();
+        if dirty_pages.is_empty() {
+            return Ok(());
         }
+        let original_page = self.current_page;
+        for (position, page_index) in dirty_pages.iter().copied().enumerate() {
+            self.current_page = page_index;
+            self.error_message = Some(format!(
+                "Re-rendering page {} of {} before approval…",
+                position + 1,
+                dirty_pages.len()
+            ));
+            if let Some(context) = &self.context {
+                context.request_repaint();
+            }
+            self.rerender_page_at(page_index).map_err(|error| {
+                anyhow::anyhow!("page {} could not be re-rendered: {error}", page_index + 1)
+            })?;
+        }
+        let page_count = self
+            .state
+            .as_ref()
+            .map(EditorState::page_count)
+            .unwrap_or(0);
+        self.current_page = original_page.min(page_count.saturating_sub(1));
+        self.error_message = None;
+        Ok(())
     }
 
     fn undo_stroke(&mut self) {
@@ -274,6 +305,12 @@ impl EditorApp {
         }
         if !self.review_file_is_current() {
             self.error_message = Some("review changed on disk; reopen this editor".to_owned());
+            return;
+        }
+        if let Err(error) = self.rerender_dirty_pages_before_approval() {
+            self.error_message = Some(format!(
+                "approval blocked until all dirty pages render successfully: {error}"
+            ));
             return;
         }
         self.review.approved_pages =
@@ -308,6 +345,21 @@ impl EditorApp {
         }
         if !self.review_file_is_current() {
             self.error_message = Some("review changed on disk; reopen this editor".to_owned());
+            return;
+        }
+        let derived_feedback = native_review_feedback(
+            self.state
+                .as_ref()
+                .map(|state| &state.value)
+                .unwrap_or(&serde_json::Value::Null),
+        );
+        if !derived_feedback.is_empty() {
+            self.review.feedback = derived_feedback;
+        }
+        if self.review.feedback.is_empty() {
+            self.error_message = Some(
+                "request fixes needs a flagged bubble or an issue on at least one page".to_owned(),
+            );
             return;
         }
         self.review.status = "fixes_requested".to_owned();
@@ -383,7 +435,18 @@ impl EditorApp {
                         {
                             self.canvas.brush_active = !self.canvas.brush_active;
                             if self.canvas.brush_active {
+                                self.canvas.eyedropper_active = false;
                                 self.canvas.current_variant = canvas::Variant::Cleaned;
+                            }
+                        }
+                        egui::Key::I
+                            if tool_shortcuts_allowed(text_focus)
+                                && *modifiers == egui::Modifiers::NONE =>
+                        {
+                            self.cancel_drag();
+                            self.canvas.eyedropper_active = !self.canvas.eyedropper_active;
+                            if self.canvas.eyedropper_active {
+                                self.canvas.brush_active = false;
                             }
                         }
                         egui::Key::V
@@ -409,6 +472,7 @@ impl EditorApp {
                         egui::Key::Escape => {
                             self.cancel_drag();
                             self.canvas.brush_active = false;
+                            self.canvas.eyedropper_active = false;
                         }
                         _ => {}
                     }
@@ -442,6 +506,125 @@ fn adjust_brush_radius(radius: f32, delta: f32) -> f32 {
     (radius + delta).clamp(4.0, 80.0)
 }
 
+fn render_dirty_page_indices(state: &EditorState) -> Vec<usize> {
+    state
+        .pages()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, page)| {
+            (page.render_dirty || page.bubbles.iter().any(|bubble| bubble.render_dirty))
+                .then_some(index)
+        })
+        .collect()
+}
+
+fn native_review_feedback(state: &serde_json::Value) -> Vec<serde_json::Value> {
+    let Some(pages) = state.get("pages").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    let mut feedback = Vec::new();
+    for (page_index, page) in pages.iter().enumerate() {
+        if let Some(issues) = page.get("issues").and_then(serde_json::Value::as_array) {
+            for issue in issues {
+                let issue_type = issue
+                    .get("issue_type")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| {
+                        matches!(
+                            *value,
+                            "leftover_source_text"
+                                | "text_overflow"
+                                | "wrong_translation"
+                                | "wrong_or_missing_bubble"
+                                | "damaged_artwork"
+                                | "font_or_layout"
+                                | "flagged_bubble"
+                                | "custom"
+                        )
+                    })
+                    .unwrap_or("custom");
+                let mut item = serde_json::json!({
+                    "page": page_index,
+                    "issue_type": issue_type,
+                    "origin": "image-pixels",
+                });
+                copy_feedback_string(&mut item, issue, "note");
+                copy_feedback_string(&mut item, issue, "corrected_text");
+                copy_feedback_string(&mut item, issue, "source_ocr");
+                copy_feedback_string(&mut item, issue, "current_translation");
+                copy_feedback_bbox(&mut item, issue);
+                feedback.push(item);
+            }
+        }
+        if let Some(bubbles) = page.get("bubbles").and_then(serde_json::Value::as_array) {
+            for bubble in bubbles {
+                let flagged = bubble
+                    .get("flagged")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    || bubble
+                        .get("problem")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                if !flagged {
+                    continue;
+                }
+                let mut item = serde_json::json!({
+                    "page": page_index,
+                    "issue_type": "flagged_bubble",
+                    "origin": "bubble-flag",
+                });
+                for key in ["bubble_id", "note", "corrected_text"] {
+                    copy_feedback_string(&mut item, bubble, key);
+                }
+                if let Some(id) = bubble.get("id").and_then(serde_json::Value::as_str) {
+                    item["bubble_id"] = serde_json::Value::String(id.to_owned());
+                }
+                if let Some(source) = bubble
+                    .get("source_ocr")
+                    .or_else(|| bubble.get("source_text"))
+                    .or_else(|| bubble.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    item["source_ocr"] = serde_json::Value::String(source.to_owned());
+                }
+                if let Some(translation) = bubble
+                    .get("current_translation")
+                    .or_else(|| bubble.get("translation"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    item["current_translation"] = serde_json::Value::String(translation.to_owned());
+                }
+                copy_feedback_bbox(&mut item, bubble);
+                feedback.push(item);
+            }
+        }
+    }
+    feedback
+}
+
+fn copy_feedback_string(target: &mut serde_json::Value, source: &serde_json::Value, key: &str) {
+    let Some(value) = source.get(key).and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    if value.len() <= 4096 {
+        target[key] = serde_json::Value::String(value.to_owned());
+    }
+}
+
+fn copy_feedback_bbox(target: &mut serde_json::Value, source: &serde_json::Value) {
+    let Some(value) = source.get("bbox") else {
+        return;
+    };
+    if serde_json::from_value::<fukidashi_mcp::domain::Rect>(value.clone())
+        .ok()
+        .and_then(|rect| rect.validate().ok())
+        .is_some()
+    {
+        target["bbox"] = value.clone();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +640,127 @@ mod tests {
     fn tool_shortcuts_are_blocked_by_text_focus() {
         assert!(tool_shortcuts_allowed(false));
         assert!(!tool_shortcuts_allowed(true));
+    }
+
+    #[test]
+    fn approval_preflight_finds_page_and_bubble_render_dirty() {
+        let state = EditorState {
+            value: serde_json::json!({
+                "pages": [
+                    {"render_dirty": false, "bubbles": [{"render_dirty": true}]},
+                    {"render_dirty": true, "bubbles": []},
+                    {"render_dirty": false, "bubbles": [{"render_dirty": false}]}
+                ]
+            }),
+            job_dir: std::path::PathBuf::new(),
+            image_path: std::path::PathBuf::new(),
+        };
+        assert_eq!(render_dirty_page_indices(&state), vec![0, 1]);
+    }
+
+    #[test]
+    fn native_request_fixes_serializes_flagged_bubbles_and_issues() {
+        let feedback = native_review_feedback(&serde_json::json!({
+            "pages": [{
+                "issues": [{"issue_type": "font_or_layout", "bbox": {"x1":1,"y1":2,"x2":8,"y2":9}}],
+                "bubbles": [{"id":"b1","flagged":true,"bbox":{"x1":2,"y1":3,"x2":9,"y2":10},"text":"OCR","translation":"Dịch"}]
+            }]
+        }));
+        assert_eq!(feedback.len(), 2);
+        assert_eq!(feedback[0]["origin"], "image-pixels");
+        assert_eq!(feedback[1]["issue_type"], "flagged_bubble");
+        assert_eq!(feedback[1]["bubble_id"], "b1");
+        assert_eq!(feedback[1]["source_ocr"], "OCR");
+        assert_eq!(feedback[1]["current_translation"], "Dịch");
+    }
+
+    #[test]
+    fn approval_keeps_review_unchanged_when_dirty_render_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let job_dir = directory.path().to_path_buf();
+        let session = "native-approval-test".to_owned();
+        let project = serde_json::json!({
+            "state_revision": 0,
+            "pages": [{
+                "id": "page-1",
+                "image_path": "missing-source.png",
+                "cleaned_image_path": "missing-clean.png",
+                "rendered_image_path": "missing-rendered.png",
+                "render_dirty": true,
+                "bubbles": []
+            }]
+        });
+        state::atomic_write_json(&job_dir.join("project.json"), &project).unwrap();
+        let review = ReviewState {
+            review_session_id: session.clone(),
+            revision: 4,
+            status: "awaiting_review".to_owned(),
+            action: None,
+            feedback: Vec::new(),
+            approved_pages: Vec::new(),
+            consumed: false,
+            audit: Vec::new(),
+        };
+        state::save_review_state(&job_dir, &review).unwrap();
+        let exit_state = Arc::new(Mutex::new(crate::ExitState::default()));
+        let mut app = EditorApp::new(job_dir.clone(), Some(session), exit_state).unwrap();
+        app.approve_and_export();
+        let persisted = read_review(&job_dir).unwrap();
+        assert!(persisted.action.is_none());
+        assert_eq!(persisted.status, "awaiting_review");
+        assert!(
+            app.error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("approval blocked"))
+        );
+    }
+
+    #[test]
+    fn request_fixes_writes_feedback_for_a_flagged_bubble() {
+        let directory = tempfile::tempdir().unwrap();
+        let job_dir = directory.path().to_path_buf();
+        let session = "native-request-test".to_owned();
+        let project = serde_json::json!({
+            "state_revision": 0,
+            "pages": [{
+                "id": "page-1",
+                "image_path": "source.png",
+                "render_dirty": false,
+                "bubbles": [{
+                    "id": "bubble-1",
+                    "bbox": {"x1": 1, "y1": 2, "x2": 10, "y2": 12},
+                    "text": "OCR",
+                    "translation": "Dịch",
+                    "flagged": true
+                }]
+            }]
+        });
+        state::atomic_write_json(&job_dir.join("project.json"), &project).unwrap();
+        state::save_review_state(
+            &job_dir,
+            &ReviewState {
+                review_session_id: session.clone(),
+                revision: 2,
+                status: "awaiting_review".to_owned(),
+                action: None,
+                feedback: Vec::new(),
+                approved_pages: Vec::new(),
+                consumed: false,
+                audit: Vec::new(),
+            },
+        )
+        .unwrap();
+        let exit_state = Arc::new(Mutex::new(crate::ExitState::default()));
+        let mut app = EditorApp::new(job_dir.clone(), Some(session), exit_state).unwrap();
+        app.context = Some(egui::Context::default());
+        app.request_fixes();
+        let persisted = read_review(&job_dir).unwrap();
+        assert_eq!(persisted.action.as_deref(), Some("request_fixes"));
+        assert_eq!(persisted.feedback.len(), 1);
+        assert_eq!(persisted.feedback[0]["bubble_id"], "bubble-1");
+        assert_eq!(persisted.feedback[0]["issue_type"], "flagged_bubble");
+        assert_eq!(persisted.feedback[0]["source_ocr"], "OCR");
+        assert_eq!(persisted.feedback[0]["current_translation"], "Dịch");
     }
 }
 

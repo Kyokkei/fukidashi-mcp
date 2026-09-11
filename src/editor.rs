@@ -812,6 +812,7 @@ pub fn render_editor_page(
     let image_path = fs::canonicalize(image_path)
         .with_context(|| format!("resolve editor image {}", image_path.display()))?;
     let root_dir = managed_editor_root(root_dir);
+    let allowed_source_paths = trusted_managed_source_paths(&root_dir)?;
     let session = Arc::new(Session {
         token: "native-editor".to_owned(),
         host: String::new(),
@@ -819,7 +820,7 @@ pub fn render_editor_page(
         root_dir: root_dir.clone(),
         state_path: root_dir.join("project.json"),
         initial_state: normalize_editor_state(state.clone())?,
-        allowed_source_paths: Vec::new(),
+        allowed_source_paths,
         review: Arc::new(ReviewChannel {
             state: Mutex::new(ReviewState {
                 review_session_id: "native".to_owned(),
@@ -839,10 +840,24 @@ pub fn render_editor_page(
     if !state_revision_matches(&current, state) {
         bail!("stale editor state: reload the project before rendering");
     }
-    if validate_state(state).is_err() || validate_project_paths(&session, state).is_err() {
-        bail!("invalid editor state");
-    }
+    validate_state(state).context("invalid editor state")?;
+    validate_project_paths(&session, state).context("invalid editor paths")?;
     render_page(&session, state, index)
+}
+
+/// Reconstruct the native editor's source allowlist from the server-owned
+/// managed marker.  Ad hoc editor state is never used to widen this list.
+fn trusted_managed_source_paths(root_dir: &Path) -> Result<Vec<PathBuf>> {
+    let has_marker =
+        root_dir.join("job.json").is_file() || root_dir.join(".fukidashi-job.json").is_file();
+    if !has_marker {
+        return Ok(Vec::new());
+    }
+    let jobs_root = root_dir
+        .parent()
+        .ok_or_else(|| anyhow!("managed editor job has no jobs root"))?;
+    crate::workflow::Workflow::new(jobs_root.to_path_buf())?
+        .managed_source_paths_for_editor(root_dir)
 }
 
 /// Locate a `fukidashi-editor` executable to auto-spawn from the MCP server.
@@ -1899,6 +1914,9 @@ fn synchronize_rendered_bubbles(page: &mut Value) {
         if let Some(bbox) = object.get("bbox").cloned() {
             object.insert("bubble_bbox".to_owned(), bbox);
         }
+        // A successful render has consumed all render-affecting bubble edits;
+        // advisory flags remain separate and are intentionally preserved.
+        object.insert("render_dirty".to_owned(), Value::Bool(false));
     }
 }
 
