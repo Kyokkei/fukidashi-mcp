@@ -118,7 +118,28 @@ pub fn serve_editor_with_allowed_sources(
     let review_path = review_file(&root_dir);
     let mut review_state = if review_path.exists() {
         let bytes = fs::read(&review_path).context("read existing review state")?;
-        serde_json::from_slice::<ReviewState>(&bytes).context("parse existing review state")?
+        let existing: ReviewState =
+            serde_json::from_slice::<ReviewState>(&bytes).context("parse existing review state")?;
+        // A review that was already approved for export is complete. Re-serving
+        // must not reset it to a fresh revision — that respawns the editor and
+        // forces the operator to approve a second time just so the export tool
+        // can read the same decision. Surface the recorded action instead.
+        // `request_fixes` is deliberately NOT sticky: the fix loop serves the
+        // editor again after feedback is applied, and that call must mint a
+        // fresh review round via the reset below.
+        if existing.action.as_deref() == Some("approve_export") {
+            return Ok(json!({
+                "editor_kind": "already_completed",
+                "action": existing.action,
+                "status": existing.status,
+                "review_session_id": existing.review_session_id,
+                "review_revision": existing.revision,
+                "review": existing,
+                "persistence_path": state_path,
+                "review_path": review_path,
+            }));
+        }
+        existing
     } else {
         ReviewState {
             review_session_id: Uuid::new_v4().simple().to_string(),
@@ -2200,6 +2221,34 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         &fallback_font_paths,
         &output,
     )?;
+    // The typesetter is intentionally page-agnostic; attach the editor page
+    // index at this boundary so persisted warnings identify both coordinates.
+    let warning_bubble_indices = report
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter_map(|warning| warning.get("bubble_index").and_then(Value::as_u64))
+                .filter_map(|value| usize::try_from(value).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Some(warnings) = report.get_mut("warnings").and_then(Value::as_array_mut) {
+        for warning in warnings {
+            warning["page"] = Value::from(index);
+        }
+    }
+    if let Some(bubbles) = report.get_mut("bubbles").and_then(Value::as_array_mut) {
+        for bubble_index in warning_bubble_indices {
+            if let Some(detail) = bubbles
+                .get_mut(bubble_index)
+                .and_then(|bubble| bubble.get_mut("warning"))
+            {
+                detail["page"] = Value::from(index);
+            }
+        }
+    }
     if !font_substitutions.is_empty() {
         let mut substitutions = font_substitutions.clone();
         if let Some(reports) = report["bubbles"].as_array_mut() {
@@ -2265,6 +2314,10 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         );
         page["render_dirty"] = Value::Bool(false);
         page["rendered_state_revision"] = Value::from(state_revision(state).saturating_add(1));
+        page["typeset_warnings"] = report
+            .get("warnings")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new()));
     }
     validate_state(&saved_state)?;
     atomic_json_save(&session.state_path, &saved_state)?;

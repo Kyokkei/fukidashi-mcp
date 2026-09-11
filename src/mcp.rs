@@ -2763,6 +2763,53 @@ impl FukidashiServer {
                 );
             }
         };
+        // A review already approved for export comes back from serve_editor
+        // without a live editor session. Skip the browser launch and the
+        // review wait entirely and export against the recorded decision —
+        // re-waiting would either block on a dead session or consume twice.
+        if served
+            .get("editor_kind")
+            .and_then(serde_json::Value::as_str)
+            == Some("already_completed")
+        {
+            let url = "native://already-completed".to_owned();
+            let review = served
+                .get("review")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let persistence_path = match served
+                .get("persistence_path")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some(value) => PathBuf::from(value),
+                None => {
+                    return json_result(
+                        &serde_json::json!({
+                            "protocol":"review-v1","status":"approved_export_blocked",
+                            "editor_url":url,
+                            "error":"already-completed review returned no persistence path"
+                        }),
+                        true,
+                    );
+                }
+            };
+            let project_dir = match persistence_path.parent() {
+                Some(value) => value.to_path_buf(),
+                None => {
+                    return json_result(
+                        &serde_json::json!({
+                            "protocol":"review-v1","status":"approved_export_blocked",
+                            "editor_url":url,
+                            "error":"already-completed review persistence path has no managed job parent"
+                        }),
+                        true,
+                    );
+                }
+            };
+            return self
+                .export_approved_project(project_dir, req.format, review, url)
+                .await;
+        }
         let url = match served.get("url").and_then(serde_json::Value::as_str) {
             Some(value) => value.to_owned(),
             None => {
@@ -2886,10 +2933,24 @@ impl FukidashiServer {
                 );
             }
         };
+        self.export_approved_project(project_dir, req.format, review, url)
+            .await
+    }
+
+    /// Export an already-approved review's project directory and wrap the
+    /// result in the standard review-v1 envelope. Shared by the live-review
+    /// path and the already-completed fast path in `review_and_export_inner`.
+    async fn export_approved_project(
+        &self,
+        project_dir: PathBuf,
+        format: String,
+        review: serde_json::Value,
+        url: String,
+    ) -> CallToolResult {
         let export = self
             .export(Parameters(ExportRequest {
                 project_dir: project_dir.display().to_string(),
-                format: req.format,
+                format,
             }))
             .await;
         match extract_tool_json(export, "review export") {

@@ -966,9 +966,10 @@ where
         }
         size -= 0.5;
     }
-    Err(anyhow!(
-        "TextOverflow: supplied text does not fit at minimum font size {min_font_size:.1}px"
+    Err(crate::error::FukidashiError::TextOverflow(format!(
+        "supplied text does not fit at minimum font size {min_font_size:.1}px"
     ))
+    .into())
 }
 
 fn rect_intersection(left: Rect, right: Rect) -> Option<Rect> {

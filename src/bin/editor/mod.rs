@@ -4,7 +4,8 @@
     clippy::bind_instead_of_map,
     clippy::collapsible_if,
     clippy::items_after_test_module,
-    clippy::let_and_return
+    clippy::let_and_return,
+    dead_code
 )]
 
 pub mod canvas;
@@ -12,8 +13,9 @@ pub mod gallery;
 pub mod inspector;
 pub mod render;
 pub mod state;
+pub mod toolbar;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,11 +42,35 @@ pub struct EditorApp {
     page_textures: HashMap<usize, TextureHandle>,
     thumb_textures: HashMap<usize, TextureHandle>,
     dirty_since: Option<Instant>,
+    /// Sender for the background autosave writer: `(epoch, project_value)`.
+    /// The epoch is the sync-save counter at send time; the writer skips any
+    /// queued snapshot whose epoch is behind the latest explicit save, so a
+    /// slow background write can never clobber a newer synchronous one.
+    save_tx: std::sync::mpsc::SyncSender<(u64, serde_json::Value)>,
+    /// Counter bumped by every synchronous save; shared with the writer.
+    save_epoch: Arc<Mutex<u64>>,
     exit_action: Option<ExitAction>,
     error_message: Option<String>,
     exit_state: Arc<Mutex<crate::ExitState>>,
     /// egui context, refreshed each frame in `update`.
     context: Option<Context>,
+    pub icon_textures: std::collections::HashMap<&'static str, egui::TextureHandle>,
+    notify_message: Option<(String, std::time::Instant)>,
+    /// Bounded snapshots for operator mutations. A gesture keeps its
+    /// pre-mutation snapshot pending until it commits, so Escape can cancel
+    /// without creating an undo entry.
+    undo_history: VecDeque<serde_json::Value>,
+    redo_history: VecDeque<serde_json::Value>,
+    pending_history: Option<serde_json::Value>,
+}
+
+const MAX_OPERATOR_HISTORY: usize = 64;
+
+fn push_history_snapshot(history: &mut VecDeque<serde_json::Value>, snapshot: serde_json::Value) {
+    history.push_back(snapshot);
+    while history.len() > MAX_OPERATOR_HISTORY {
+        history.pop_front();
+    }
 }
 
 impl EditorApp {
@@ -85,6 +111,30 @@ impl EditorApp {
             image_path,
         };
         let review = state::load_or_create_review(&job_dir, &review_session_id);
+        let (save_tx, save_rx) = std::sync::mpsc::sync_channel::<(u64, serde_json::Value)>(1);
+        let save_epoch: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        // Background autosave writer. `atomic_write_json` fsyncs, which can
+        // block for seconds on slow disks — that must never happen on the egui
+        // UI thread, so debounced saves are handed off here. `try_send` drops
+        // the snapshot when the writer is still busy with an older one (the
+        // next debounce fires anyway).
+        {
+            let writer_dir = job_dir.clone();
+            let writer_epoch = Arc::clone(&save_epoch);
+            std::thread::Builder::new()
+                .name("editor-autosave".to_owned())
+                .spawn(move || {
+                    while let Ok((queued_epoch, value)) = save_rx.recv() {
+                        // Skip snapshots superseded by a later synchronous save.
+                        if *writer_epoch.lock().unwrap() > queued_epoch {
+                            continue;
+                        }
+                        let path = writer_dir.join("project.json");
+                        let _ = state::atomic_write_json(&path, &value);
+                    }
+                })
+                .expect("spawn editor autosave thread");
+        }
         Ok(EditorApp {
             state: Some(state),
             review,
@@ -94,10 +144,17 @@ impl EditorApp {
             page_textures: HashMap::new(),
             thumb_textures: HashMap::new(),
             dirty_since: None,
+            save_tx,
+            save_epoch,
             exit_action: None,
             error_message: None,
             exit_state,
             context: None,
+            icon_textures: std::collections::HashMap::new(),
+            notify_message: None,
+            undo_history: VecDeque::new(),
+            redo_history: VecDeque::new(),
+            pending_history: None,
         })
     }
 
@@ -197,14 +254,41 @@ impl EditorApp {
         }
     }
 
+    /// Synchronous save used by explicit user-triggered one-shots (render,
+    /// approve, request fixes, Ctrl+S, exit). Bumps the save epoch so any
+    /// queued background snapshot from before this save is discarded — the
+    /// in-memory state it carried is now older than what's on disk.
+    fn save_project_sync(&self, state: &EditorState) -> anyhow::Result<()> {
+        let result = state::save_project(state);
+        if result.is_ok() {
+            let mut epoch = self.save_epoch.lock().unwrap();
+            *epoch = epoch.saturating_add(1);
+        }
+        result
+    }
+
     fn flush_save_if_due(&mut self) {
         if let Some(since) = self.dirty_since {
             if since.elapsed() >= Duration::from_millis(800) {
-                if let Some(state) = self.state.as_ref() {
-                    if let Err(e) = state::save_project(state) {
-                        self.error_message = Some(format!("save failed: {e}"));
-                    } else {
-                        self.dirty_since = None;
+                // Snapshot the epoch alongside the value: if a synchronous
+                // save lands after this snapshot was taken, the writer sees a
+                // newer epoch and discards the stale snapshot.
+                let queued_epoch = *self.save_epoch.lock().unwrap();
+                let value = self
+                    .state
+                    .as_ref()
+                    .ok_or("editor state is unavailable")
+                    .and_then(|state| {
+                        self.save_tx
+                            .try_send((queued_epoch, state.value.clone()))
+                            .map_err(|_| "autosave writer is busy")
+                    });
+                match value {
+                    Ok(()) => self.dirty_since = None,
+                    Err(_) => {
+                        // Writer busy with an older snapshot; retry on the
+                        // next debounce without clearing the deadline.
+                        self.dirty_since = Some(Instant::now());
                     }
                 }
             }
@@ -237,7 +321,7 @@ impl EditorApp {
             .ok_or_else(|| anyhow::anyhow!("editor state is unavailable"))?;
         // Inspector edits are debounced for normal work, but an explicit
         // render must include every edit made immediately before the click.
-        state::save_project(state)
+        self.save_project_sync(state)
             .map_err(|error| anyhow::anyhow!("save failed before render: {error}"))?;
         render::rerender_page(state, page_index, &image_path)?;
 
@@ -290,11 +374,89 @@ impl EditorApp {
         Ok(())
     }
 
-    fn undo_stroke(&mut self) {
-        if let Some(state) = self.state.as_mut() {
-            if state.pop_stroke(self.current_page).is_some() {
-                self.canvas.brush_overlay_dirty = true;
-                self.schedule_save();
+    fn save_and_render(&mut self) {
+        if let Some(state) = self.state.as_ref() {
+            if let Err(e) = self.save_project_sync(state) {
+                self.error_message = Some(format!("save failed: {e}"));
+                return;
+            }
+        }
+        let current_dirty = self
+            .state
+            .as_ref()
+            .and_then(|state| state.pages().into_iter().nth(self.current_page))
+            .is_some_and(|page| {
+                page.render_dirty || page.bubbles.iter().any(|bubble| bubble.render_dirty)
+            });
+        if current_dirty {
+            if let Err(e) = self.rerender_page_at(self.current_page) {
+                self.error_message =
+                    Some(format!("render page {} failed: {e}", self.current_page + 1));
+                return;
+            }
+            self.notify_message = Some((
+                "✓ Saved and re-rendered current page".to_owned(),
+                std::time::Instant::now(),
+            ));
+            self.page_textures.clear();
+        } else {
+            self.notify_message = Some(("✓ Saved".to_owned(), std::time::Instant::now()));
+        }
+        self.error_message = None;
+    }
+
+    fn begin_pending_history(&mut self) {
+        if self.pending_history.is_none() {
+            self.pending_history = self.state.as_ref().map(|state| state.value.clone());
+            self.redo_history.clear();
+        }
+    }
+
+    fn commit_pending_history(&mut self) {
+        if let Some(snapshot) = self.pending_history.take() {
+            push_history_snapshot(&mut self.undo_history, snapshot);
+            self.redo_history.clear();
+        }
+    }
+
+    fn record_history_before_mutation(&mut self) {
+        if let Some(state) = self.state.as_ref() {
+            push_history_snapshot(&mut self.undo_history, state.value.clone());
+            self.redo_history.clear();
+        }
+    }
+
+    fn clear_after_history_restore(&mut self) {
+        self.canvas.selected = None;
+        self.canvas.selected_issue = None;
+        self.canvas.drag = canvas::DragState::None;
+        self.canvas.drag_snapshot = None;
+        self.canvas.drag_page_dirty_before = None;
+        self.canvas.drag_moved = false;
+        self.canvas.pan_start = None;
+        self.canvas.brush_overlay = None;
+        self.canvas.brush_overlay_dirty = true;
+        self.page_textures.clear();
+        self.thumb_textures.clear();
+        self.schedule_save();
+    }
+
+    fn undo_operator(&mut self) {
+        if let Some(previous) = self.undo_history.pop_back() {
+            if let Some(state) = self.state.as_mut() {
+                push_history_snapshot(&mut self.redo_history, state.value.clone());
+                state.value = previous;
+                self.clear_after_history_restore();
+            }
+        }
+    }
+
+    fn redo_operator(&mut self) {
+        if let Some(next) = self.redo_history.pop_back() {
+            if let Some(state) = self.state.as_mut() {
+                push_history_snapshot(&mut self.undo_history, state.value.clone());
+                state.value = next;
+                self.clear_after_history_restore();
             }
         }
     }
@@ -323,7 +485,7 @@ impl EditorApp {
             "revision": self.review.revision,
         }));
         if let Some(state) = self.state.as_ref() {
-            if let Err(error) = state::save_project(state) {
+            if let Err(error) = self.save_project_sync(state) {
                 self.error_message = Some(format!("save failed before approval: {error}"));
                 return;
             }
@@ -371,7 +533,7 @@ impl EditorApp {
             "revision": self.review.revision,
         }));
         if let Some(state) = self.state.as_ref() {
-            if let Err(error) = state::save_project(state) {
+            if let Err(error) = self.save_project_sync(state) {
                 self.error_message = Some(format!("save failed before request: {error}"));
                 return;
             }
@@ -400,10 +562,10 @@ impl EditorApp {
         let count = self.state.as_ref().map(|s| s.page_count()).unwrap_or(0);
         let mut next = self.current_page;
         let mut undo = false;
-        let mut save = false;
+        let mut redo = false;
         // egui gives text editors keyboard focus through Memory. Keep editor
         // navigation and brush shortcuts out of text fields/modal-like widgets
-        // while allowing Ctrl+Z/S to retain their normal document semantics.
+        // while keeping document shortcuts from stealing text edits as well.
         let text_focus = ctx.memory(|memory| memory.focused().is_some());
         ctx.input(|i| {
             for event in &i.events {
@@ -419,44 +581,74 @@ impl EditorApp {
                     }
                     match key {
                         egui::Key::A | egui::Key::ArrowLeft
-                            if *modifiers == egui::Modifiers::NONE =>
+                            if !text_focus && *modifiers == egui::Modifiers::NONE =>
                         {
                             next = next.saturating_sub(1);
                         }
                         egui::Key::D | egui::Key::ArrowRight
-                            if *modifiers == egui::Modifiers::NONE =>
+                            if !text_focus && *modifiers == egui::Modifiers::NONE =>
                         {
                             next = (next + 1).min(count.saturating_sub(1));
                         }
                         egui::Key::Z if modifiers.ctrl => undo = true,
-                        egui::Key::S if modifiers.ctrl => save = true,
+                        egui::Key::Y if modifiers.ctrl => redo = true,
+                        egui::Key::S if modifiers.ctrl => {
+                            // handled below (needs &mut self)
+                        }
                         egui::Key::B
                             if tool_shortcuts_allowed(text_focus)
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
-                            self.canvas.brush_active = !self.canvas.brush_active;
-                            if self.canvas.brush_active {
-                                self.canvas.eyedropper_active = false;
-                                self.canvas.draw_issue_mode = false;
-                                self.canvas.current_variant = canvas::Variant::Cleaned;
-                            }
+                            // toggle Brush / back to Select
+                            let next_tool = if self.canvas.active_tool == canvas::ActiveTool::Brush
+                            {
+                                canvas::ActiveTool::Select
+                            } else {
+                                canvas::ActiveTool::Brush
+                            };
+                            self.set_active_tool(next_tool);
+                        }
+                        egui::Key::E
+                            if tool_shortcuts_allowed(text_focus)
+                                && *modifiers == egui::Modifiers::NONE =>
+                        {
+                            let next_tool = if self.canvas.active_tool == canvas::ActiveTool::Eraser
+                            {
+                                canvas::ActiveTool::Select
+                            } else {
+                                canvas::ActiveTool::Eraser
+                            };
+                            self.set_active_tool(next_tool);
                         }
                         egui::Key::I
                             if tool_shortcuts_allowed(text_focus)
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
-                            self.cancel_drag();
-                            self.canvas.eyedropper_active = !self.canvas.eyedropper_active;
-                            if self.canvas.eyedropper_active {
-                                self.canvas.brush_active = false;
-                                self.canvas.draw_issue_mode = false;
-                            }
+                            let next_tool =
+                                if self.canvas.active_tool == canvas::ActiveTool::Eyedropper {
+                                    canvas::ActiveTool::Select
+                                } else {
+                                    canvas::ActiveTool::Eyedropper
+                                };
+                            self.set_active_tool(next_tool);
                         }
                         egui::Key::V
                             if tool_shortcuts_allowed(text_focus)
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
-                            self.canvas.brush_active = false;
+                            self.set_active_tool(canvas::ActiveTool::Select);
+                        }
+                        egui::Key::O
+                            if tool_shortcuts_allowed(text_focus)
+                                && *modifiers == egui::Modifiers::NONE =>
+                        {
+                            self.set_active_tool(canvas::ActiveTool::DrawBubble);
+                        }
+                        egui::Key::T
+                            if tool_shortcuts_allowed(text_focus)
+                                && *modifiers == egui::Modifiers::NONE =>
+                        {
+                            self.set_active_tool(canvas::ActiveTool::AddText);
                         }
                         egui::Key::OpenBracket
                             if tool_shortcuts_allowed(text_focus)
@@ -472,17 +664,45 @@ impl EditorApp {
                             self.canvas.brush_radius =
                                 adjust_brush_radius(self.canvas.brush_radius, 4.0);
                         }
-                        egui::Key::Escape => {
+                        egui::Key::Delete | egui::Key::Backspace
+                            if tool_shortcuts_allowed(text_focus)
+                                && *modifiers == egui::Modifiers::NONE =>
+                        {
+                            if self.canvas.drag != canvas::DragState::None {
+                                self.cancel_drag();
+                            } else if let Some((page_index, bubble_index)) = self.canvas.selected {
+                                let exists = self
+                                    .state
+                                    .as_ref()
+                                    .and_then(|state| state.bubble_value(page_index, bubble_index))
+                                    .is_some();
+                                if exists {
+                                    self.record_history_before_mutation();
+                                    if self.state.as_mut().is_some_and(|state| {
+                                        state.delete_bubble(page_index, bubble_index)
+                                    }) {
+                                        self.canvas.selected = None;
+                                        self.schedule_save();
+                                    }
+                                }
+                            }
+                        }
+                        egui::Key::Escape if !text_focus => {
                             self.cancel_drag();
-                            self.canvas.brush_active = false;
-                            self.canvas.eyedropper_active = false;
-                            self.canvas.draw_issue_mode = false;
+                            self.set_active_tool(canvas::ActiveTool::Select);
                         }
                         _ => {}
                     }
                 }
             }
         });
+        // Ctrl+S: save & render (must be outside the ctx.input closure since it needs &mut self).
+        let ctrl_s = ctx.input(|i| i.events.iter().any(|e| {
+            matches!(e, egui::Event::Key { key: egui::Key::S, modifiers, pressed: true, .. } if modifiers.ctrl)
+        }));
+        if ctrl_s && !text_focus {
+            self.save_and_render();
+        }
         if next != self.current_page {
             self.cancel_drag();
             self.current_page = next;
@@ -492,12 +712,16 @@ impl EditorApp {
             self.canvas.fit_applied = false;
             self.page_textures.clear();
         }
-        if undo {
-            self.undo_stroke();
-        }
-        if save {
-            if let Some(state) = self.state.as_ref() {
-                let _ = state::save_project(state);
+        if undo || redo {
+            if self.canvas.drag != canvas::DragState::None {
+                self.cancel_drag();
+            } else if tool_shortcuts_allowed(text_focus) {
+                if undo {
+                    self.undo_operator();
+                }
+                if redo {
+                    self.redo_operator();
+                }
             }
         }
     }
@@ -725,6 +949,20 @@ mod tests {
     }
 
     #[test]
+    fn operator_history_is_bounded_and_keeps_latest_snapshot() {
+        let mut history = VecDeque::new();
+        for value in 0..(MAX_OPERATOR_HISTORY + 3) {
+            push_history_snapshot(&mut history, serde_json::json!({"revision": value}));
+        }
+        assert_eq!(history.len(), MAX_OPERATOR_HISTORY);
+        assert_eq!(history.front().unwrap()["revision"], 3);
+        assert_eq!(
+            history.back().unwrap()["revision"],
+            MAX_OPERATOR_HISTORY + 2
+        );
+    }
+
+    #[test]
     fn approval_preflight_finds_page_and_bubble_render_dirty() {
         let state = EditorState {
             value: serde_json::json!({
@@ -886,35 +1124,29 @@ mod tests {
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.context = Some(ctx.clone());
+
+        // Lazy-load icon textures on first frame.
+        if self.icon_textures.is_empty() {
+            self.icon_textures = toolbar::load_icons(ctx);
+        }
+
         self.handle_shortcuts(ctx);
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        // Top bar: branding + approve + Ctrl+S hint + dirty indicator + notify toast.
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(format!("Fukidashi · {}", self.job_dir.display()));
                 ui.separator();
-                if ui.button("Re-render page").clicked() {
-                    self.rerender_current_page();
-                }
+
+                // Tool options (context-sensitive, right of the separator).
+                self.tool_options_ui(ui);
+                ui.separator();
+
                 if ui.button("Approve & Export").clicked() {
                     self.approve_and_export();
                 }
-                if ui.button("Request Fixes").clicked() {
-                    self.request_fixes();
-                }
-                let draw_label = if self.canvas.draw_issue_mode {
-                    "Cancel draw"
-                } else {
-                    "Draw issue"
-                };
-                if ui.button(draw_label).clicked() {
-                    self.cancel_drag();
-                    self.canvas.draw_issue_mode = !self.canvas.draw_issue_mode;
-                    if self.canvas.draw_issue_mode {
-                        self.canvas.brush_active = false;
-                        self.canvas.eyedropper_active = false;
-                        self.canvas.selected = None;
-                        self.canvas.selected_issue = None;
-                    }
+                if ui.button("⚡ Save & Render  Ctrl+S").clicked() {
+                    self.save_and_render();
                 }
                 let dirty = self
                     .current_page_view()
@@ -922,12 +1154,23 @@ impl eframe::App for EditorApp {
                 if dirty {
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 180, 50),
-                        "⚠️ Changes need re-render",
+                        "⚠ Changes need re-render",
                     );
+                }
+
+                // Notify toast — auto-dismiss after 3 s.
+                if let Some((msg, at)) = &self.notify_message {
+                    if at.elapsed().as_secs_f32() < 3.0 {
+                        ui.separator();
+                        ui.colored_label(egui::Color32::from_rgb(80, 220, 100), msg);
+                    } else {
+                        self.notify_message = None;
+                    }
                 }
             });
         });
 
+        self.toolbar_ui(ctx);
         self.gallery_ui(ctx);
         self.inspector_ui(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -939,7 +1182,7 @@ impl eframe::App for EditorApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(state) = self.state.as_ref() {
-            let _ = state::save_project(state);
+            let _ = self.save_project_sync(state);
         }
     }
 }

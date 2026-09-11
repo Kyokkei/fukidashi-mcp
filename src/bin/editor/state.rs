@@ -361,8 +361,9 @@ impl EditorState {
     }
 
     /// Move/resize a bubble. Enforces the invariant: `bbox` AND `bubble_bbox`
-    /// become the new rect, and `text_bbox` is cleared so the renderer re-fits
-    /// from the bubble's current geometry.
+    /// become the new rect, and any fitted `text_bbox` is transformed with the
+    /// operator geometry so the renderer never anchors a moved bubble at its
+    /// stale pre-edit position.
     pub fn set_bubble_bbox(&mut self, page_index: usize, bubble_index: usize, rect: Rect) {
         let rect_value = serde_json::json!({
             "x1": rect.x1, "y1": rect.y1, "x2": rect.x2, "y2": rect.y2
@@ -583,6 +584,126 @@ impl EditorState {
         let changed = !issues.is_empty();
         issues.clear();
         changed
+    }
+
+    /// Append a new empty bubble to the page and return its index.
+    pub fn push_new_bubble(&mut self, page_index: usize, bbox: Rect) -> usize {
+        let id = loop {
+            let candidate = format!("bubble-{}", uuid::Uuid::new_v4());
+            let exists = self
+                .value
+                .get("pages")
+                .and_then(|pages| pages.as_array())
+                .and_then(|pages| pages.get(page_index))
+                .and_then(|page| page.get("bubbles"))
+                .and_then(|bubbles| bubbles.as_array())
+                .is_some_and(|bubbles| {
+                    bubbles.iter().any(|bubble| {
+                        bubble.get("id").and_then(serde_json::Value::as_str)
+                            == Some(candidate.as_str())
+                    })
+                });
+            if !exists {
+                break candidate;
+            }
+        };
+        let new_bubble = serde_json::json!({
+            "id": id,
+            "bbox": { "x1": bbox.x1, "y1": bbox.y1, "x2": bbox.x2, "y2": bbox.y2 },
+            "bubble_bbox": { "x1": bbox.x1, "y1": bbox.y1, "x2": bbox.x2, "y2": bbox.y2 },
+            "text": "",
+            "source_text": "",
+            "translation": "",
+            "shape": "ellipse",
+            "font_size": null,
+            "padding": null,
+            "text_bbox": null,
+            "preserve_source": false,
+            "flagged": false,
+            "render_dirty": true,
+        });
+        let index = {
+            let Some(page) = self
+                .value
+                .get_mut("pages")
+                .and_then(|pages| pages.as_array_mut())
+                .and_then(|pages| pages.get_mut(page_index))
+                .and_then(|page| page.as_object_mut())
+            else {
+                return 0;
+            };
+            let bubbles = page
+                .entry("bubbles")
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            let Some(bubbles) = bubbles.as_array_mut() else {
+                return 0;
+            };
+            bubbles.push(new_bubble);
+            bubbles.len() - 1
+        };
+        self.mark_page_dirty(page_index);
+        index
+    }
+
+    /// Delete a bubble while retaining enough source metadata to restore its
+    /// pixels during a later render.
+    pub fn delete_bubble(&mut self, page_index: usize, bubble_index: usize) -> bool {
+        let bubble = {
+            let Some(page) = self
+                .value
+                .get_mut("pages")
+                .and_then(|pages| pages.as_array_mut())
+                .and_then(|pages| pages.get_mut(page_index))
+                .and_then(|page| page.as_object_mut())
+            else {
+                return false;
+            };
+            let Some(bubbles) = page
+                .get_mut("bubbles")
+                .and_then(|value| value.as_array_mut())
+            else {
+                return false;
+            };
+            if bubble_index >= bubbles.len() {
+                return false;
+            }
+            bubbles.remove(bubble_index)
+        };
+        let id = bubble.get("id").cloned().unwrap_or_else(|| {
+            serde_json::Value::String(format!("legacy-bubble-{page_index}-{bubble_index}"))
+        });
+        let tombstone = serde_json::json!({
+            "id": id,
+            "bbox": bubble.get("bbox").or_else(|| bubble.get("bubble_bbox")).cloned()
+                .unwrap_or(serde_json::Value::Null),
+            "source_text": bubble.get("source_text")
+                .or_else(|| bubble.get("source_ocr"))
+                .or_else(|| bubble.get("text"))
+                .cloned().unwrap_or(serde_json::Value::String(String::new())),
+            "translation": bubble.get("translation").cloned()
+                .unwrap_or(serde_json::Value::String(String::new())),
+            "removed_reason": "operator_deleted",
+        });
+        {
+            let Some(page) = self
+                .value
+                .get_mut("pages")
+                .and_then(|pages| pages.as_array_mut())
+                .and_then(|pages| pages.get_mut(page_index))
+                .and_then(|page| page.as_object_mut())
+            else {
+                return false;
+            };
+            let tombstones = page
+                .entry("removed_bubbles")
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if !tombstones.is_array() {
+                *tombstones = serde_json::Value::Array(Vec::new());
+            }
+            tombstones.as_array_mut().expect("array initialized").push(tombstone);
+        }
+        self.mark_page_dirty(page_index);
+        true
     }
 
     pub(crate) fn set_issue_text(
@@ -811,5 +932,36 @@ mod tests {
         assert!(state.remove_issue(0, index));
         assert!(state.pages()[0].issues.is_empty());
         assert!(!state.clear_issues(0));
+    }
+
+    #[test]
+    fn new_bubble_has_operator_defaults_and_delete_keeps_a_tombstone() {
+        let mut state = EditorState {
+            value: serde_json::json!({
+                "pages": [{"render_dirty": false, "bubbles": []}]
+            }),
+            job_dir: PathBuf::from("."),
+            image_path: PathBuf::from("image.png"),
+        };
+        let index = state.push_new_bubble(
+            0,
+            Rect {
+                x1: 1.0,
+                y1: 2.0,
+                x2: 40.0,
+                y2: 30.0,
+            },
+        );
+        let bubble = state.bubble_value(0, index).unwrap();
+        assert!(bubble["id"].as_str().unwrap().starts_with("bubble-"));
+        assert_eq!(bubble["shape"], "ellipse");
+        assert_eq!(bubble["render_dirty"], true);
+        assert!(state.delete_bubble(0, index));
+        assert!(state.pages()[0].bubbles.is_empty());
+        assert_eq!(
+            state.value["pages"][0]["removed_bubbles"][0]["removed_reason"],
+            "operator_deleted"
+        );
+        assert_eq!(state.value["pages"][0]["render_dirty"], true);
     }
 }

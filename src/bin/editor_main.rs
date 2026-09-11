@@ -77,7 +77,26 @@ fn run() -> i32 {
             let session = cli.review_session_id.clone();
             let exit_state = Arc::clone(&exit_state);
             move |cc| {
-                let _ = cc;
+                // egui's default fonts lack Vietnamese diacritic coverage, so
+                // the inspector's text widgets render `□` for `ở`, `ề`, `ắ`,
+                // `ị`. Register the bundled Patrick Hand face (full Vietnamese
+                // coverage) as a Proportional fallback — egui tries faces
+                // left-to-right, so Latin stays on the default fonts and only
+                // missing glyphs fall through to Patrick Hand.
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert(
+                    "PatrickHand".to_owned(),
+                    std::sync::Arc::new(egui::FontData::from_static(
+                        fukidashi_mcp::fonts::PATRICK_HAND_REGULAR.bytes,
+                    )),
+                );
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .push("PatrickHand".to_owned());
+                cc.egui_ctx.set_fonts(fonts);
+
                 match editor::EditorApp::new(
                     job_dir.clone(),
                     session.clone(),

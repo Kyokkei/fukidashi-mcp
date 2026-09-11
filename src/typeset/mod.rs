@@ -76,6 +76,7 @@ pub fn typeset_page_with_fallbacks(
         })
         .collect::<Vec<_>>();
     let mut reports = Vec::with_capacity(bubbles.len());
+    let mut warnings = Vec::new();
     for (index, payload) in bubbles.iter().enumerate() {
         payload.validate_text_color()?;
         // A preserved item is deliberately left as source pixels. Empty text
@@ -102,6 +103,37 @@ pub fn typeset_page_with_fallbacks(
             }));
             continue;
         }
+        let rect = payload.bbox;
+        if !valid_balloon_rect(rect) {
+            return Err(anyhow!("bubble {index} has an invalid typeset rectangle"));
+        }
+        if rect.x2 - rect.x1 < 8.0 || rect.y2 - rect.y1 < 8.0 {
+            let warning = json!({
+                "page": serde_json::Value::Null,
+                "bubble_index": index,
+                "bubble_id": payload.id,
+                "issue_type": "typeset_warning",
+                "reason": "degenerate_bbox",
+                "message": "bubble geometry is smaller than 8 pixels on one axis; text rasterization was skipped",
+            });
+            warnings.push(warning.clone());
+            reports.push(json!({
+                "index": index,
+                "id": payload.id,
+                "input_bbox": rect,
+                "bubble_bbox": payload.bubble_bbox,
+                "text_bbox": payload.text_bbox,
+                "text": payload.text,
+                "text_color": payload.text_color,
+                "requested_text_color": payload.text_color,
+                "resolved_text_color": serde_json::Value::Null,
+                "sampled_luminance": serde_json::Value::Null,
+                "skipped": true,
+                "skip_reason": "degenerate_bbox",
+                "warning": warning,
+            }));
+            continue;
+        }
         let requested_font_path = payload.font_path.as_ref().ok_or_else(|| {
             anyhow!("bubble {index} has no font_path; a real font is required for typesetting")
         })?;
@@ -114,7 +146,6 @@ pub fn typeset_page_with_fallbacks(
                 font: &asset.font,
             })
             .collect::<Vec<_>>();
-        let rect = payload.bbox;
         let min = payload.min_font_size.unwrap_or(8.0);
         let max = payload.max_font_size.unwrap_or(72.0);
         let shape = payload.shape.as_deref().unwrap_or("ellipse");
@@ -147,7 +178,7 @@ pub fn typeset_page_with_fallbacks(
                 None
             }
         });
-        let layout = fit_text_with_font_candidates_masked(
+        let layout = match fit_text_with_font_candidates_masked(
             &candidates,
             &payload.text,
             rect,
@@ -158,8 +189,39 @@ pub fn typeset_page_with_fallbacks(
             max,
             payload.padding,
             balloon_mask,
-        )
-        .with_context(|| format!("fit text for bubble {index}"))?;
+        ) {
+            Ok(layout) => layout,
+            Err(error) if is_text_overflow(&error) => {
+                let warning = json!({
+                    "page": serde_json::Value::Null,
+                    "bubble_index": index,
+                    "bubble_id": payload.id,
+                    "issue_type": "typeset_warning",
+                    "reason": "text_overflow",
+                    "message": error.to_string(),
+                });
+                warnings.push(warning.clone());
+                reports.push(json!({
+                    "index": index,
+                    "id": payload.id,
+                    "input_bbox": rect,
+                    "bubble_bbox": payload.bubble_bbox,
+                    "text_bbox": payload.text_bbox,
+                    "text": payload.text,
+                    "text_color": payload.text_color,
+                    "requested_text_color": payload.text_color,
+                    "resolved_text_color": serde_json::Value::Null,
+                    "sampled_luminance": serde_json::Value::Null,
+                    "skipped": true,
+                    "skip_reason": "text_overflow",
+                    "warning": warning,
+                }));
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("fit text for bubble {index}"));
+            }
+        };
         // An explicit override is authoritative and does not need (or report)
         // a clean-image sample. Auto mode alone performs contrast detection.
         let (resolved_text_color, sampled_luminance) = match payload.text_color.as_deref() {
@@ -249,7 +311,7 @@ pub fn typeset_page_with_fallbacks(
         .persist(output_path)
         .map_err(|e| anyhow!("promote typeset output: {}", e.error))?;
     let absolute = fs::canonicalize(output_path).unwrap_or_else(|_| output_path.to_path_buf());
-    Ok(json!({"output_path": absolute, "bubbles": reports}))
+    Ok(json!({"output_path": absolute, "bubbles": reports, "warnings": warnings}))
 }
 
 /// Recover the light connected component that contains one bubble's interior.
@@ -805,6 +867,12 @@ fn resolve_auto_text_color(sampled_luminance: Option<u8>) -> &'static str {
     }
 }
 
+fn is_text_overflow(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::error::FukidashiError>()
+        .is_some_and(|error| matches!(error, crate::error::FukidashiError::TextOverflow(_)))
+}
+
 /// Auto ink samples an adaptive central window around the layout anchor from
 /// the clean page. The window covers about 40% of each usable safe dimension,
 /// with a 128-pixel cap. Median integer luma and the 110 threshold resist
@@ -1304,5 +1372,133 @@ mod tests {
             }
         }
         assert!(changed_text_pixels > 0);
+    }
+
+    fn warning_payload(id: &str, bbox: Rect, text: &str, font_path: String) -> TypesetPayload {
+        TypesetPayload {
+            id: Some(id.to_owned()),
+            source_text: Some("source".to_owned()),
+            kind: Some("dialogue".to_owned()),
+            preserve_by_default: Some(false),
+            needs_review: Some(false),
+            flagged: Some(false),
+            preserve_source: Some(false),
+            fallback_font_paths: Vec::new(),
+            bbox,
+            bubble_bbox: Some(bbox),
+            text_bbox: None,
+            padding: Some(4.0),
+            text: text.to_owned(),
+            font_path: Some(font_path),
+            min_font_size: Some(8.0),
+            max_font_size: Some(72.0),
+            text_color: None,
+            shape: Some("rectangle".to_owned()),
+        }
+    }
+
+    #[test]
+    fn degenerate_bubble_is_skipped_while_other_page_text_renders() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.png");
+        let output = directory.path().join("rendered.png");
+        image::RgbaImage::from_pixel(180, 100, Rgba([255, 255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let font = directory.path().join("ComicNeue-Regular.ttf");
+        fs::write(&font, crate::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+        let bubbles = vec![
+            warning_payload(
+                "tiny",
+                Rect {
+                    x1: 4.0,
+                    y1: 4.0,
+                    x2: 6.0,
+                    y2: 40.0,
+                },
+                "Tiny",
+                font.display().to_string(),
+            ),
+            warning_payload(
+                "good",
+                Rect {
+                    x1: 20.0,
+                    y1: 20.0,
+                    x2: 160.0,
+                    y2: 80.0,
+                },
+                "Good text",
+                font.display().to_string(),
+            ),
+        ];
+        let report = typeset_page_with_fallbacks(&source, &bubbles, &[], &output).unwrap();
+        assert_eq!(report["bubbles"][0]["skip_reason"], "degenerate_bbox");
+        assert_ne!(report["bubbles"][1]["skipped"], true);
+        assert_eq!(report["warnings"][0]["bubble_id"], "tiny");
+        assert!(output.exists());
+    }
+
+    #[test]
+    fn text_overflow_is_a_structured_per_bubble_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.png");
+        let output = directory.path().join("rendered.png");
+        image::RgbaImage::from_pixel(180, 100, Rgba([255, 255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let font = directory.path().join("ComicNeue-Regular.ttf");
+        fs::write(&font, crate::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+        let mut overflow = warning_payload(
+            "overflow",
+            Rect {
+                x1: 4.0,
+                y1: 4.0,
+                x2: 34.0,
+                y2: 24.0,
+            },
+            &"Overflow ".repeat(80),
+            font.display().to_string(),
+        );
+        overflow.min_font_size = Some(72.0);
+        overflow.max_font_size = Some(72.0);
+        let good = warning_payload(
+            "good",
+            Rect {
+                x1: 45.0,
+                y1: 20.0,
+                x2: 160.0,
+                y2: 80.0,
+            },
+            "Good",
+            font.display().to_string(),
+        );
+        let report = typeset_page_with_fallbacks(&source, &[overflow, good], &[], &output).unwrap();
+        assert_eq!(report["bubbles"][0]["skip_reason"], "text_overflow");
+        assert_ne!(report["bubbles"][1]["skipped"], true);
+        assert_eq!(report["warnings"][0]["reason"], "text_overflow");
+        assert!(output.exists());
+    }
+
+    #[test]
+    fn unrelated_font_failure_still_aborts_typesetting() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.png");
+        let output = directory.path().join("rendered.png");
+        image::RgbaImage::from_pixel(80, 60, Rgba([255, 255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let bubble = warning_payload(
+            "bad-font",
+            Rect {
+                x1: 10.0,
+                y1: 10.0,
+                x2: 70.0,
+                y2: 50.0,
+            },
+            "Valid geometry",
+            directory.path().join("missing.ttf").display().to_string(),
+        );
+        let error = typeset_page_with_fallbacks(&source, &[bubble], &[], &output).unwrap_err();
+        assert!(error.to_string().contains("read font for bubble 0"));
     }
 }
