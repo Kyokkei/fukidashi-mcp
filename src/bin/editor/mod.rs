@@ -353,9 +353,10 @@ impl EditorApp {
                 .map(|state| &state.value)
                 .unwrap_or(&serde_json::Value::Null),
         );
-        if !derived_feedback.is_empty() {
-            self.review.feedback = derived_feedback;
-        }
+        // Native review has one authoritative source: the current page issue
+        // rectangles and bubble flags. Never resubmit stale feedback loaded
+        // from an earlier draft when the operator has cleared the page.
+        self.review.feedback = derived_feedback;
         if self.review.feedback.is_empty() {
             self.error_message = Some(
                 "request fixes needs a flagged bubble or an issue on at least one page".to_owned(),
@@ -436,6 +437,7 @@ impl EditorApp {
                             self.canvas.brush_active = !self.canvas.brush_active;
                             if self.canvas.brush_active {
                                 self.canvas.eyedropper_active = false;
+                                self.canvas.draw_issue_mode = false;
                                 self.canvas.current_variant = canvas::Variant::Cleaned;
                             }
                         }
@@ -447,6 +449,7 @@ impl EditorApp {
                             self.canvas.eyedropper_active = !self.canvas.eyedropper_active;
                             if self.canvas.eyedropper_active {
                                 self.canvas.brush_active = false;
+                                self.canvas.draw_issue_mode = false;
                             }
                         }
                         egui::Key::V
@@ -473,6 +476,7 @@ impl EditorApp {
                             self.cancel_drag();
                             self.canvas.brush_active = false;
                             self.canvas.eyedropper_active = false;
+                            self.canvas.draw_issue_mode = false;
                         }
                         _ => {}
                     }
@@ -483,6 +487,7 @@ impl EditorApp {
             self.cancel_drag();
             self.current_page = next;
             self.canvas.selected = None;
+            self.canvas.selected_issue = None;
             self.canvas.brush_overlay_dirty = true;
             self.canvas.fit_applied = false;
             self.page_textures.clear();
@@ -552,7 +557,16 @@ fn native_review_feedback(state: &serde_json::Value) -> Vec<serde_json::Value> {
                 copy_feedback_string(&mut item, issue, "corrected_text");
                 copy_feedback_string(&mut item, issue, "source_ocr");
                 copy_feedback_string(&mut item, issue, "current_translation");
+                if !item.get("note").is_some_and(serde_json::Value::is_string) {
+                    item["note"] = serde_json::Value::String(String::new());
+                }
+                if !item.get("corrected_text").is_some() {
+                    item["corrected_text"] = serde_json::Value::Null;
+                }
                 copy_feedback_bbox(&mut item, issue);
+                if issue_type == "wrong_translation" {
+                    link_wrong_translation_feedback(&mut item, page);
+                }
                 feedback.push(item);
             }
         }
@@ -595,6 +609,18 @@ fn native_review_feedback(state: &serde_json::Value) -> Vec<serde_json::Value> {
                 {
                     item["current_translation"] = serde_json::Value::String(translation.to_owned());
                 }
+                if !item.get("note").is_some_and(serde_json::Value::is_string) {
+                    let note = bubble
+                        .get("flag_reason")
+                        .or_else(|| bubble.get("problem_reason"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or("Flagged bubble requires review");
+                    item["note"] = serde_json::Value::String(note.to_owned());
+                }
+                if !item.get("corrected_text").is_some() {
+                    item["corrected_text"] = serde_json::Value::Null;
+                }
                 copy_feedback_bbox(&mut item, bubble);
                 feedback.push(item);
             }
@@ -613,7 +639,7 @@ fn copy_feedback_string(target: &mut serde_json::Value, source: &serde_json::Val
 }
 
 fn copy_feedback_bbox(target: &mut serde_json::Value, source: &serde_json::Value) {
-    let Some(value) = source.get("bbox") else {
+    let Some(value) = source.get("bbox").or_else(|| source.get("bubble_bbox")) else {
         return;
     };
     if serde_json::from_value::<fukidashi_mcp::domain::Rect>(value.clone())
@@ -623,6 +649,62 @@ fn copy_feedback_bbox(target: &mut serde_json::Value, source: &serde_json::Value
     {
         target["bbox"] = value.clone();
     }
+}
+
+fn link_wrong_translation_feedback(target: &mut serde_json::Value, page: &serde_json::Value) {
+    let Some(issue_bbox) = target
+        .get("bbox")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<fukidashi_mcp::domain::Rect>(value).ok())
+    else {
+        target["link_status"] = serde_json::Value::String("no_overlap".to_owned());
+        return;
+    };
+    let candidates = page
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|bubble| {
+            let bbox = bubble
+                .get("bbox")
+                .or_else(|| bubble.get("bubble_bbox"))
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<fukidashi_mcp::domain::Rect>(value).ok()
+                })?;
+            (rects_overlap(issue_bbox, bbox)).then_some(bubble)
+        })
+        .collect::<Vec<_>>();
+    match candidates.as_slice() {
+        [bubble] => {
+            target["link_status"] = serde_json::Value::String("linked".to_owned());
+            if let Some(id) = bubble.get("id").and_then(serde_json::Value::as_str) {
+                target["bubble_id"] = serde_json::Value::String(id.to_owned());
+            }
+            if let Some(source) = bubble
+                .get("source_ocr")
+                .or_else(|| bubble.get("source_text"))
+                .or_else(|| bubble.get("text"))
+                .and_then(serde_json::Value::as_str)
+            {
+                target["source_ocr"] = serde_json::Value::String(source.to_owned());
+            }
+            if let Some(translation) = bubble
+                .get("current_translation")
+                .or_else(|| bubble.get("translation"))
+                .and_then(serde_json::Value::as_str)
+            {
+                target["current_translation"] = serde_json::Value::String(translation.to_owned());
+            }
+        }
+        [] => target["link_status"] = serde_json::Value::String("no_overlap".to_owned()),
+        _ => target["link_status"] = serde_json::Value::String("ambiguous".to_owned()),
+    }
+}
+
+fn rects_overlap(left: fukidashi_mcp::domain::Rect, right: fukidashi_mcp::domain::Rect) -> bool {
+    left.x1.max(right.x1) < left.x2.min(right.x2) && left.y1.max(right.y1) < left.y2.min(right.y2)
 }
 
 #[cfg(test)]
@@ -662,16 +744,49 @@ mod tests {
     fn native_request_fixes_serializes_flagged_bubbles_and_issues() {
         let feedback = native_review_feedback(&serde_json::json!({
             "pages": [{
-                "issues": [{"issue_type": "font_or_layout", "bbox": {"x1":1,"y1":2,"x2":8,"y2":9}}],
+                "issues": [
+                    {"issue_type": "font_or_layout", "bbox": {"x1":1,"y1":2,"x2":8,"y2":9}},
+                    {"issue_type": "wrong_translation", "bbox": {"x1":12,"y1":12,"x2":18,"y2":18}, "note":"Use the polite form", "corrected_text":"Xin chào"}
+                ],
                 "bubbles": [{"id":"b1","flagged":true,"bbox":{"x1":2,"y1":3,"x2":9,"y2":10},"text":"OCR","translation":"Dịch"}]
             }]
         }));
-        assert_eq!(feedback.len(), 2);
+        assert_eq!(feedback.len(), 3);
         assert_eq!(feedback[0]["origin"], "image-pixels");
-        assert_eq!(feedback[1]["issue_type"], "flagged_bubble");
-        assert_eq!(feedback[1]["bubble_id"], "b1");
-        assert_eq!(feedback[1]["source_ocr"], "OCR");
-        assert_eq!(feedback[1]["current_translation"], "Dịch");
+        assert_eq!(feedback[1]["page"], 0);
+        assert_eq!(feedback[1]["bbox"]["x1"], 12);
+        assert_eq!(feedback[1]["link_status"], "no_overlap");
+        assert_eq!(feedback[1]["note"], "Use the polite form");
+        assert_eq!(feedback[1]["corrected_text"], "Xin chào");
+        assert_eq!(feedback[2]["issue_type"], "flagged_bubble");
+        assert_eq!(feedback[2]["bubble_id"], "b1");
+        assert_eq!(feedback[2]["source_ocr"], "OCR");
+        assert_eq!(feedback[2]["current_translation"], "Dịch");
+    }
+
+    #[test]
+    fn wrong_translation_feedback_links_only_a_unique_overlap() {
+        let one = native_review_feedback(&serde_json::json!({
+            "pages": [{
+                "issues": [{"issue_type":"wrong_translation", "bbox":{"x1":5,"y1":5,"x2":15,"y2":15}}],
+                "bubbles": [{"id":"b1","bbox":{"x1":10,"y1":10,"x2":20,"y2":20},"source_text":"One","translation":"Một"}]
+            }]
+        }));
+        assert_eq!(one[0]["link_status"], "linked");
+        assert_eq!(one[0]["bubble_id"], "b1");
+        assert_eq!(one[0]["source_ocr"], "One");
+        assert_eq!(one[0]["current_translation"], "Một");
+
+        let ambiguous = native_review_feedback(&serde_json::json!({
+            "pages": [{
+                "issues": [{"issue_type":"wrong_translation", "bbox":{"x1":5,"y1":5,"x2":25,"y2":25}}],
+                "bubbles": [
+                    {"id":"b1","bbox":{"x1":0,"y1":0,"x2":15,"y2":15}},
+                    {"id":"b2","bbox":{"x1":15,"y1":15,"x2":30,"y2":30}}
+                ]
+            }]
+        }));
+        assert_eq!(ambiguous[0]["link_status"], "ambiguous");
     }
 
     #[test]
@@ -759,6 +874,10 @@ mod tests {
         assert_eq!(persisted.feedback.len(), 1);
         assert_eq!(persisted.feedback[0]["bubble_id"], "bubble-1");
         assert_eq!(persisted.feedback[0]["issue_type"], "flagged_bubble");
+        assert_eq!(
+            persisted.feedback[0]["note"],
+            "Flagged bubble requires review"
+        );
         assert_eq!(persisted.feedback[0]["source_ocr"], "OCR");
         assert_eq!(persisted.feedback[0]["current_translation"], "Dịch");
     }
@@ -782,9 +901,24 @@ impl eframe::App for EditorApp {
                 if ui.button("Request Fixes").clicked() {
                     self.request_fixes();
                 }
+                let draw_label = if self.canvas.draw_issue_mode {
+                    "Cancel draw"
+                } else {
+                    "Draw issue"
+                };
+                if ui.button(draw_label).clicked() {
+                    self.cancel_drag();
+                    self.canvas.draw_issue_mode = !self.canvas.draw_issue_mode;
+                    if self.canvas.draw_issue_mode {
+                        self.canvas.brush_active = false;
+                        self.canvas.eyedropper_active = false;
+                        self.canvas.selected = None;
+                        self.canvas.selected_issue = None;
+                    }
+                }
                 let dirty = self
                     .current_page_view()
-                    .is_some_and(|page| page.render_dirty || page.has_flagged_or_dirty());
+                    .is_some_and(|page| page.has_render_dirty());
                 if dirty {
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 180, 50),

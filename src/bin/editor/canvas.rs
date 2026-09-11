@@ -60,6 +60,12 @@ pub enum DragState {
         start_pos: Pos2,
         handle: Handle,
     },
+    DrawIssue {
+        page_index: usize,
+        start_pos: Pos2,
+        current_pos: Pos2,
+        image_size: Vec2,
+    },
     BrushStroke {
         page_index: usize,
         mode: BrushMode,
@@ -73,6 +79,8 @@ pub struct CanvasState {
     pub pan: Vec2,
     pub zoom: f32,
     pub selected: Option<(usize, usize)>,
+    pub selected_issue: Option<usize>,
+    pub draw_issue_mode: bool,
     pub drag: DragState,
     /// Snapshot used to roll back a canceled bubble gesture.  `egui` can stop
     /// delivering pointer events when a window loses focus, so cleanup cannot
@@ -104,6 +112,8 @@ impl Default for CanvasState {
             pan: Vec2::ZERO,
             zoom: 1.0,
             selected: None,
+            selected_issue: None,
+            draw_issue_mode: false,
             drag: DragState::None,
             drag_snapshot: None,
             drag_page_dirty_before: None,
@@ -180,6 +190,25 @@ impl CanvasState {
         None
     }
 
+    fn hit_issue(&self, pointer: Pos2, origin: Pos2, page: &PageView) -> Option<usize> {
+        let image_pt = self.screen_to_image(pointer, origin);
+        page.issues
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(idx, issue)| {
+                issue
+                    .bbox
+                    .filter(|bbox| {
+                        image_pt.x >= bbox.x1
+                            && image_pt.x <= bbox.x2
+                            && image_pt.y >= bbox.y1
+                            && image_pt.y <= bbox.y2
+                    })
+                    .map(|_| idx)
+            })
+    }
+
     /// Anchor a pan gesture to the press frame. `Response::drag_delta()` is
     /// cumulative, so adding it on every frame produces accelerating drift.
     pub(crate) fn pan_from_drag(start_pan: Vec2, drag_delta: Vec2) -> Vec2 {
@@ -199,6 +228,92 @@ impl CanvasState {
         bbox.x2 = (bbox.x1 + width).min(image_size.x.max(width));
         bbox.y2 = (bbox.y1 + height).min(image_size.y.max(height));
         bbox
+    }
+
+    pub(crate) fn clamp_translate_bbox(bbox: DomainRect, image_size: Vec2) -> DomainRect {
+        let width = (bbox.x2 - bbox.x1).max(2.0).min(image_size.x.max(2.0));
+        let height = (bbox.y2 - bbox.y1).max(2.0).min(image_size.y.max(2.0));
+        let x1 = bbox.x1.clamp(0.0, (image_size.x - width).max(0.0));
+        let y1 = bbox.y1.clamp(0.0, (image_size.y - height).max(0.0));
+        DomainRect {
+            x1,
+            y1,
+            x2: x1 + width,
+            y2: y1 + height,
+        }
+    }
+
+    pub(crate) fn clamp_resize_bbox(
+        mut candidate: DomainRect,
+        anchor: DomainRect,
+        handle: Handle,
+        image_size: Vec2,
+    ) -> DomainRect {
+        let max_x = image_size.x.max(2.0);
+        let max_y = image_size.y.max(2.0);
+        match handle {
+            Handle::Tl => {
+                candidate.x1 = candidate.x1.clamp(0.0, anchor.x2 - 2.0);
+                candidate.y1 = candidate.y1.clamp(0.0, anchor.y2 - 2.0);
+                candidate.x2 = anchor.x2;
+                candidate.y2 = anchor.y2;
+            }
+            Handle::Tc => {
+                candidate.y1 = candidate.y1.clamp(0.0, anchor.y2 - 2.0);
+                candidate.x1 = anchor.x1;
+                candidate.x2 = anchor.x2;
+                candidate.y2 = anchor.y2;
+            }
+            Handle::Tr => {
+                candidate.x2 = candidate.x2.clamp(anchor.x1 + 2.0, max_x);
+                candidate.y1 = candidate.y1.clamp(0.0, anchor.y2 - 2.0);
+                candidate.x1 = anchor.x1;
+                candidate.y2 = anchor.y2;
+            }
+            Handle::Ml => {
+                candidate.x1 = candidate.x1.clamp(0.0, anchor.x2 - 2.0);
+                candidate.y1 = anchor.y1;
+                candidate.x2 = anchor.x2;
+                candidate.y2 = anchor.y2;
+            }
+            Handle::Mr => {
+                candidate.x2 = candidate.x2.clamp(anchor.x1 + 2.0, max_x);
+                candidate.x1 = anchor.x1;
+                candidate.y1 = anchor.y1;
+                candidate.y2 = anchor.y2;
+            }
+            Handle::Bl => {
+                candidate.x1 = candidate.x1.clamp(0.0, anchor.x2 - 2.0);
+                candidate.y2 = candidate.y2.clamp(anchor.y1 + 2.0, max_y);
+                candidate.x2 = anchor.x2;
+                candidate.y1 = anchor.y1;
+            }
+            Handle::Bc => {
+                candidate.y2 = candidate.y2.clamp(anchor.y1 + 2.0, max_y);
+                candidate.x1 = anchor.x1;
+                candidate.x2 = anchor.x2;
+                candidate.y1 = anchor.y1;
+            }
+            Handle::Br => {
+                candidate.x2 = candidate.x2.clamp(anchor.x1 + 2.0, max_x);
+                candidate.y2 = candidate.y2.clamp(anchor.y1 + 2.0, max_y);
+                candidate.x1 = anchor.x1;
+                candidate.y1 = anchor.y1;
+            }
+        }
+        candidate
+    }
+
+    pub(crate) fn bbox_from_points(start: Pos2, end: Pos2, image_size: Vec2) -> DomainRect {
+        CanvasState::clamp_bbox(
+            DomainRect {
+                x1: start.x.min(end.x),
+                y1: start.y.min(end.y),
+                x2: start.x.max(end.x),
+                y2: start.y.max(end.y),
+            },
+            image_size,
+        )
     }
 
     pub(crate) fn average_color_in_neighborhood(
@@ -368,6 +483,57 @@ impl EditorApp {
             }
         }
 
+        // Review issue overlays use image coordinates, so they remain aligned
+        // through pan and zoom and can be selected for inspector editing.
+        for (idx, issue) in page.issues.iter().enumerate() {
+            let Some(bbox) = &issue.bbox else { continue };
+            let rect = self.canvas.screen_rect(bbox, origin);
+            if rect.min.x > available.max.x
+                || rect.max.x < available.min.x
+                || rect.min.y > available.max.y
+                || rect.max.y < available.min.y
+            {
+                continue;
+            }
+            let selected = self.canvas.selected_issue == Some(idx);
+            painter.rect_filled(
+                rect,
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(255, 150, 40, if selected { 65 } else { 35 }),
+            );
+            painter.rect_stroke(
+                rect,
+                2.0,
+                Stroke::new(
+                    if selected { 3.0_f32 } else { 2.0_f32 },
+                    egui::Color32::from_rgb(255, 140, 30),
+                ),
+                StrokeKind::Middle,
+            );
+        }
+
+        if let DragState::DrawIssue {
+            start_pos,
+            current_pos,
+            ..
+        } = &self.canvas.drag
+        {
+            let start = self.canvas.image_to_screen(*start_pos, origin);
+            let current = self.canvas.image_to_screen(*current_pos, origin);
+            let rect = Rect::from_two_pos(start, current);
+            painter.rect_filled(
+                rect,
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(255, 150, 40, 45),
+            );
+            painter.rect_stroke(
+                rect,
+                2.0,
+                Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 140, 30)),
+                StrokeKind::Middle,
+            );
+        }
+
         // Live brush stroke preview.
         if let DragState::BrushStroke {
             points,
@@ -439,6 +605,8 @@ impl EditorApp {
                 Handle::Tc | Handle::Bc => egui::CursorIcon::ResizeVertical,
                 Handle::Ml | Handle::Mr => egui::CursorIcon::ResizeHorizontal,
             });
+        } else if self.canvas.draw_issue_mode {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
         } else if self.canvas.eyedropper_active
             || (self.canvas.brush_active && ctx.input(|i| i.modifiers.alt))
         {
@@ -506,9 +674,10 @@ impl EditorApp {
             && (response.dragged_by(egui::PointerButton::Secondary)
                 || response.drag_started_by(egui::PointerButton::Secondary));
         if response.drag_started_by(egui::PointerButton::Middle)
-            || response.drag_started_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Middle)
-            || (response.dragged_by(egui::PointerButton::Secondary) && !right_brush)
+            || ((response.drag_started_by(egui::PointerButton::Secondary)
+                || response.dragged_by(egui::PointerButton::Secondary))
+                && !right_brush)
         {
             if !matches!(self.canvas.drag, DragState::Pan) {
                 self.canvas.drag = DragState::Pan;
@@ -518,6 +687,26 @@ impl EditorApp {
                 self.canvas.pan_start.unwrap_or(self.canvas.pan),
                 response.drag_delta(),
             );
+            return;
+        }
+
+        // Draw Issue owns primary gestures before any brush or bubble action.
+        // The press origin preserves the initial motion when egui reports the
+        // drag after its movement threshold.
+        if self.canvas.draw_issue_mode {
+            let image_point = self.canvas.screen_to_image(pointer, origin);
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                let press = ctx.input(|i| i.pointer.press_origin()).unwrap_or(pointer);
+                let start_pos = self.canvas.screen_to_image(press, origin);
+                self.canvas.drag = DragState::DrawIssue {
+                    page_index: self.current_page,
+                    start_pos,
+                    current_pos: image_point,
+                    image_size,
+                };
+            } else if let DragState::DrawIssue { current_pos, .. } = &mut self.canvas.drag {
+                *current_pos = image_point;
+            }
             return;
         }
 
@@ -638,7 +827,7 @@ impl EditorApp {
                     bbox.y1 += delta.y / self.canvas.zoom;
                     bbox.x2 += delta.x / self.canvas.zoom;
                     bbox.y2 += delta.y / self.canvas.zoom;
-                    let next = CanvasState::clamp_bbox(bbox, image_size);
+                    let next = CanvasState::clamp_translate_bbox(bbox, image_size);
                     if (next.x1 - start_bbox.x1).abs() > 0.01
                         || (next.y1 - start_bbox.y1).abs() > 0.01
                         || (next.x2 - start_bbox.x2).abs() > 0.01
@@ -695,7 +884,8 @@ impl EditorApp {
                             bbox.y2 += dy;
                         }
                     }
-                    let next = CanvasState::clamp_bbox(bbox, image_size);
+                    let next =
+                        CanvasState::clamp_resize_bbox(bbox, *start_bbox, *handle, image_size);
                     if next.x2 - next.x1 > 1.0 && next.y2 - next.y1 > 1.0 {
                         self.canvas.drag_moved = true;
                         self.state.as_mut().unwrap().set_bubble_bbox(
@@ -711,10 +901,15 @@ impl EditorApp {
         }
 
         if response.clicked() && self.canvas.drag == DragState::None {
-            if let Some(bi) = self.canvas.hit_bubble(pointer, origin, page) {
+            if let Some(issue_index) = self.canvas.hit_issue(pointer, origin, page) {
+                self.canvas.selected_issue = Some(issue_index);
+                self.canvas.selected = None;
+            } else if let Some(bi) = self.canvas.hit_bubble(pointer, origin, page) {
                 self.canvas.selected = Some((self.current_page, bi));
+                self.canvas.selected_issue = None;
             } else if !self.canvas.brush_active {
                 self.canvas.selected = None;
+                self.canvas.selected_issue = None;
             }
         }
     }
@@ -816,6 +1011,25 @@ impl EditorApp {
                     self.canvas.undo_stack.push_back(page_index);
                     self.canvas.brush_overlay_dirty = true;
                     self.schedule_save();
+                }
+            }
+            DragState::DrawIssue {
+                page_index,
+                start_pos,
+                current_pos,
+                image_size,
+            } => {
+                let bbox = CanvasState::bbox_from_points(start_pos, current_pos, image_size);
+                if bbox.x2 - bbox.x1 >= 3.0 && bbox.y2 - bbox.y1 >= 3.0 {
+                    let issue_index = self
+                        .state
+                        .as_mut()
+                        .map(|state| state.push_issue(page_index, bbox));
+                    if let Some(issue_index) = issue_index {
+                        self.canvas.selected_issue = Some(issue_index);
+                        self.canvas.selected = None;
+                        self.schedule_save();
+                    }
                 }
             }
             DragState::TranslateBubble { .. } | DragState::ResizeBubble { .. } => {
@@ -925,6 +1139,52 @@ mod tests {
         assert!(clamped.x2 <= 64.0 && clamped.y2 <= 64.0);
         assert!(clamped.x2 - clamped.x1 >= 2.0);
         assert!(clamped.y2 - clamped.y1 >= 2.0);
+    }
+
+    #[test]
+    fn coordinate_conversion_and_resize_clamp_preserve_expected_edges() {
+        let canvas = CanvasState {
+            pan: Vec2::new(11.0, -7.0),
+            zoom: 2.0,
+            ..CanvasState::default()
+        };
+        let origin = Pos2::new(100.0, 80.0);
+        let image_point = Pos2::new(13.0, 9.0);
+        let screen = canvas.image_to_screen(image_point, origin);
+        assert_eq!(canvas.screen_to_image(screen, origin), image_point);
+
+        let anchor = DomainRect {
+            x1: 10.0,
+            y1: 10.0,
+            x2: 30.0,
+            y2: 30.0,
+        };
+        let resized = CanvasState::clamp_resize_bbox(
+            DomainRect {
+                x1: -20.0,
+                y1: 10.0,
+                x2: 30.0,
+                y2: 30.0,
+            },
+            anchor,
+            Handle::Ml,
+            Vec2::new(40.0, 40.0),
+        );
+        assert_eq!(resized.x1, 0.0);
+        assert_eq!(resized.x2, anchor.x2);
+        let translated = CanvasState::clamp_translate_bbox(
+            DomainRect {
+                x1: 35.0,
+                y1: 35.0,
+                x2: 55.0,
+                y2: 55.0,
+            },
+            Vec2::new(40.0, 40.0),
+        );
+        assert_eq!(translated.x2 - translated.x1, 20.0);
+        assert_eq!(translated.y2 - translated.y1, 20.0);
+        assert_eq!(translated.x2, 40.0);
+        assert_eq!(translated.y2, 40.0);
     }
 
     #[test]

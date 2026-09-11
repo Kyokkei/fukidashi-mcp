@@ -39,6 +39,36 @@ impl EditorApp {
                 }
 
                 ui.separator();
+                let mut draw_issue = self.canvas.draw_issue_mode;
+                if ui
+                    .checkbox(&mut draw_issue, "Draw Issue (primary drag)")
+                    .changed()
+                {
+                    self.cancel_drag();
+                    self.canvas.draw_issue_mode = draw_issue;
+                    if draw_issue {
+                        self.canvas.brush_active = false;
+                        self.canvas.eyedropper_active = false;
+                        self.canvas.selected = None;
+                        self.canvas.selected_issue = None;
+                    }
+                }
+                let issue_count = self
+                    .current_page_view()
+                    .map(|page| page.issues.len())
+                    .unwrap_or(0);
+                ui.horizontal(|ui| {
+                    ui.label(format!("Issues on page: {issue_count}"));
+                    if ui.button("Clear page issues").clicked() && issue_count > 0 {
+                        if let Some(state) = self.state.as_mut() {
+                            state.clear_issues(self.current_page);
+                        }
+                        self.canvas.selected_issue = None;
+                        self.schedule_save();
+                    }
+                });
+
+                ui.separator();
                 ui.collapsing("Color palette", |ui| {
                     let eye_label = if self.canvas.eyedropper_active {
                         "Eyedropper active (I)"
@@ -186,13 +216,12 @@ impl EditorApp {
 
                 // Bubble inspector.
                 let sel = self.canvas.selected;
-                match sel {
-                    Some((pi, bi)) => {
-                        self.bubble_inspector(ui, pi, bi);
-                    }
-                    None => {
-                        ui.label("Select a bubble on the canvas to edit it.");
-                    }
+                if let Some(issue_index) = self.canvas.selected_issue {
+                    self.issue_inspector(ui, self.current_page, issue_index);
+                } else if let Some((pi, bi)) = sel {
+                    self.bubble_inspector(ui, pi, bi);
+                } else {
+                    ui.label("Select a bubble or issue on the canvas to edit it.");
                 }
 
                 ui.separator();
@@ -213,6 +242,85 @@ impl EditorApp {
                     ui.colored_label(Color32::RED, format!("Error: {err}"));
                 }
             });
+    }
+
+    fn issue_inspector(&mut self, ui: &mut Ui, page_index: usize, issue_index: usize) {
+        let issue = self
+            .current_page_view()
+            .and_then(|page| page.issues.get(issue_index).cloned());
+        let Some(issue) = issue else {
+            self.canvas.selected_issue = None;
+            return;
+        };
+        ui.label(format!("Issue {}", issue_index + 1));
+        ui.label(format!(
+            "{} issue(s) on this page",
+            self.current_page_view()
+                .map(|p| p.issues.len())
+                .unwrap_or(0)
+        ));
+
+        let choices = [
+            ("leftover_source_text", "Leftover source text"),
+            ("text_overflow", "Text overflow"),
+            ("wrong_translation", "Wrong translation"),
+            ("wrong_or_missing_bubble", "Wrong/missing bubble"),
+            ("damaged_artwork", "Damaged artwork"),
+            ("font_or_layout", "Font/layout"),
+            ("flagged_bubble", "Flagged bubble"),
+            ("custom", "Custom"),
+        ];
+        let mut issue_type = issue.issue_type.clone();
+        ComboBox::from_label("Issue type")
+            .selected_text(
+                choices
+                    .iter()
+                    .find(|(value, _)| *value == issue_type)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("Custom"),
+            )
+            .show_ui(ui, |ui| {
+                for (value, label) in choices {
+                    ui.selectable_value(&mut issue_type, value.to_owned(), label);
+                }
+            });
+        if issue_type != issue.issue_type {
+            if let Some(state) = self.state.as_mut() {
+                state.set_issue_type(page_index, issue_index, issue_type);
+            }
+            self.schedule_save();
+        }
+
+        let mut note = issue.note.clone();
+        ui.label("Note");
+        if ui.text_edit_multiline(&mut note).changed() {
+            if let Some(state) = self.state.as_mut() {
+                state.set_issue_text(page_index, issue_index, "note", Some(note));
+            }
+            self.schedule_save();
+        }
+
+        let mut corrected_text = issue.corrected_text.clone().unwrap_or_default();
+        ui.label("Corrected text (optional)");
+        if ui.text_edit_multiline(&mut corrected_text).changed() {
+            if let Some(state) = self.state.as_mut() {
+                state.set_issue_text(
+                    page_index,
+                    issue_index,
+                    "corrected_text",
+                    (!corrected_text.trim().is_empty()).then_some(corrected_text),
+                );
+            }
+            self.schedule_save();
+        }
+
+        if ui.button("Delete selected issue").clicked() {
+            if let Some(state) = self.state.as_mut() {
+                state.remove_issue(page_index, issue_index);
+            }
+            self.canvas.selected_issue = None;
+            self.schedule_save();
+        }
     }
 
     fn bubble_inspector(&mut self, ui: &mut Ui, page_index: usize, bubble_index: usize) {

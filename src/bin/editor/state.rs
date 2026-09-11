@@ -86,8 +86,19 @@ pub struct BubbleView {
     pub font_size: Option<f32>,
     pub padding: Option<f32>,
     pub flagged: bool,
+    pub problem: bool,
     pub preserve_source: bool,
     pub render_dirty: bool,
+}
+
+/// Read-only view of a review issue rectangle. Issues are review metadata and
+/// deliberately do not participate in render-dirty tracking.
+#[derive(Clone)]
+pub struct IssueView {
+    pub issue_type: String,
+    pub bbox: Option<Rect>,
+    pub note: String,
+    pub corrected_text: Option<String>,
 }
 
 /// Read-only view of a page (with resolved, on-disk image paths).
@@ -97,13 +108,26 @@ pub struct PageView {
     pub cleaned_image_path: PathBuf,
     pub rendered_image_path: Option<PathBuf>,
     pub bubbles: Vec<BubbleView>,
+    pub issues: Vec<IssueView>,
     pub correction_strokes: Vec<CorrectionStroke>,
     pub render_dirty: bool,
 }
 
 impl PageView {
     pub fn has_flagged_or_dirty(&self) -> bool {
-        self.bubbles.iter().any(|b| b.flagged || b.render_dirty)
+        self.bubbles
+            .iter()
+            .any(|b| b.flagged || b.problem || b.render_dirty)
+    }
+
+    pub fn has_bubble_flags(&self) -> bool {
+        self.bubbles
+            .iter()
+            .any(|bubble| bubble.flagged || bubble.problem)
+    }
+
+    pub fn has_render_dirty(&self) -> bool {
+        self.render_dirty || self.bubbles.iter().any(|bubble| bubble.render_dirty)
     }
 }
 
@@ -169,6 +193,7 @@ impl EditorState {
                             .map(|v| v as f32),
                         padding: b.get("padding").and_then(|v| v.as_f64()).map(|v| v as f32),
                         flagged: b.get("flagged").and_then(|v| v.as_bool()).unwrap_or(false),
+                        problem: b.get("problem").and_then(|v| v.as_bool()).unwrap_or(false),
                         preserve_source: b
                             .get("preserve_source")
                             .and_then(|v| v.as_bool())
@@ -190,6 +215,33 @@ impl EditorState {
                     .collect()
             })
             .unwrap_or_default();
+        let issues = page
+            .get("issues")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .map(|issue| IssueView {
+                        issue_type: issue
+                            .get("issue_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("custom")
+                            .to_owned(),
+                        bbox: issue
+                            .get("bbox")
+                            .and_then(|v| serde_json::from_value::<Rect>(v.clone()).ok()),
+                        note: issue
+                            .get("note")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned(),
+                        corrected_text: issue
+                            .get("corrected_text")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         PageView {
             id: page
                 .get("id")
@@ -200,6 +252,7 @@ impl EditorState {
             cleaned_image_path: cleaned,
             rendered_image_path: rendered,
             bubbles,
+            issues,
             correction_strokes,
             render_dirty: page
                 .get("render_dirty")
@@ -473,6 +526,102 @@ impl EditorState {
         });
     }
 
+    pub(crate) fn push_issue(&mut self, page_index: usize, bbox: Rect) -> usize {
+        let issue = serde_json::json!({
+            "issue_type": "custom",
+            "origin": "image-pixels",
+            "bbox": {"x1": bbox.x1, "y1": bbox.y1, "x2": bbox.x2, "y2": bbox.y2},
+            "note": "",
+        });
+        let Some(page) = self
+            .value
+            .get_mut("pages")
+            .and_then(|pages| pages.as_array_mut())
+            .and_then(|pages| pages.get_mut(page_index))
+        else {
+            return 0;
+        };
+        let Some(page) = page.as_object_mut() else {
+            return 0;
+        };
+        let issues = page
+            .entry("issues")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let Some(issues) = issues.as_array_mut() else {
+            return 0;
+        };
+        issues.push(issue);
+        issues.len().saturating_sub(1)
+    }
+
+    pub(crate) fn remove_issue(&mut self, page_index: usize, issue_index: usize) -> bool {
+        self.value
+            .get_mut("pages")
+            .and_then(|pages| pages.as_array_mut())
+            .and_then(|pages| pages.get_mut(page_index))
+            .and_then(|page| page.get_mut("issues"))
+            .and_then(|issues| issues.as_array_mut())
+            .and_then(|issues| (issue_index < issues.len()).then_some(issues))
+            .map(|issues| {
+                issues.remove(issue_index);
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn clear_issues(&mut self, page_index: usize) -> bool {
+        let Some(issues) = self
+            .value
+            .get_mut("pages")
+            .and_then(|pages| pages.as_array_mut())
+            .and_then(|pages| pages.get_mut(page_index))
+            .and_then(|page| page.get_mut("issues"))
+            .and_then(|issues| issues.as_array_mut())
+        else {
+            return false;
+        };
+        let changed = !issues.is_empty();
+        issues.clear();
+        changed
+    }
+
+    pub(crate) fn set_issue_text(
+        &mut self,
+        page_index: usize,
+        issue_index: usize,
+        key: &str,
+        value: Option<String>,
+    ) {
+        if let Some(issue) = self
+            .value
+            .get_mut("pages")
+            .and_then(|pages| pages.as_array_mut())
+            .and_then(|pages| pages.get_mut(page_index))
+            .and_then(|page| page.get_mut("issues"))
+            .and_then(|issues| issues.as_array_mut())
+            .and_then(|issues| issues.get_mut(issue_index))
+            .and_then(|issue| issue.as_object_mut())
+        {
+            match value {
+                Some(value) => {
+                    issue.insert(key.to_owned(), serde_json::Value::String(value));
+                }
+                None => {
+                    issue.remove(key);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_issue_type(
+        &mut self,
+        page_index: usize,
+        issue_index: usize,
+        issue_type: String,
+    ) {
+        self.set_issue_text(page_index, issue_index, "issue_type", Some(issue_type));
+    }
+
     pub fn push_stroke(&mut self, page_index: usize, stroke: &CorrectionStroke) {
         if let Some(arr) = self
             .value
@@ -630,5 +779,37 @@ mod tests {
         assert_eq!(bubble["bbox"], bubble["bubble_bbox"]);
         assert_eq!(bubble["text_bbox"]["x1"], 30.0);
         assert_eq!(bubble["text_bbox"]["y2"], 60.0);
+    }
+
+    #[test]
+    fn issue_crud_persists_review_metadata_without_dirtying_render() {
+        let mut state = EditorState {
+            value: serde_json::json!({
+                "pages": [{"render_dirty": false, "bubbles": []}]
+            }),
+            job_dir: PathBuf::from("."),
+            image_path: PathBuf::from("image.png"),
+        };
+        let index = state.push_issue(
+            0,
+            Rect {
+                x1: 2.0,
+                y1: 3.0,
+                x2: 12.0,
+                y2: 14.0,
+            },
+        );
+        state.set_issue_type(0, index, "wrong_translation".to_owned());
+        state.set_issue_text(0, index, "note", Some("Use the formal pronoun".to_owned()));
+        state.set_issue_text(0, index, "corrected_text", Some("Corrected".to_owned()));
+        let page = state.pages().pop().unwrap();
+        assert_eq!(page.issues.len(), 1);
+        assert_eq!(page.issues[0].issue_type, "wrong_translation");
+        assert_eq!(page.issues[0].note, "Use the formal pronoun");
+        assert_eq!(page.issues[0].corrected_text.as_deref(), Some("Corrected"));
+        assert!(!page.render_dirty);
+        assert!(state.remove_issue(0, index));
+        assert!(state.pages()[0].issues.is_empty());
+        assert!(!state.clear_issues(0));
     }
 }

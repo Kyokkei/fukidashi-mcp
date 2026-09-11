@@ -16,7 +16,9 @@ impl EditorApp {
                     for (index, page) in pages.iter().enumerate() {
                         let thumb = self.load_thumbnail(index, page);
                         let is_current = index == self.current_page;
-                        let flagged = page.has_flagged_or_dirty();
+                        let flagged = page.has_bubble_flags();
+                        let has_issues = !page.issues.is_empty();
+                        let render_dirty = page.has_render_dirty();
 
                         let size = egui::vec2(96.0, 96.0);
                         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
@@ -37,7 +39,7 @@ impl EditorApp {
                         if is_current {
                             ui.painter().rect_stroke(
                                 rect,
-                                2.0,
+                                2.0_f32,
                                 egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(80, 200, 255)),
                                 StrokeKind::Middle,
                             );
@@ -45,6 +47,21 @@ impl EditorApp {
                         if flagged {
                             ui.painter()
                                 .circle_filled(rect.right_top(), 6.0, egui::Color32::RED);
+                        }
+                        if has_issues {
+                            ui.painter().circle_filled(
+                                rect.right_top() + egui::vec2(-14.0, 0.0),
+                                6.0,
+                                egui::Color32::from_rgb(255, 160, 40),
+                            );
+                        }
+                        if render_dirty {
+                            ui.painter().rect_stroke(
+                                rect,
+                                2.0_f32,
+                                egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 210, 70)),
+                                StrokeKind::Middle,
+                            );
                         }
                         ui.painter().text(
                             rect.min + egui::vec2(2.0, 2.0),
@@ -57,6 +74,7 @@ impl EditorApp {
                             self.cancel_drag();
                             self.current_page = index;
                             self.canvas.selected = None;
+                            self.canvas.selected_issue = None;
                             self.canvas.brush_overlay_dirty = true;
                             self.canvas.fit_applied = false;
                             self.page_textures.clear();
