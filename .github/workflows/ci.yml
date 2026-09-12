@@ -1,4 +1,4 @@
-name: portability
+﻿name: portability
 
 on:
   push:
@@ -17,6 +17,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install Linux GUI dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgtk-3-dev
       - run: cargo fmt --check
       - run: cargo check --locked --all-targets --all-features
       - run: cargo test --locked --all-targets --all-features
