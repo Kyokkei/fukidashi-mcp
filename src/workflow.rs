@@ -21,6 +21,7 @@ use uuid::Uuid;
 const CLEAN_SIDECAR_SUFFIX: &str = ".fukidashi-clean.json";
 const RENDER_SIDECAR_SUFFIX: &str = ".fukidashi-render.json";
 const LORE_FILE_NAME: &str = "lore.json";
+const MAX_LORE_BYTES: usize = 1_048_576;
 const LEGACY_MANIFEST_NAME: &str = ".fukidashi-job.json";
 const MANIFEST_NAME: &str = "job.json";
 const MAX_INGRESS_PAGES: usize = 500;
@@ -139,13 +140,83 @@ pub struct LoreDocument {
     pub extra: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct LoreCharacter {
     pub id: String,
     #[serde(default)]
     pub names: Vec<String>,
     #[serde(default)]
     pub notes: String,
+    #[serde(skip)]
+    shorthand: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct LoreCharacterFields {
+    id: String,
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default)]
+    notes: String,
+}
+
+impl<'de> Deserialize<'de> for LoreCharacter {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(name) => {
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    return Err(serde::de::Error::custom(
+                        "character shorthand must be a non-empty name",
+                    ));
+                }
+                Ok(Self {
+                    id: lore_character_id(trimmed),
+                    names: vec![trimmed.to_owned()],
+                    notes: String::new(),
+                    shorthand: true,
+                })
+            }
+            serde_json::Value::Object(_) => {
+                let fields: LoreCharacterFields =
+                    serde_json::from_value(value).map_err(|error| {
+                        serde::de::Error::custom(format!(
+                            "character object must contain string id and names: {error}"
+                        ))
+                    })?;
+                Ok(Self {
+                    id: fields.id,
+                    names: fields.names,
+                    notes: fields.notes,
+                    shorthand: false,
+                })
+            }
+            _ => Err(serde::de::Error::custom(
+                "character must be a name string or {id,names,notes} object",
+            )),
+        }
+    }
+}
+
+fn lore_character_id(name: &str) -> String {
+    let mut id = String::new();
+    for character in name.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() {
+            id.push(character);
+        } else if !id.is_empty() && !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    let id = id.trim_end_matches('-');
+    if id.is_empty() {
+        "character".to_owned()
+    } else {
+        id.to_owned()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -166,16 +237,55 @@ fn default_lore_schema() -> u32 {
 }
 
 impl LoreDocument {
-    fn validate(self) -> Result<Self> {
+    fn validate(mut self) -> Result<Self> {
         if self.schema == 0 {
             bail!("lore schema must be a positive integer");
         }
-        for character in &self.characters {
+        if self.characters.len() > 4096
+            || self.pronouns.len() > 4096
+            || self.glossary.len() > 16_384
+        {
+            bail!("lore contains too many entries; reduce characters, pronouns, or glossary");
+        }
+        let mut seen_ids = std::collections::BTreeSet::new();
+        let mut shorthand_counts = std::collections::BTreeMap::<String, usize>::new();
+        for character in &mut self.characters {
             if character.id.trim().is_empty() {
                 bail!("lore character id must not be empty");
             }
-            if character.names.iter().any(|name| name.trim().is_empty()) {
-                bail!("lore character names must not be empty");
+            if character.id.chars().count() > 256 {
+                bail!("lore character id is too long (maximum 256 characters)");
+            }
+            if character.names.is_empty()
+                || character.names.iter().any(|name| name.trim().is_empty())
+            {
+                bail!("lore character names must contain at least one non-empty name");
+            }
+            if character
+                .names
+                .iter()
+                .any(|name| name.chars().count() > 512)
+            {
+                bail!("lore character name is too long (maximum 512 characters)");
+            }
+            if character.notes.chars().count() > 4096 {
+                bail!("lore character notes are too long (maximum 4096 characters)");
+            }
+            let base_id = character.id.clone();
+            if !seen_ids.insert(base_id.clone()) {
+                if !character.shorthand {
+                    bail!("lore character ids must be unique; duplicate id {base_id:?}");
+                }
+                let count = shorthand_counts.entry(base_id.clone()).or_insert(1);
+                let mut candidate;
+                loop {
+                    *count += 1;
+                    candidate = format!("{base_id}-{}", *count);
+                    if seen_ids.insert(candidate.clone()) {
+                        character.id = candidate;
+                        break;
+                    }
+                }
             }
         }
         for pronoun in &self.pronouns {
@@ -185,10 +295,19 @@ impl LoreDocument {
             {
                 bail!("lore pronoun entries require speaker, addressee, and pair");
             }
+            if pronoun.speaker.chars().count() > 256
+                || pronoun.addressee.chars().count() > 256
+                || pronoun.pair.chars().count() > 512
+            {
+                bail!("lore pronoun fields are too long");
+            }
         }
         for entry in &self.glossary {
             if entry.source.trim().is_empty() || entry.target.trim().is_empty() {
                 bail!("lore glossary entries require source and target");
+            }
+            if entry.source.chars().count() > 1024 || entry.target.chars().count() > 1024 {
+                bail!("lore glossary entries are too long");
             }
         }
         Ok(self)
@@ -1988,12 +2107,29 @@ fn validate_lore_value(value: serde_json::Value) -> Result<serde_json::Value> {
     let object = value
         .as_object()
         .ok_or_else(|| anyhow!("lore must be a JSON object"))?;
+    let encoded = serde_json::to_vec(&value).context("measure lore payload")?;
+    if encoded.len() > MAX_LORE_BYTES {
+        bail!(
+            "lore payload is too large ({} bytes; maximum {} bytes)",
+            encoded.len(),
+            MAX_LORE_BYTES
+        );
+    }
     if object.get("schema").is_some_and(serde_json::Value::is_null) {
         bail!("lore schema must be a positive integer");
     }
-    let document: LoreDocument = serde_json::from_value(value)
-        .context("lore must match the forward-compatible lore schema")?;
-    serde_json::to_value(document.validate()?).context("serialize validated lore")
+    const LORE_TEMPLATE: &str = r#"{"schema":1,"characters":["Fuyu"],"pronouns":[],"glossary":[{"source":"proprietress","target":"bà chủ"}]}"#;
+    let document: LoreDocument = serde_json::from_value(value).map_err(|error| {
+        anyhow!(
+            "invalid lore; expected {LORE_TEMPLATE}; character strings are accepted and canonicalized: {error}"
+        )
+    })?;
+    let document = document.validate().map_err(|error| {
+        anyhow!(
+            "invalid lore; expected {LORE_TEMPLATE}; character strings are accepted and canonicalized: {error}"
+        )
+    })?;
+    serde_json::to_value(document).context("serialize validated lore")
 }
 
 pub fn clean_sidecar(path: &Path) -> PathBuf {
@@ -3049,6 +3185,68 @@ mod tests {
                 .is_err()
         );
         assert!(registration.job_dir.join("lore.json").is_file());
+    }
+
+    #[test]
+    fn lore_accepts_natural_character_shorthand_and_canonicalizes_ids() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("page.png");
+        RgbaImage::from_pixel(16, 16, Rgba([255, 255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+        let saved = workflow
+            .write_lore(
+                &registration.job_dir,
+                &json!({
+                    "schema": 1,
+                    "characters": ["Fuyu", "Fuyu", "Kuga"],
+                    "pronouns": [],
+                    "glossary": [{"source":"proprietress","target":"bà chủ"}],
+                    "future": {"voice": "dry"}
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            saved["characters"][0],
+            json!({
+                "id": "fuyu",
+                "names": ["Fuyu"],
+                "notes": ""
+            })
+        );
+        assert_eq!(saved["characters"][1]["id"], "fuyu-2");
+        assert_eq!(saved["characters"][2]["id"], "kuga");
+        assert_eq!(saved["future"]["voice"], "dry");
+        assert_eq!(workflow.read_lore(&registration.job_dir).unwrap(), saved);
+    }
+
+    #[test]
+    fn lore_rejects_malformed_or_unbounded_values_with_actionable_errors() {
+        let oversized = json!({"schema":1,"characters":["x".repeat(1_100_000)]});
+        let error = validate_lore_value(oversized).unwrap_err().to_string();
+        assert!(error.contains("too large"));
+        assert!(error.contains("maximum"));
+
+        for value in [
+            json!(null),
+            json!({"schema":1,"characters":[null]}),
+            json!({"schema":1,"characters":[{"id":"x","names":[]}]}),
+            json!({"schema":1,"characters":[{"id":"","names":["x"]}]}),
+            json!({"schema":1,"pronouns":[{"speaker":"","addressee":"x","pair":"y"}]}),
+            json!({"schema":1,"glossary":[{"source":"x","target":""}]}),
+        ] {
+            let error = validate_lore_value(value).unwrap_err().to_string();
+            assert!(error.contains("lore") || error.contains("character"));
+            if !error.contains("JSON object") {
+                assert!(
+                    error.contains("expected")
+                        || error.contains("must")
+                        || error.contains("require")
+                );
+            }
+        }
     }
 
     #[test]

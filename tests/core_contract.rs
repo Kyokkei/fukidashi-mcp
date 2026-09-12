@@ -164,6 +164,23 @@ async fn rmcp_surface_lists_tools_and_reports_tool_errors() -> anyhow::Result<()
     let strict_submit_schema = serde_json::to_value(strict_submit.input_schema.clone())?;
     assert!(strict_submit_schema["properties"]["work_token"].is_object());
     assert!(strict_submit_schema["properties"]["translations"].is_object());
+    let lore_schema = tools
+        .tools
+        .iter()
+        .find(|tool| tool.name == "fukidashi_put_lore")
+        .expect("put lore tool schema")
+        .input_schema
+        .clone();
+    let lore_schema = serde_json::to_value(lore_schema)?;
+    assert_eq!(lore_schema["properties"]["lore"]["type"], "object");
+    assert!(lore_schema["properties"]["lore"]["additionalProperties"].is_object());
+    let character_items =
+        &lore_schema["properties"]["lore"]["properties"]["characters"]["items"]["anyOf"];
+    assert!(character_items.as_array().is_some_and(|items| {
+        items.iter().any(|item| item["type"] == "string")
+            && items.iter().any(|item| item["type"] == "object")
+    }));
+    assert!(lore_schema.to_string().contains("Fuyu"));
     let review_export_schema = tools
         .tools
         .iter()

@@ -54,7 +54,7 @@
 * 🔍 **Multilingual Local OCR**: High-speed, local transcription for Japanese (Baberu Vision & Manga-OCR), Chinese, Korean, and Latin/English (PP-OCRv5/v6).
 * ✍️ **Smart Typesetting**: Dynamic word-wrapping, box-fitting, automated font scaling, and full Vietnamese diacritic support via bundled fonts (*Patrick Hand* & *Comic Neue*), with Unicode emoji/symbol fallbacks (`❤`, `★`).
 * 🖥️ **Hardware-Accelerated Desktop Editor (`fukidashi-editor`)**: Standalone, 60fps native Rust `egui` QA application. Panning, zooming, side-by-side comparison, inpainting brush, and real-time bubble editing.
-* 🛡️ **Strict Lore Preservation**: Integrated `fukidashi_put_lore` system prevents pronoun drift and character name confusion across multi-page chapters.
+* 🛡️ **Strict Lore Preservation**: Integrated `fukidashi_put_lore` system prevents pronoun drift and character name confusion across multi-page chapters. Use `{"schema":1,"characters":["Fuyu"],"pronouns":[],"glossary":[{"source":"proprietress","target":"bà chủ"}]}`; character strings are stored canonically with stable IDs.
 
 ---
 

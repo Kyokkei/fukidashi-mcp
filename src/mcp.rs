@@ -124,6 +124,44 @@ fn json_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({"type": "object"})
 }
 
+fn lore_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "description": "Canonical lore. Character entries may be names (for example \"Fuyu\") or objects; name strings are canonicalized to stable {id,names,notes} entries.",
+        "additionalProperties": {},
+        "properties": {
+            "schema": {"type": "integer", "minimum": 1, "default": 1},
+            "characters": {
+                "type": "array", "maxItems": 4096,
+                "items": {"anyOf": [
+                    {"type": "string", "minLength": 1},
+                    {"type": "object", "required": ["id", "names"], "additionalProperties": {},
+                        "properties": {
+                            "id": {"type": "string", "minLength": 1, "maxLength": 256},
+                            "names": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 512}},
+                            "notes": {"type": "string", "maxLength": 4096}
+                        }
+                    }
+                ]}
+            },
+            "pronouns": {"type": "array", "maxItems": 4096, "items": {"type": "object", "required": ["speaker", "addressee", "pair"], "additionalProperties": {},
+                "properties": {
+                    "speaker": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "addressee": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "pair": {"type": "string", "minLength": 1, "maxLength": 512}
+                }
+            }},
+            "glossary": {"type": "array", "maxItems": 16384, "items": {"type": "object", "required": ["source", "target"], "additionalProperties": {},
+                "properties": {
+                    "source": {"type": "string", "minLength": 1, "maxLength": 1024},
+                    "target": {"type": "string", "minLength": 1, "maxLength": 1024}
+                }
+            }}
+        },
+        "examples": [{"schema": 1, "characters": ["Fuyu", "Kuga", "Sosuke"], "pronouns": [], "glossary": [{"source": "proprietress", "target": "bà chủ"}] }]
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ExportRequest {
     pub project_dir: String,
@@ -195,7 +233,7 @@ pub struct PutLoreRequest {
     pub job_id: String,
     /// Forward-compatible lore object. The server validates known fields and
     /// retains unknown top-level fields for newer clients.
-    #[schemars(schema_with = "json_object_schema")]
+    #[schemars(schema_with = "lore_object_schema")]
     pub lore: serde_json::Value,
 }
 
@@ -967,6 +1005,7 @@ impl FukidashiServer {
         &self,
         pending: &PendingPage,
         analysis: &serde_json::Value,
+        replace_sfx: bool,
     ) -> Result<(), FukidashiError> {
         let mut preserved = analysis.clone();
         if preserved
@@ -1004,7 +1043,7 @@ impl FukidashiServer {
         preserved["translation_handoff"]["status"] = serde_json::Value::String("preserved".into());
         preserved["strict_v1"] = serde_json::json!({
             "status": "preserved",
-            "sfx_mode": "preserve",
+            "sfx_mode": if replace_sfx { "replace" } else { "preserve" },
             "preserved_count": items.len(),
         });
         self.workflow
@@ -1097,7 +1136,8 @@ impl FukidashiServer {
                     pending.total_pages,
                     "Preserving source page (no dialogue)...",
                 );
-                self.complete_preserved_page(&pending, &analysis).await?;
+                self.complete_preserved_page(&pending, &analysis, false)
+                    .await?;
                 auto_preserved_pages.push(pending.page_number);
                 match self.workflow.next_pending_page(&pending.job_dir) {
                     Ok(Some(next)) => {
@@ -1144,6 +1184,95 @@ impl FukidashiServer {
                 response["auto_preserved_pages"] = serde_json::json!(auto_preserved_pages);
             }
             return Ok(response);
+        }
+    }
+
+    async fn advance_strict_page(
+        &self,
+        claim: &TranslationClaim,
+    ) -> Result<serde_json::Value, FukidashiError> {
+        match self.workflow.next_pending_page(&claim.job_dir) {
+            Ok(None) => self.strict_review_ready(&claim.job_dir),
+            Ok(Some(next)) => {
+                let next_request = TranslationStartRequest {
+                    image_path: None,
+                    job_path: None,
+                    job_id: Some(
+                        claim
+                            .job_dir
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default()
+                            .to_owned(),
+                    ),
+                    ocr_mode: Some("local".into()),
+                    source_language: claim.source_language.clone(),
+                    target_language: claim.target_language.clone(),
+                    scope: None,
+                    sfx_mode: Some(if claim.replace_sfx {
+                        "replace".into()
+                    } else {
+                        "preserve".into()
+                    }),
+                };
+                self.prepare_strict_page(next, &next_request).await
+            }
+            Err(error) => Err(FukidashiError::InvalidInput(error.to_string())),
+        }
+    }
+
+    fn completed_translation_response(
+        &self,
+        claim: &TranslationClaim,
+        response: Result<serde_json::Value, FukidashiError>,
+        auto_preserved: bool,
+    ) -> CallToolResult {
+        match response {
+            Ok(mut value) => {
+                value["completed_page"] = serde_json::json!(claim.page_number);
+                if auto_preserved {
+                    value["auto_preserved"] = serde_json::Value::Bool(true);
+                    value["pass_through"] = serde_json::Value::Bool(true);
+                }
+                if value.get("current_page").is_none() {
+                    let total = claim.total_pages;
+                    emit_page_progress(total, total, "Review ready");
+                    attach_page_progress(&mut value, total, total, "Review ready");
+                }
+                json_result(&value, false)
+            }
+            Err(error) => {
+                let mut value = serde_json::json!({
+                    "protocol": "strict-v1",
+                    "status": "page_complete",
+                    "job_id": claim
+                        .job_dir
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_default(),
+                    "completed_page": claim.page_number,
+                    "error": format!("page rendered but next page is not ready: {error}"),
+                    "next_action": {
+                        "tool": "fukidashi_translation_start",
+                        "arguments": {"job_id": claim
+                            .job_dir
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default()},
+                    }
+                });
+                if auto_preserved {
+                    value["auto_preserved"] = serde_json::Value::Bool(true);
+                    value["pass_through"] = serde_json::Value::Bool(true);
+                }
+                attach_page_progress(
+                    &mut value,
+                    claim.page_number,
+                    claim.total_pages,
+                    "Page complete",
+                );
+                json_result(&value, true)
+            }
         }
     }
 
@@ -1649,7 +1778,7 @@ fn checkpoint_text_regions(
 impl FukidashiServer {
     #[tool(
         name = "fukidashi_get_lore",
-        description = "Read the canonical lore context for a managed job. Call this before the first translation submit; an untouched job returns an empty valid template."
+        description = "Read canonical lore for a managed job before the first submit. An untouched job returns {schema:1,characters:[],pronouns:[],glossary:[]}; character strings such as [\"Fuyu\"] are accepted by fukidashi_put_lore and returned as stable {id,names,notes} entries."
     )]
     pub async fn get_lore(&self, Parameters(req): Parameters<LoreRequest>) -> CallToolResult {
         let job = match self.workflow.resolve_managed_job_id(&req.job_id) {
@@ -1672,7 +1801,7 @@ impl FukidashiServer {
 
     #[tool(
         name = "fukidashi_put_lore",
-        description = "Validate and atomically write canonical lore context for a managed job. This stores client-authored names, pronouns, glossary, and forward-compatible fields; it never invokes an LLM."
+        description = "Validate and atomically write lore before the first submit; use {schema:1,characters:[\"Fuyu\",{id:\"kuga\",names:[\"Kuga\"]}],pronouns:[],glossary:[{source:\"proprietress\",target:\"bà chủ\"}]} (character strings are canonicalized to {id,names,notes}). Known fields are checked, unknown top-level fields are retained, and malformed or oversized values return the expected-shape error; this never invokes an LLM."
     )]
     pub async fn put_lore(&self, Parameters(req): Parameters<PutLoreRequest>) -> CallToolResult {
         let job = match self.workflow.resolve_managed_job_id(&req.job_id) {
@@ -1790,7 +1919,7 @@ impl FukidashiServer {
 
     #[tool(
         name = "fukidashi_translation_submit",
-        description = "Strict-v1 continuation. Submit exactly one translation decision for every stable ID returned by fukidashi_translation_start. The server owns analysis, cleaning, typesetting, stage reuse, model release, and page advancement; do not send image, analysis, clean, mask, font, or output paths. Use keep_source=true and/or needs_review=true for uncertain OCR instead of aborting the page."
+        description = "Strict-v1 continuation. Submit exactly one translation decision for every stable ID returned by fukidashi_translation_start. The server owns analysis, cleaning, typesetting, stage reuse, model release, and page advancement; do not send image, analysis, clean, mask, font, or output paths. Use keep_source=true and/or needs_review=true for uncertain OCR instead of aborting the page. When every required item uses keep_source=true, the server records a verified source pass-through, skips cleaning/typesetting with an empty crop list, consumes the token once, and returns completed_page plus the next_action."
     )]
     pub async fn translation_submit(
         &self,
@@ -1888,6 +2017,48 @@ impl FukidashiServer {
         };
         if let Err(error) = self.refresh_translation_claim_hash(&req.work_token, persisted_hash) {
             return fail(self, error);
+        }
+
+        // A page whose every required dialogue decision explicitly keeps the
+        // source must not enter crop cleaning.  Silent-page OCR false
+        // positives commonly produce exactly this submission, and an empty
+        // eligible crop list is a verified pass-through rather than an
+        // inpainting request.  The handoff is already persisted above, so a
+        // failure here leaves the claim retryable with the same token.
+        let all_keep_source = !payloads.is_empty()
+            && payloads
+                .iter()
+                .all(|payload| payload.preserve_source == Some(true));
+        if all_keep_source {
+            emit_page_progress(
+                claim.page_number,
+                claim.total_pages,
+                "Preserving source page (all decisions keep_source)...",
+            );
+            if let Err(error) = self
+                .complete_preserved_page(&pending, &analysis, claim.replace_sfx)
+                .await
+            {
+                return fail(self, error);
+            }
+            let _ = self
+                .release_models(Parameters(ReleaseModelsRequest {}))
+                .await;
+            if let Err(error) = self.consume_translation_claim(&req.work_token) {
+                return json_result(
+                    &serde_json::json!({
+                        "protocol": "strict-v1",
+                        "error": error.to_string(),
+                        "next_step": "the page was rendered; resume with fukidashi_translation_start using the job_id"
+                    }),
+                    true,
+                );
+            }
+            return self.completed_translation_response(
+                &claim,
+                self.advance_strict_page(&claim).await,
+                true,
+            );
         }
 
         // A valid saved clean stage survives an interrupted client turn.  If
@@ -1988,73 +2159,7 @@ impl FukidashiServer {
                 true,
             );
         }
-        let response = match self.workflow.next_pending_page(&claim.job_dir) {
-            Ok(None) => self.strict_review_ready(&claim.job_dir),
-            Ok(Some(next)) => {
-                let next_request = TranslationStartRequest {
-                    image_path: None,
-                    job_path: None,
-                    job_id: Some(
-                        claim
-                            .job_dir
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or_default()
-                            .to_owned(),
-                    ),
-                    ocr_mode: Some("local".into()),
-                    source_language: claim.source_language.clone(),
-                    target_language: claim.target_language.clone(),
-                    scope: None,
-                    sfx_mode: Some(if claim.replace_sfx {
-                        "replace".into()
-                    } else {
-                        "preserve".into()
-                    }),
-                };
-                self.prepare_strict_page(next, &next_request).await
-            }
-            Err(error) => Err(FukidashiError::InvalidInput(error.to_string())),
-        };
-        match response {
-            Ok(mut value) => {
-                value["completed_page"] = serde_json::json!(claim.page_number);
-                if value.get("current_page").is_none() {
-                    let total = claim.total_pages;
-                    emit_page_progress(total, total, "Review ready");
-                    attach_page_progress(&mut value, total, total, "Review ready");
-                }
-                json_result(&value, false)
-            }
-            Err(error) => {
-                let mut value = serde_json::json!({
-                    "protocol": "strict-v1",
-                    "status": "page_complete",
-                    "job_id": claim
-                        .job_dir
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default(),
-                    "completed_page": claim.page_number,
-                    "error": format!("page rendered but next page is not ready: {error}"),
-                    "next_action": {
-                        "tool": "fukidashi_translation_start",
-                        "arguments": {"job_id": claim
-                            .job_dir
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or_default()},
-                    }
-                });
-                attach_page_progress(
-                    &mut value,
-                    claim.page_number,
-                    claim.total_pages,
-                    "Page complete",
-                );
-                json_result(&value, true)
-            }
-        }
+        self.completed_translation_response(&claim, self.advance_strict_page(&claim).await, false)
     }
 
     #[tool(
@@ -2319,7 +2424,7 @@ impl FukidashiServer {
     }
     #[tool(
         name = "fukidashi_clean_page",
-        description = "Remove text strokes with LaMa. mode=full preserves page inference; mode=crop requires mask_path, text_regions, or a full analysis_path and avoids detection/OCR. sfx_mode=preserve (default) excludes structurally unmatched text-* regions from analysis-derived cleaning; use replace explicitly."
+        description = "Remove text strokes with LaMa. mode=full preserves page inference; mode=crop requires mask_path, text_regions, or a full analysis_path and avoids detection/OCR. An explicitly empty crop region list returns an actionable strict keep_source pass-through message instead of starting a heavy model. sfx_mode=preserve (default) excludes structurally unmatched text-* regions from analysis-derived cleaning; use replace explicitly."
     )]
     pub async fn clean_page(&self, Parameters(req): Parameters<CleanRequest>) -> CallToolResult {
         let image_path = match path(&req.image_path) {
@@ -2381,7 +2486,10 @@ impl FukidashiServer {
         }
         if mode == "crop" && mask_path.is_none() && text_regions.is_empty() {
             return json_result(
-                &serde_json::json!({"error":"crop cleaning requires mask_path, text_regions, or analysis_path"}),
+                &serde_json::json!({
+                    "error": "crop cleaning has no eligible regions; provide mask_path/text_regions or use strict fukidashi_translation_submit with keep_source=true for an explicit source pass-through",
+                    "next_action": "do not retry crop cleaning with an empty region list"
+                }),
                 true,
             );
         }
@@ -3275,7 +3383,7 @@ impl ServerHandler for FukidashiServer {
                 fukidashi_translation_start with one source image, job_path, or job_id, then call \
                 fukidashi_get_lore (or use the page_ready lore template) before the first submit and \
                 fukidashi_put_lore for known names, pronouns, and glossary terms; flag unknown speakers \
-                with needs_review=true. Lore is client-authored and this server never invokes an LLM. \
+                with needs_review=true. A compact lore example is {schema:1,characters:[\"Fuyu\"],pronouns:[],glossary:[{source:\"proprietress\",target:\"bà chủ\"}]}; character name strings are returned canonically as {id,names,notes}. Lore is client-authored and this server never invokes an LLM. \
                 fukidashi_translation_submit with only the returned work_token and one structured decision for \
                 each required_translation_ids entry. The server owns page selection, analysis, clean, typeset, \
                 stage reuse, model release, and advancement. sfx_mode=preserve is the default: structurally \
@@ -3363,6 +3471,11 @@ mod tests {
         assert!(instructions.contains("external releases"));
         assert!(instructions.contains("Source language"));
         assert!(instructions.contains("after approval"));
+        assert!(instructions.contains("characters:[\"Fuyu\"]"));
+        assert!(
+            instructions
+                .contains("character name strings are returned canonically as {id,names,notes}")
+        );
     }
 
     fn test_config(root: &std::path::Path) -> Config {
@@ -3641,6 +3754,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(initial_lore["lore"]["schema"], 1);
+        let natural_lore = server
+            .put_lore(Parameters(PutLoreRequest {
+                job_id: job_id.clone(),
+                lore: serde_json::json!({
+                    "schema": 1,
+                    "characters": ["Fuyu", "Kuga", "Sosuke"],
+                    "pronouns": [],
+                    "glossary": [{"source":"proprietress","target":"bà chủ"}]
+                }),
+            }))
+            .await;
+        let natural_lore = extract_tool_json(natural_lore, "natural put lore").unwrap();
+        assert_eq!(natural_lore["lore"]["characters"][0]["id"], "fuyu");
+        assert_eq!(natural_lore["lore"]["characters"][1]["names"][0], "Kuga");
         let authored_lore = server
             .put_lore(Parameters(PutLoreRequest {
                 job_id: job_id.clone(),
@@ -3823,6 +3950,125 @@ mod tests {
         let value = extract_tool_json(result, "sfx-only start").unwrap();
         assert_eq!(value["status"], "review_ready");
         assert_eq!(value["auto_preserved_pages"], serde_json::json!([1]));
+    }
+
+    #[tokio::test]
+    async fn all_keep_source_submission_passes_through_and_advances_without_cleaning() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path());
+        let workflow = Workflow::new(config.jobs_dir()).unwrap();
+        let registration = workflow
+            .import_ingress_pages(
+                "silent-false-positives",
+                vec![
+                    (
+                        "page-1.png".into(),
+                        image::RgbImage::from_pixel(24, 24, image::Rgb([240, 240, 240])),
+                    ),
+                    (
+                        "page-2.png".into(),
+                        image::RgbImage::from_pixel(24, 24, image::Rgb([240, 240, 240])),
+                    ),
+                ],
+                serde_json::json!({"source":"test"}),
+            )
+            .unwrap();
+        let page_one = registration.expected_pages[0].clone();
+        let page_two = registration.expected_pages[1].clone();
+        workflow
+            .write_analysis_artifact(&page_one, &strict_fixture_analysis())
+            .unwrap();
+        workflow
+            .write_analysis_artifact(&page_two, &strict_fixture_analysis())
+            .unwrap();
+        let job_id = registration
+            .job_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let server = FukidashiServer::new(config).unwrap();
+        let started = server
+            .translation_start(Parameters(TranslationStartRequest {
+                job_id: Some(job_id.clone()),
+                ..Default::default()
+            }))
+            .await;
+        let started = extract_tool_json(started, "all-keep start").unwrap();
+        assert_eq!(started["status"], "page_ready");
+        let token = started["work_token"].as_str().unwrap().to_owned();
+        let submitted = server
+            .translation_submit(Parameters(TranslationSubmitRequest {
+                work_token: token,
+                translations: vec![TranslationSubmission {
+                    id: "bubble-1".into(),
+                    translation: None,
+                    keep_source: Some(true),
+                    needs_review: Some(true),
+                }],
+            }))
+            .await;
+        let submitted = extract_tool_json(submitted, "all-keep submit").unwrap();
+        assert_eq!(submitted["status"], "page_ready");
+        assert_eq!(submitted["completed_page"], 1);
+        assert_eq!(submitted["current_page"], 2);
+        assert_eq!(submitted["auto_preserved"], true);
+        assert_eq!(submitted["pass_through"], true);
+        assert_eq!(
+            submitted["next_action"]["tool"],
+            "fukidashi_translation_submit"
+        );
+        let page = server
+            .workflow
+            .managed_page(&registration.job_dir, &page_one)
+            .unwrap();
+        assert_eq!(page.state, "rendered");
+        assert!(
+            server
+                .workflow
+                .validate_clean_input(&page.cleaned_image)
+                .unwrap()
+                .passthrough
+        );
+        assert!(
+            server
+                .workflow
+                .validate_render_input(&page.rendered_image)
+                .is_ok()
+        );
+
+        let resumed = server
+            .translation_start(Parameters(TranslationStartRequest {
+                job_id: Some(job_id),
+                ..Default::default()
+            }))
+            .await;
+        let resumed = extract_tool_json(resumed, "all-keep resume").unwrap();
+        assert_eq!(resumed["status"], "page_ready");
+        assert_eq!(resumed["current_page"], 2);
+
+        let second = server
+            .translation_submit(Parameters(TranslationSubmitRequest {
+                work_token: resumed["work_token"].as_str().unwrap().into(),
+                translations: vec![TranslationSubmission {
+                    id: "bubble-1".into(),
+                    translation: None,
+                    keep_source: Some(true),
+                    needs_review: Some(false),
+                }],
+            }))
+            .await;
+        let second = extract_tool_json(second, "all-keep final submit").unwrap();
+        assert_eq!(second["status"], "review_ready");
+        assert_eq!(second["completed_page"], 2);
+        assert_eq!(second["auto_preserved"], true);
+        assert!(
+            server
+                .workflow
+                .next_pending_page(&registration.job_dir)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
