@@ -1,0 +1,5 @@
+﻿# Treat assets and templates as vendored so GitHub Language bar shows 100% Rust
+assets/** linguist-vendored
+*.html linguist-vendored
+*.iss linguist-vendored
+*.cmd linguist-vendored

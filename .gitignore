@@ -1,11 +1,12 @@
-target/
+﻿target/
 target/test-artifacts/
 *.onnx
 *.onnx_data
-models/
-runtime/
-outputs/
+/models/
+/runtime/
+/outputs/
 *.dll
 .mcp.json
 
 dist/
+

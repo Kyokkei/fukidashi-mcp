@@ -700,7 +700,10 @@ impl EditorState {
             if !tombstones.is_array() {
                 *tombstones = serde_json::Value::Array(Vec::new());
             }
-            tombstones.as_array_mut().expect("array initialized").push(tombstone);
+            tombstones
+                .as_array_mut()
+                .expect("array initialized")
+                .push(tombstone);
         }
         self.mark_page_dirty(page_index);
         true
