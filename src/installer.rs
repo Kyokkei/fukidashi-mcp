@@ -676,7 +676,7 @@ fn install_binary(source: &Path, destination: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let source_mode = fs::metadata(&source)?.permissions().mode();
+        let source_mode = fs::metadata(source)?.permissions().mode();
         let mut permissions = temp.as_file().metadata()?.permissions();
         permissions.set_mode(source_mode | 0o111);
         temp.as_file().set_permissions(permissions)?;

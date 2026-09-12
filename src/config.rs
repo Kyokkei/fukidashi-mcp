@@ -693,16 +693,16 @@ fn atomic_user_config(path: &Path, value: &UserConfig) -> Result<()> {
 fn platform_config_dir() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
-        return env::var_os("XDG_CONFIG_HOME")
+        env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
-            .unwrap_or_else(|| PathBuf::from("."));
+            .unwrap_or_else(|| PathBuf::from("."))
     }
     #[cfg(target_os = "macos")]
     {
-        return dirs::home_dir()
+        dirs::home_dir()
             .map(|p| p.join("Library/Application Support"))
-            .unwrap_or_else(|| PathBuf::from("."));
+            .unwrap_or_else(|| PathBuf::from("."))
     }
     #[cfg(target_os = "windows")]
     {
@@ -722,15 +722,15 @@ fn platform_config_file() -> PathBuf {
 fn platform_storage_root() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        return env::var_os("XDG_DATA_HOME")
+        env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|p| PathBuf::from(p).join(".local/share")))
             .or_else(dirs::data_local_dir)
-            .map(|p| p.join("Fukidashi"));
+            .map(|p| p.join("Fukidashi"))
     }
     #[cfg(target_os = "macos")]
     {
-        return dirs::home_dir().map(|p| p.join("Library/Application Support/Fukidashi"));
+        dirs::home_dir().map(|p| p.join("Library/Application Support/Fukidashi"))
     }
     #[cfg(target_os = "windows")]
     {

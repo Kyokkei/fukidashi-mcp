@@ -1048,7 +1048,7 @@ fn cuda_dependency_dirs(root: &Path) -> Vec<std::path::PathBuf> {
 }
 #[cfg(feature = "onnx")]
 static CUDA_PROVIDER_READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-#[cfg(feature = "onnx")]
+#[cfg(all(feature = "onnx", target_os = "windows"))]
 fn preload_cuda_provider(path: &Path) -> std::result::Result<(), String> {
     #[cfg(target_os = "windows")]
     {
