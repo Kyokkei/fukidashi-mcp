@@ -124,8 +124,8 @@ fn auto_ink_uses_clean_center_median_and_explicit_overrides() {
 #[test]
 fn gray_screentone_hole_uses_the_detector_ellipse_envelope() {
     let dir = tempdir().unwrap();
-    let font_path = dir.path().join("ComicNeue-Regular.ttf");
-    fs::write(&font_path, fukidashi_mcp::fonts::COMIC_NEUE_REGULAR.bytes).unwrap();
+    let font_path = dir.path().join("PatrickHand-Regular.ttf");
+    fs::write(&font_path, fukidashi_mcp::fonts::PATRICK_HAND_REGULAR.bytes).unwrap();
     let source = dir.path().join("screentone.png");
     let output = dir.path().join("screentone-rendered.png");
     let bubble = Rect {
