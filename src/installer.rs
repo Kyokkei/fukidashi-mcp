@@ -1,4 +1,4 @@
-//! Cross-client installation and rollback for the Fukidashi MCP server.
+﻿//! Cross-client installation and rollback for the Fukidashi MCP server.
 //!
 //! The installer owns the MCP/editor executable pair and writes only the
 //! Fukidashi MCP entry in each client's user configuration. Project-local
@@ -1279,7 +1279,8 @@ mod tests {
     #[test]
     fn generated_skills_use_established_name_and_frontmatter() {
         let content = skill_contents(Client::Claude);
-        assert!(content.starts_with("---\nname: fukidashi-comic-translation\n"));
+        let normalized = content.replace("\r\n", "\n");
+        assert!(normalized.starts_with("---\nname: fukidashi-comic-translation\n"));
         assert!(content.contains("description: "));
         assert!(content.contains(MANAGED_START));
         assert!(content.contains(MANAGED_END));
@@ -1330,3 +1331,4 @@ mod tests {
         assert!(error.contains("alongside"));
     }
 }
+
