@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 # 吹 Fukidashi MCP
 
@@ -22,12 +22,15 @@
 ## 📖 The Problem vs. The Fukidashi Solution
 
 * **The Old Way**: You screenshot manga pages, upload them to ChatGPT, copy the translated text into Photoshop, spend 4 hours manually healing backgrounds with the clone stamp, and manually format text boxes.
-* **The Fukidashi Way**: Tell your AI agent: *"Translate `D:\manga\ch01` to Vietnamese using Patrick Hand."* Fukidashi detects the speech bubbles, cleans the artwork with deep inpainting, transcribes Japanese text via local OCR, typesets the dialogue, and launches a native desktop review window.
+* **The Fukidashi Way**: Tell your AI agent in one single prompt:
+  > *"Hey, pull the latest chapter of Dandadan and translate it to Vietnamese using Patrick Hand."*
+  
+  Fukidashi auto-fetches the chapter from MangaDex (or any supported URL), detects speech bubbles, deeply inpaints backgrounds with LaMa, transcribes Japanese via local OCR, translates through your agent, typesets dialogue with dynamic box-fitting, and opens the native desktop QA editor for review and CBZ export.
 
 ```text
 ┌─────────────────┐       ┌─────────────────┐       ┌─────────────────┐
-│  Raw Japanese   │ ────► │  RT-DETR Model  │ ────► │     LaMa AI     │
-│   Manga Pages   │       │ (Bubble Detect) │       │ (Deep Inpaint)  │
+│  MangaDex Pull  │ ────► │  RT-DETR Model  │ ────► │     LaMa AI     │
+│  or Local Raw   │       │ (Bubble Detect) │       │ (Deep Inpaint)  │
 └─────────────────┘       └─────────────────┘       └────────┬────────┘
                                                              │
 ┌─────────────────┐       ┌─────────────────┐       ┌────────▼────────┐
@@ -45,6 +48,7 @@
 
 ## ✨ Features
 
+* 📥 **MangaDex & Direct URL Ingest (`fukidashi_pull_chapter`)**: Native search and chapter acquisition. Prompt your agent to grab the latest release automatically or pass any webcomic URL via gallery-dl integration.
 * 🎯 **RT-DETR Detection**: Neural bubble and vertical/horizontal text-line detection designed specifically for comic and manga layouts.
 * 🧹 **LaMa Deep Inpainting**: Seamlessly wipes Japanese dialogue and sound effects while preserving delicate linework, screentones, and character hair.
 * 🔍 **Multilingual Local OCR**: High-speed, local transcription for Japanese (Baberu Vision & Manga-OCR), Chinese, Korean, and Latin/English (PP-OCRv5/v6).

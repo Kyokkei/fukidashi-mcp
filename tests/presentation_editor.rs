@@ -615,7 +615,7 @@ fn removing_a_bubble_persists_tombstone_and_restores_source_pixels_on_render() {
     let font = workflow
         .materialize_bundled_font(
             &registration.job_dir,
-            &fukidashi_mcp::fonts::COMIC_NEUE_REGULAR,
+            &fukidashi_mcp::fonts::PATRICK_HAND_REGULAR,
         )
         .unwrap();
     let payload = TypesetPayload {
