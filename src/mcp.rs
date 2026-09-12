@@ -464,12 +464,32 @@ struct SavedTranslationItem {
     source_text: String,
     source_language: String,
     confidence: f32,
-    bbox: Rect,
+    /// Geometry is intentionally optional while a strict page is waiting for
+    /// the client's decision.  Silent OCR false positives can carry null or
+    /// degenerate geometry; an all-keep submission must still be able to use
+    /// the verified source pass-through.  The normal translation path
+    /// validates this field before constructing any typeset payload.
+    bbox: Option<Rect>,
     correction_applied: bool,
     status: String,
     translation: Option<String>,
     keep_source: bool,
     needs_review: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StrictTranslationSelection {
+    id: String,
+    text: String,
+    keep_source: bool,
+    needs_review: bool,
+}
+
+#[derive(Debug, Clone)]
+struct StrictSubmissionPlan {
+    all_items: Vec<SavedTranslationItem>,
+    items: Vec<SavedTranslationItem>,
+    selected: Vec<StrictTranslationSelection>,
 }
 
 fn read_saved_analysis(
@@ -556,15 +576,16 @@ fn saved_translation_items(
                 FukidashiError::InvalidInput(format!("translation item {id:?} has no source_text"))
             })?
             .to_owned();
-        let bbox = serde_json::from_value::<Rect>(
-            item.get("bbox").cloned().unwrap_or(serde_json::Value::Null),
-        )
-        .map_err(|error| {
-            FukidashiError::InvalidInput(format!(
-                "translation item {id:?} has invalid bbox: {error}"
-            ))
-        })?
-        .validate()?;
+        // Do not reject geometry while building the waiting-page contract.
+        // The strict all-keep path deliberately bypasses geometry, cleaner,
+        // and typesetter validation.  A normal/partial submission calls
+        // `strict_typeset_payloads`, which reports the original parse or
+        // validation error before mutating/persisting the handoff.
+        let bbox = item
+            .get("bbox")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Rect>(value).ok())
+            .and_then(|rect| rect.validate().ok());
         let confidence = item
             .get("confidence")
             .and_then(serde_json::Value::as_f64)
@@ -1320,11 +1341,11 @@ impl FukidashiServer {
             .map_err(|error| FukidashiError::InvalidInput(error.to_string()))
     }
 
-    fn apply_strict_translations(
-        analysis: &mut serde_json::Value,
+    fn validate_strict_submissions(
+        analysis: &serde_json::Value,
         claim: &TranslationClaim,
         submissions: &[TranslationSubmission],
-    ) -> Result<Vec<TypesetPayload>, FukidashiError> {
+    ) -> Result<StrictSubmissionPlan, FukidashiError> {
         let all_items = saved_translation_items(analysis)?;
         let items = translatable_items(&all_items, claim.replace_sfx);
         let index_by_id = items
@@ -1381,7 +1402,12 @@ impl FukidashiServer {
                 }
                 text.to_owned()
             };
-            selected.push((id.to_owned(), text, keep_source, needs_review));
+            selected.push(StrictTranslationSelection {
+                id: id.to_owned(),
+                text,
+                keep_source,
+                needs_review,
+            });
         }
         if seen != claim.item_ids {
             let missing = claim
@@ -1394,12 +1420,18 @@ impl FukidashiServer {
                 missing.join(", ")
             )));
         }
-        let bubble_bboxes = items
-            .iter()
-            .map(|item| {
-                analysis_bubble_bbox(analysis, &item.id).map(|bbox| (item.id.clone(), bbox))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        Ok(StrictSubmissionPlan {
+            all_items,
+            items,
+            selected,
+        })
+    }
+
+    fn apply_strict_handoff(
+        analysis: &mut serde_json::Value,
+        claim: &TranslationClaim,
+        plan: &StrictSubmissionPlan,
+    ) -> Result<(), FukidashiError> {
         let item_values = analysis
             .get_mut("translation_handoff")
             .and_then(|handoff| handoff.get_mut("items"))
@@ -1409,64 +1441,32 @@ impl FukidashiServer {
                     "analysis checkpoint has no mutable translation items".into(),
                 )
             })?;
-        let mut payloads = Vec::with_capacity(selected.len());
-        for (id, text, keep_source, needs_review) in selected {
+        for selection in &plan.selected {
             let item = item_values
                 .iter_mut()
                 .find(|item| {
-                    item.get("id").and_then(serde_json::Value::as_str) == Some(id.as_str())
+                    item.get("id").and_then(serde_json::Value::as_str)
+                        == Some(selection.id.as_str())
                 })
                 .ok_or_else(|| {
-                    FukidashiError::InvalidInput(format!("translation id {id:?} disappeared"))
+                    FukidashiError::InvalidInput(format!(
+                        "translation id {:?} disappeared",
+                        selection.id
+                    ))
                 })?;
-            item["translation"] = serde_json::Value::String(text.clone());
-            item["keep_source"] = serde_json::Value::Bool(keep_source);
-            item["needs_review"] = serde_json::Value::Bool(needs_review);
+            item["translation"] = serde_json::Value::String(selection.text.clone());
+            item["keep_source"] = serde_json::Value::Bool(selection.keep_source);
+            item["needs_review"] = serde_json::Value::Bool(selection.needs_review);
             item["status"] = serde_json::Value::String(
-                if needs_review {
+                if selection.needs_review {
                     "needs_review"
-                } else if keep_source {
+                } else if selection.keep_source {
                     "keep_source"
                 } else {
                     "translated"
                 }
                 .into(),
             );
-            let bbox = serde_json::from_value::<Rect>(item["bbox"].clone())?.validate()?;
-            let bubble_bbox = bubble_bboxes.get(&id).copied().flatten();
-            payloads.push(TypesetPayload {
-                id: Some(id.clone()),
-                source_text: item
-                    .get("source_text")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                kind: item
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                preserve_by_default: item
-                    .get("preserve_by_default")
-                    .and_then(serde_json::Value::as_bool),
-                needs_review: Some(needs_review),
-                // Model uncertainty is advisory. Only an explicit editor flag
-                // or problem is an approval blocker.
-                flagged: None,
-                preserve_source: Some(keep_source),
-                fallback_font_paths: Vec::new(),
-                bbox,
-                bubble_bbox,
-                text_bbox: None,
-                padding: None,
-                text,
-                font_path: None,
-                min_font_size: None,
-                max_font_size: None,
-                text_color: item
-                    .get("text_color")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned),
-                shape: None,
-            });
         }
         if !claim.replace_sfx {
             for item in item_values.iter_mut() {
@@ -1499,12 +1499,106 @@ impl FukidashiServer {
             "preserved_count": if claim.replace_sfx {
                 0
             } else {
-                all_items
+                plan.all_items
                     .iter()
                     .filter(|item| item.preserve_by_default)
                     .count()
             },
         });
+        Ok(())
+    }
+
+    fn strict_typeset_payloads(
+        analysis: &serde_json::Value,
+        plan: &StrictSubmissionPlan,
+    ) -> Result<Vec<TypesetPayload>, FukidashiError> {
+        let bubble_bboxes = plan
+            .items
+            .iter()
+            .map(|item| {
+                analysis_bubble_bbox(analysis, &item.id).map(|bbox| (item.id.clone(), bbox))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let item_values = analysis
+            .get("translation_handoff")
+            .and_then(|handoff| handoff.get("items"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                FukidashiError::InvalidInput("analysis checkpoint has no translation items".into())
+            })?;
+        let mut payloads = Vec::with_capacity(plan.selected.len());
+        for selection in &plan.selected {
+            let item = item_values
+                .iter()
+                .find(|item| {
+                    item.get("id").and_then(serde_json::Value::as_str)
+                        == Some(selection.id.as_str())
+                })
+                .ok_or_else(|| {
+                    FukidashiError::InvalidInput(format!(
+                        "translation id {:?} disappeared",
+                        selection.id
+                    ))
+                })?;
+            let raw_bbox = item.get("bbox").cloned().unwrap_or(serde_json::Value::Null);
+            let bbox = serde_json::from_value::<Rect>(raw_bbox)
+                .map_err(|error| {
+                    FukidashiError::InvalidInput(format!(
+                        "translation item {:?} has invalid bbox: {error}",
+                        selection.id
+                    ))
+                })?
+                .validate()?;
+            let bubble_bbox = bubble_bboxes.get(&selection.id).copied().flatten();
+            payloads.push(TypesetPayload {
+                id: Some(selection.id.clone()),
+                source_text: item
+                    .get("source_text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                kind: item
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                preserve_by_default: item
+                    .get("preserve_by_default")
+                    .and_then(serde_json::Value::as_bool),
+                needs_review: Some(selection.needs_review),
+                // Model uncertainty is advisory. Only an explicit editor flag
+                // or problem is an approval blocker.
+                flagged: None,
+                preserve_source: Some(selection.keep_source),
+                fallback_font_paths: Vec::new(),
+                bbox,
+                bubble_bbox,
+                text_bbox: None,
+                padding: None,
+                min_font_size: None,
+                max_font_size: None,
+                text: selection.text.clone(),
+                font_path: None,
+                text_color: item
+                    .get("text_color")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                shape: None,
+            });
+        }
+        Ok(payloads)
+    }
+
+    #[cfg(test)]
+    fn apply_strict_translations(
+        analysis: &mut serde_json::Value,
+        claim: &TranslationClaim,
+        submissions: &[TranslationSubmission],
+    ) -> Result<Vec<TypesetPayload>, FukidashiError> {
+        let plan = Self::validate_strict_submissions(analysis, claim, submissions)?;
+        // Validate all geometry before mutating the handoff.  This preserves
+        // retry semantics for a normal/partial submission while allowing the
+        // caller to deliberately skip this step for all-keep pass-through.
+        let payloads = Self::strict_typeset_payloads(analysis, &plan)?;
+        Self::apply_strict_handoff(analysis, claim, &plan)?;
         Ok(payloads)
     }
 }
@@ -1994,11 +2088,26 @@ impl FukidashiServer {
             Ok(value) => value,
             Err(error) => return fail(self, error),
         };
-        let payloads =
-            match Self::apply_strict_translations(&mut analysis, &claim, &req.translations) {
-                Ok(payloads) => payloads,
+        // Validate stable IDs and decision fields before touching geometry.
+        // This lets an exact all-keep submission take the source pass-through
+        // even when a silent-page false positive has null/degenerate bboxes.
+        let plan = match Self::validate_strict_submissions(&analysis, &claim, &req.translations) {
+            Ok(plan) => plan,
+            Err(error) => return fail(self, error),
+        };
+        let all_keep_source = !plan.selected.is_empty()
+            && plan.selected.iter().all(|selection| selection.keep_source);
+        let payloads = if all_keep_source {
+            None
+        } else {
+            match Self::strict_typeset_payloads(&analysis, &plan) {
+                Ok(payloads) => Some(payloads),
                 Err(error) => return fail(self, error),
-            };
+            }
+        };
+        if let Err(error) = Self::apply_strict_handoff(&mut analysis, &claim, &plan) {
+            return fail(self, error);
+        }
         if let Err(error) = self
             .workflow
             .write_analysis_artifact(&claim.source_image, &analysis)
@@ -2025,10 +2134,6 @@ impl FukidashiServer {
         // eligible crop list is a verified pass-through rather than an
         // inpainting request.  The handoff is already persisted above, so a
         // failure here leaves the claim retryable with the same token.
-        let all_keep_source = !payloads.is_empty()
-            && payloads
-                .iter()
-                .all(|payload| payload.preserve_source == Some(true));
         if all_keep_source {
             emit_page_progress(
                 claim.page_number,
@@ -2129,7 +2234,7 @@ impl FukidashiServer {
         );
         let typeset_request = TypesetRequest {
             image_path: cleaned_path.display().to_string(),
-            bubbles: payloads,
+            bubbles: payloads.expect("normal strict submissions have payloads"),
             font_path: None,
             padding: None,
             min_font_size: None,
@@ -3721,6 +3826,40 @@ mod tests {
         assert_eq!(saved[1]["translation"], "dịch");
     }
 
+    #[test]
+    fn strict_partial_submission_rejects_invalid_geometry_before_handoff() {
+        let mut analysis = strict_fixture_analysis();
+        analysis["translation_handoff"]["items"][0]["bbox"] = serde_json::Value::Null;
+        let claim = TranslationClaim {
+            job_dir: PathBuf::from("C:/jobs/job"),
+            source_image: PathBuf::from("C:/source/page.png"),
+            page_number: 1,
+            total_pages: 1,
+            analysis_path: PathBuf::from("C:/jobs/job/pages/0001/analysis.json"),
+            analysis_sha256: "hash".into(),
+            item_ids: ["bubble-1".into()].into_iter().collect(),
+            source_language: Some("ja".into()),
+            target_language: Some("vi".into()),
+            replace_sfx: false,
+            in_progress: true,
+            consumed: false,
+        };
+        let error = FukidashiServer::apply_strict_translations(
+            &mut analysis,
+            &claim,
+            &[TranslationSubmission {
+                id: "bubble-1".into(),
+                translation: Some("dịch".into()),
+                keep_source: Some(false),
+                needs_review: Some(false),
+            }],
+        )
+        .expect_err("partial translation must still validate its bbox");
+        assert!(error.to_string().contains("invalid bbox"));
+        assert_eq!(analysis["translation_handoff"]["status"], "pending");
+        assert!(analysis["translation_handoff"]["items"][0]["translation"].is_null());
+    }
+
     #[tokio::test]
     async fn strict_start_resumes_saved_analysis_without_inference_or_artifact_paths() {
         let temp = tempfile::tempdir().unwrap();
@@ -3953,7 +4092,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_keep_source_submission_passes_through_and_advances_without_cleaning() {
+    async fn all_keep_source_with_invalid_geometry_passes_through_and_advances() {
         let temp = tempfile::tempdir().unwrap();
         let config = test_config(temp.path());
         let workflow = Workflow::new(config.jobs_dir()).unwrap();
@@ -3975,8 +4114,12 @@ mod tests {
             .unwrap();
         let page_one = registration.expected_pages[0].clone();
         let page_two = registration.expected_pages[1].clone();
+        let mut invalid_geometry_analysis = strict_fixture_analysis();
+        invalid_geometry_analysis["translation_handoff"]["items"][0]["bbox"] =
+            serde_json::Value::Null;
+        invalid_geometry_analysis["bubbles"][0]["bbox"] = serde_json::Value::Null;
         workflow
-            .write_analysis_artifact(&page_one, &strict_fixture_analysis())
+            .write_analysis_artifact(&page_one, &invalid_geometry_analysis)
             .unwrap();
         workflow
             .write_analysis_artifact(&page_two, &strict_fixture_analysis())
