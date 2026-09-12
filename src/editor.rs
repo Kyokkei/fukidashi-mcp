@@ -19,7 +19,13 @@ use uuid::Uuid;
 use crate::domain::{Rect, TypesetPayload};
 
 const MAX_REQUEST: usize = 4 * 1024 * 1024;
+// Editor state for ad-hoc loopback sessions remains deliberately small.
 const MAX_JSON: usize = 2 * 1024 * 1024;
+// A managed review is reconstructed from the server-owned manifest and render
+// sidecars. The browser still carries that complete state on save/render, so
+// large jobs need room for all pages and their OCR metadata. The state still
+// has a hard bound so a corrupt manifest cannot allocate forever.
+const MAX_MANAGED_STATE_JSON: usize = 16 * 1024 * 1024;
 // Keep the review UI embedded so the loopback editor has no CDN dependency.
 const EDITOR_HTML: &str = include_str!("../assets/editor.html");
 
@@ -77,6 +83,9 @@ struct Session {
     /// outside the jobs directory, while every other filesystem path remains
     /// rejected by the editor boundary.
     allowed_source_paths: Vec<PathBuf>,
+    /// Managed projects are server-reconstructed and may use the larger,
+    /// still-bounded state budget. Ad-hoc loopback sessions retain MAX_JSON.
+    server_owned_state: bool,
     review: Arc<ReviewChannel>,
 }
 
@@ -96,6 +105,7 @@ pub fn serve_editor_with_allowed_sources(
         .parent()
         .ok_or_else(|| anyhow!("editor image has no parent"))?;
     let root_dir = managed_editor_root(parent);
+    let server_owned_state = is_managed_editor_root(&root_dir);
     track_editor_root(&root_dir);
     let state_path = root_dir.join("project.json");
     let mut initial_state = normalize_editor_state(json_data)?;
@@ -112,7 +122,7 @@ pub fn serve_editor_with_allowed_sources(
             );
         }
     }
-    validate_state(&initial_state)?;
+    validate_state_for_session(server_owned_state, &initial_state)?;
     validate_project_paths_for_root(&root_dir, &initial_state, &allowed_source_paths)?;
     atomic_json_save(&state_path, &initial_state)?;
     let review_path = review_file(&root_dir);
@@ -220,6 +230,7 @@ pub fn serve_editor_with_allowed_sources(
         state_path: state_path.clone(),
         initial_state,
         allowed_source_paths,
+        server_owned_state,
         review,
     });
     let worker = Arc::clone(&session);
@@ -259,6 +270,18 @@ fn managed_editor_root(artifact_parent: &Path) -> PathBuf {
             return artifact_parent.to_path_buf();
         }
         candidate = parent.to_path_buf();
+    }
+}
+
+fn is_managed_editor_root(root: &Path) -> bool {
+    root.join("job.json").is_file() || root.join(".fukidashi-job.json").is_file()
+}
+
+fn editor_json_limit(server_owned_state: bool) -> usize {
+    if server_owned_state {
+        MAX_MANAGED_STATE_JSON
+    } else {
+        MAX_JSON
     }
 }
 
@@ -842,6 +865,7 @@ pub fn render_editor_page(
         state_path: root_dir.join("project.json"),
         initial_state: normalize_editor_state(state.clone())?,
         allowed_source_paths,
+        server_owned_state: is_managed_editor_root(&root_dir),
         review: Arc::new(ReviewChannel {
             state: Mutex::new(ReviewState {
                 review_session_id: "native".to_owned(),
@@ -861,7 +885,8 @@ pub fn render_editor_page(
     if !state_revision_matches(&current, state) {
         bail!("stale editor state: reload the project before rendering");
     }
-    validate_state(state).context("invalid editor state")?;
+    validate_state_for_session(session.server_owned_state, state)
+        .context("invalid editor state")?;
     validate_project_paths(&session, state).context("invalid editor paths")?;
     render_page(&session, state, index)
 }
@@ -990,18 +1015,22 @@ fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
     if !path.starts_with(&format!("/{}/", session.token)) {
         return respond(&mut stream, 404, "text/plain", b"not found");
     }
-    if content_length > MAX_JSON {
+    let max_body = editor_json_limit(session.server_owned_state);
+    if content_length > max_body {
         return respond(&mut stream, 413, "text/plain", b"request too large");
     }
     let body_start = header_end + 4;
     let mut body = bytes[body_start..].to_vec();
+    if body.len() > max_body {
+        return respond(&mut stream, 413, "text/plain", b"request too large");
+    }
     while body.len() < content_length {
         let count = stream.read(&mut buf)?;
         if count == 0 {
             break;
         }
         body.extend_from_slice(&buf[..count]);
-        if body.len() > MAX_JSON {
+        if body.len() > max_body {
             return respond(&mut stream, 413, "text/plain", b"request too large");
         }
     }
@@ -1095,7 +1124,9 @@ fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
             }
             let mut value = value;
             mark_render_dirty_changes(&current, &mut value);
-            if validate_state(&value).is_err() || validate_project_paths(session, &value).is_err() {
+            if validate_state_for_session(session.server_owned_state, &value).is_err()
+                || validate_project_paths(session, &value).is_err()
+            {
                 return respond(&mut stream, 400, "text/plain", b"invalid editor state");
             }
             let next_revision = state_revision(&current).saturating_add(1);
@@ -1221,7 +1252,9 @@ fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
                 Ok(index) => index,
                 Err(_) => return respond(&mut stream, 400, "text/plain", b"invalid page index"),
             };
-            if validate_state(&state).is_err() || validate_project_paths(session, &state).is_err() {
+            if validate_state_for_session(session.server_owned_state, &state).is_err()
+                || validate_project_paths(session, &state).is_err()
+            {
                 return respond(&mut stream, 400, "text/plain", b"invalid editor state");
             }
             let result = match render_page(session, &state, index) {
@@ -1243,12 +1276,14 @@ fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
 }
 
 fn load_state(session: &Session) -> Result<Value> {
-    if session.state_path.exists() {
+    let state = if session.state_path.exists() {
         let bytes = fs::read(&session.state_path).context("read editor state")?;
         normalize_editor_state(serde_json::from_slice(&bytes).context("parse editor state")?)
     } else {
         normalize_editor_state(session.initial_state.clone())
-    }
+    }?;
+    validate_state_for_session(session.server_owned_state, &state)?;
+    Ok(state)
 }
 
 fn state_revision(state: &Value) -> u64 {
@@ -2319,7 +2354,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             .cloned()
             .unwrap_or_else(|| Value::Array(Vec::new()));
     }
-    validate_state(&saved_state)?;
+    validate_state_for_session(session.server_owned_state, &saved_state)?;
     atomic_json_save(&session.state_path, &saved_state)?;
     atomic_json_save(
         &translation_manifest_path(&session.state_path),
@@ -2496,10 +2531,14 @@ fn respond(stream: &mut TcpStream, code: u16, content_type: &str, body: &[u8]) -
     Ok(())
 }
 
-fn validate_state(value: &Value) -> Result<()> {
+fn validate_state_for_session(server_owned_state: bool, value: &Value) -> Result<()> {
+    validate_state_with_limit(value, editor_json_limit(server_owned_state))
+}
+
+fn validate_state_with_limit(value: &Value, max_json: usize) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
-    if bytes.len() > MAX_JSON {
-        bail!("editor state exceeds {} bytes", MAX_JSON);
+    if bytes.len() > max_json {
+        bail!("editor state exceeds {} bytes", max_json);
     }
     fn visit(value: &Value) -> Result<()> {
         match value {
@@ -2657,6 +2696,55 @@ mod tests {
                 .contains("const renderState=JSON.stringify({page_index:renderPageIndex,state})")
         );
         assert!(EDITOR_HTML.contains("e.status===409"));
+    }
+
+    #[test]
+    fn managed_state_budget_is_bounded_without_expanding_ad_hoc_budget() {
+        let state = json!({
+            "schema_version": 1,
+            "pages": [],
+            "metadata": "x".repeat(MAX_JSON + 1),
+        });
+        assert!(validate_state_for_session(false, &state).is_err());
+        assert!(validate_state_for_session(true, &state).is_ok());
+
+        let oversized = json!({
+            "schema_version": 1,
+            "pages": [],
+            "metadata": "x".repeat(MAX_MANAGED_STATE_JSON + 1),
+        });
+        assert!(validate_state_for_session(true, &oversized).is_err());
+    }
+
+    #[test]
+    fn managed_editor_root_requires_a_known_job_marker() {
+        let dir = tempdir().unwrap();
+        assert!(!is_managed_editor_root(dir.path()));
+
+        fs::write(dir.path().join("job.json"), b"{}").unwrap();
+        assert!(is_managed_editor_root(dir.path()));
+
+        fs::remove_file(dir.path().join("job.json")).unwrap();
+        fs::write(dir.path().join(".fukidashi-job.json"), b"{}").unwrap();
+        assert!(is_managed_editor_root(dir.path()));
+    }
+
+    #[test]
+    fn request_and_save_validation_share_the_managed_state_budget() {
+        let state = json!({
+            "state_revision": 0,
+            "pages": [],
+            "metadata": "x".repeat(MAX_JSON + 1),
+        });
+        let body = serde_json::to_vec(&state).unwrap();
+        assert!(body.len() > MAX_JSON);
+        assert!(body.len() < MAX_MANAGED_STATE_JSON);
+        assert_eq!(editor_json_limit(false), MAX_JSON);
+        assert_eq!(editor_json_limit(true), MAX_MANAGED_STATE_JSON);
+        assert!(body.len() > editor_json_limit(false));
+        assert!(body.len() <= editor_json_limit(true));
+        assert!(validate_state_for_session(false, &state).is_err());
+        assert!(validate_state_for_session(true, &state).is_ok());
     }
 
     #[test]
