@@ -1,4 +1,4 @@
-﻿//! Cross-client installation and rollback for the Fukidashi MCP server.
+//! Cross-client installation and rollback for the Fukidashi MCP server.
 //!
 //! The installer owns the MCP/editor executable pair and writes only the
 //! Fukidashi MCP entry in each client's user configuration. Project-local
@@ -1331,4 +1331,3 @@ mod tests {
         assert!(error.contains("alongside"));
     }
 }
-
