@@ -42,7 +42,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 which = "6"
 
 # Editor-only deps (feature-gated so the headless MCP binary stays lean).
-eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "persistence"] }
+eframe = { version = "0.31", optional = true, default-features = false, features = ["glow", "persistence", "wayland", "x11"] }
 egui = { version = "0.31", optional = true }
 egui_extras = { version = "0.31", optional = true, features = ["image"] }
 rfd = { version = "0.15", optional = true }
