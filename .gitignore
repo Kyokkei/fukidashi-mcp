@@ -7,3 +7,5 @@ runtime/
 outputs/
 *.dll
 .mcp.json
+
+dist/
