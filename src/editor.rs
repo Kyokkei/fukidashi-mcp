@@ -611,7 +611,9 @@ fn submit_review(session: &Session, request: &Value) -> Result<Value> {
                     .ok_or_else(|| anyhow!("managed editor job has no jobs root"))?;
                 crate::workflow::Workflow::new(jobs_root.to_path_buf())?
                     .validate_editor_completeness(&session.root_dir, &project)
-                    .context("managed review completeness validation")?;
+                    .map_err(|error| {
+                        anyhow!("managed review completeness validation: {error:#}")
+                    })?;
             }
             current.approved_pages = pages;
             current.status = "approved".to_owned();

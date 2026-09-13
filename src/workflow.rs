@@ -2103,7 +2103,7 @@ impl Workflow {
                 expected_pages.len()
             );
         }
-        for source in expected_pages {
+        for (page_index, source) in expected_pages.into_iter().enumerate() {
             let page = manifest
                 .pages
                 .get(&page_key(&source))
@@ -2113,7 +2113,13 @@ impl Workflow {
                 .as_ref()
                 .ok_or_else(|| anyhow!("expected page is not rendered: {}", source.display()))?;
             let artifact = self.validate_render_input(rendered)?;
-            validate_typeset_completeness(&job, &source, &artifact.typeset)?;
+            validate_typeset_completeness(&job, &source, &artifact.typeset).with_context(|| {
+                format!(
+                    "page {} completeness ({})",
+                    page_index + 1,
+                    source.display()
+                )
+            })?;
         }
         Ok(())
     }
