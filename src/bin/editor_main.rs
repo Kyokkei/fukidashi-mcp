@@ -40,6 +40,14 @@ struct Cli {
     /// reuses the existing `review.json` instead of minting a fresh session.
     #[arg(long)]
     review_session_id: Option<String>,
+
+    /// Review revision paired with `--review-session-id`.
+    #[arg(long)]
+    review_revision: Option<u64>,
+
+    /// Lease reserved by the MCP parent and handed off to this process.
+    #[arg(long)]
+    editor_lease: Option<PathBuf>,
 }
 
 fn main() {
@@ -55,6 +63,47 @@ fn run() -> i32 {
                 "cannot resolve job directory {}: {error}",
                 cli.job_dir.display()
             );
+            return EXIT_ERROR;
+        }
+    };
+
+    let _lease = match (&cli.editor_lease, &cli.review_session_id) {
+        (Some(path), Some(session_id)) => {
+            let revision = cli.review_revision.or_else(|| {
+                fukidashi_mcp::editor::read_review(&job_dir).map(|review| review.revision)
+            });
+            let Some(revision) = revision else {
+                eprintln!("cannot adopt native editor lease without a review revision");
+                return EXIT_ERROR;
+            };
+            match fukidashi_mcp::editor::adopt_editor_lease(path, session_id, revision) {
+                Ok(lease) => Some(lease),
+                Err(error) => {
+                    eprintln!("cannot adopt native editor lease: {error}");
+                    return EXIT_ERROR;
+                }
+            }
+        }
+        (None, Some(session_id)) => {
+            let revision = cli.review_revision.or_else(|| {
+                fukidashi_mcp::editor::read_review(&job_dir).map(|review| review.revision)
+            });
+            match revision {
+                Some(revision) => match fukidashi_mcp::editor::acquire_native_editor_lease(
+                    &job_dir, session_id, revision,
+                ) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        eprintln!("cannot acquire native editor lease: {error}");
+                        return EXIT_ERROR;
+                    }
+                },
+                None => None,
+            }
+        }
+        (None, None) => None,
+        (Some(_), None) => {
+            eprintln!("--editor-lease requires --review-session-id");
             return EXIT_ERROR;
         }
     };

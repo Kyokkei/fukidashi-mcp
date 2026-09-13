@@ -5,14 +5,17 @@
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use uuid::Uuid;
 
@@ -32,6 +35,64 @@ const EDITOR_HTML: &str = include_str!("../assets/editor.html");
 
 const REVIEW_FILE: &str = "review.json";
 const REVIEW_AUDIT_FILE: &str = "review-audit.json";
+const EDITOR_LEASE_FILE: &str = ".fukidashi-editor.lock";
+
+#[derive(Debug, Clone)]
+struct EditorLeaseInfo {
+    pid: u32,
+    review_session_id: Option<String>,
+    revision: Option<u64>,
+}
+
+/// A cross-process lease for one native editor. The MCP process reserves this
+/// lease while it transitions the review and starts the child, then hands it
+/// to the child PID before returning to the caller. The native binary adopts
+/// it and keeps the heartbeat alive for the entire window lifetime.
+pub struct NativeEditorLease {
+    path: PathBuf,
+    review_session_id: String,
+    revision: u64,
+    stop: Option<mpsc::Sender<()>>,
+    heartbeat: Option<thread::JoinHandle<()>>,
+    remove_on_drop: bool,
+}
+
+impl Drop for NativeEditorLease {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        if self.remove_on_drop {
+            remove_editor_lease_if_owner(&self.path, std::process::id());
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ActiveNativeEditor {
+    session_id: String,
+    revision: u64,
+    pid: u32,
+    alive: Arc<AtomicBool>,
+    child: Arc<Mutex<Child>>,
+}
+
+static ACTIVE_NATIVE_EDITORS: OnceLock<
+    Mutex<std::collections::HashMap<PathBuf, Arc<ActiveNativeEditor>>>,
+> = OnceLock::new();
+static EDITOR_LIFECYCLE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn active_native_editors()
+-> &'static Mutex<std::collections::HashMap<PathBuf, Arc<ActiveNativeEditor>>> {
+    ACTIVE_NATIVE_EDITORS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn editor_lifecycle_lock() -> &'static Mutex<()> {
+    EDITOR_LIFECYCLE_LOCK.get_or_init(|| Mutex::new(()))
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReviewState {
@@ -77,6 +138,530 @@ fn review_audit_file(root: &Path) -> PathBuf {
     root.join(REVIEW_AUDIT_FILE)
 }
 
+fn editor_lease_file(root: &Path) -> PathBuf {
+    root.join(EDITOR_LEASE_FILE)
+}
+
+fn write_editor_lease_metadata(
+    path: &Path,
+    pid: u32,
+    review_session_id: &str,
+    revision: u64,
+) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("write editor lease {}", path.display()))?;
+    writeln!(file, "pid={pid}")?;
+    writeln!(file, "review_session_id={review_session_id}")?;
+    writeln!(file, "revision={revision}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn read_editor_lease_info(path: &Path) -> Option<EditorLeaseInfo> {
+    let contents = fs::read_to_string(path).ok()?;
+    let pid = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid=")?.trim().parse::<u32>().ok())?;
+    let review_session_id = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("review_session_id=").map(str::to_owned));
+    let revision = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("revision=")?.trim().parse::<u64>().ok());
+    Some(EditorLeaseInfo {
+        pid,
+        review_session_id,
+        revision,
+    })
+}
+
+fn editor_process_is_alive(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0;
+        let result = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
+        unsafe { CloseHandle(handle) };
+        return result && code == STILL_ACTIVE as u32;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        return Path::new("/proc").join(pid.to_string()).exists();
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        return false;
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        false
+    }
+}
+
+fn remove_editor_lease_if_owner(path: &Path, pid: u32) {
+    if read_editor_lease_info(path).is_some_and(|info| info.pid == pid) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn start_editor_lease_heartbeat(
+    path: &Path,
+    review_session_id: &str,
+    revision: u64,
+) -> Result<(mpsc::Sender<()>, thread::JoinHandle<()>)> {
+    let (stop, receiver) = mpsc::channel();
+    let heartbeat_path = path.to_path_buf();
+    let session = review_session_id.to_owned();
+    let heartbeat = thread::Builder::new()
+        .name("fukidashi-editor-lease".to_owned())
+        .spawn(move || {
+            while receiver.recv_timeout(Duration::from_secs(30)).is_err() {
+                if write_editor_lease_metadata(
+                    &heartbeat_path,
+                    std::process::id(),
+                    &session,
+                    revision,
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .context("start editor lease heartbeat")?;
+    Ok((stop, heartbeat))
+}
+
+fn create_editor_lease(
+    path: PathBuf,
+    review_session_id: &str,
+    revision: u64,
+) -> Result<NativeEditorLease> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("reserve native editor lease {}", path.display()))?;
+    drop(file);
+    if let Err(error) =
+        write_editor_lease_metadata(&path, std::process::id(), review_session_id, revision)
+    {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+    let (stop, heartbeat) = match start_editor_lease_heartbeat(&path, review_session_id, revision) {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+    };
+    Ok(NativeEditorLease {
+        path,
+        review_session_id: review_session_id.to_owned(),
+        revision,
+        stop: Some(stop),
+        heartbeat: Some(heartbeat),
+        remove_on_drop: true,
+    })
+}
+
+fn try_reserve_editor_lease(
+    root: &Path,
+    review_session_id: &str,
+    revision: u64,
+) -> Result<EditorLeaseReservation> {
+    let path = editor_lease_file(root);
+    match create_editor_lease(path.clone(), review_session_id, revision) {
+        Ok(lease) => Ok(EditorLeaseReservation::Acquired(lease)),
+        Err(error)
+            if error
+                .root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) =>
+        {
+            if let Some(info) = read_editor_lease_info(&path)
+                && editor_process_is_alive(info.pid)
+            {
+                return Ok(EditorLeaseReservation::Active(info));
+            }
+            // Match the existing workflow lock's recovery rule: a readable
+            // dead PID is reclaimable immediately; malformed metadata is only
+            // reclaimed after a long age guard.
+            let stale = read_editor_lease_info(&path)
+                .is_some_and(|info| !editor_process_is_alive(info.pid))
+                || fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > Duration::from_secs(10 * 60));
+            if stale {
+                let _ = fs::remove_file(&path);
+                return try_reserve_editor_lease(root, review_session_id, revision);
+            }
+            // The owner writes the PID and heartbeat by truncating the small
+            // metadata file. A reader can briefly observe the file between
+            // truncate and write; wait for that publication instead of
+            // reclaiming or reporting a false lease conflict.
+            Ok(EditorLeaseReservation::ActiveMetadataPending)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+enum EditorLeaseReservation {
+    Acquired(NativeEditorLease),
+    Active(EditorLeaseInfo),
+    ActiveMetadataPending,
+}
+
+impl NativeEditorLease {
+    fn update_metadata(&mut self, review_session_id: &str, revision: u64) -> Result<()> {
+        write_editor_lease_metadata(&self.path, std::process::id(), review_session_id, revision)?;
+        self.review_session_id = review_session_id.to_owned();
+        self.revision = revision;
+        Ok(())
+    }
+
+    fn handoff_to_child(mut self, child_pid: u32) -> Result<()> {
+        let Some(stop) = self.stop.take() else {
+            bail!("native editor lease is already handed off");
+        };
+        let _ = stop.send(());
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        if let Err(error) = write_editor_lease_metadata(
+            &self.path,
+            child_pid,
+            &self.review_session_id,
+            self.revision,
+        ) {
+            return Err(error);
+        }
+        self.remove_on_drop = false;
+        std::mem::forget(self);
+        Ok(())
+    }
+}
+
+/// Adopt the reservation handed off by the MCP parent process. The native
+/// process becomes the lease owner before creating its window.
+pub fn adopt_editor_lease(
+    path: &Path,
+    review_session_id: &str,
+    revision: u64,
+) -> Result<NativeEditorLease> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let Some(info) = read_editor_lease_info(path) else {
+            if Instant::now() >= deadline {
+                bail!("native editor lease metadata is missing");
+            }
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        };
+        if info.pid == std::process::id() {
+            if info.review_session_id.as_deref() != Some(review_session_id)
+                || info.revision != Some(revision)
+            {
+                bail!("native editor lease does not match the requested review");
+            }
+            break;
+        }
+        if !editor_process_is_alive(info.pid) {
+            // The parent can die between spawn and handoff. Reclaiming its
+            // dead reservation lets the child still protect its own window.
+            write_editor_lease_metadata(path, std::process::id(), review_session_id, revision)?;
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("native editor lease is owned by process {}", info.pid);
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (stop, heartbeat) = start_editor_lease_heartbeat(path, review_session_id, revision)?;
+    Ok(NativeEditorLease {
+        path: path.to_path_buf(),
+        review_session_id: review_session_id.to_owned(),
+        revision,
+        stop: Some(stop),
+        heartbeat: Some(heartbeat),
+        remove_on_drop: true,
+    })
+}
+
+/// Reserve a lease for a native editor launched outside the MCP parent.
+pub fn acquire_native_editor_lease(
+    root: &Path,
+    review_session_id: &str,
+    revision: u64,
+) -> Result<NativeEditorLease> {
+    match try_reserve_editor_lease(root, review_session_id, revision)? {
+        EditorLeaseReservation::Acquired(lease) => Ok(lease),
+        EditorLeaseReservation::Active(info) => {
+            bail!(
+                "native editor lease is already owned by process {}",
+                info.pid
+            )
+        }
+        EditorLeaseReservation::ActiveMetadataPending => {
+            bail!("native editor lease metadata is being published")
+        }
+    }
+}
+
+fn native_editor_response(
+    root_dir: &Path,
+    state_path: &Path,
+    review_path: &Path,
+    review_state: &ReviewState,
+    native_binary: Option<&Path>,
+    reused: bool,
+) -> Value {
+    let mut response = json!({
+        "editor_kind": "native",
+        "url": format!("native://{}", root_dir.display()),
+        "native_binary": native_binary.map_or(Value::Null, |path| json!(path)),
+        "persistence_path": state_path,
+        "session_token": Value::Null,
+        "review_session_id": review_state.review_session_id,
+        "review_revision": review_state.revision,
+        "review_path": review_path,
+    });
+    if reused {
+        response["reused"] = Value::Bool(true);
+        response["message"] =
+            Value::String("native editor already open; reused the active review".to_owned());
+    }
+    response
+}
+
+fn local_native_editor_for_review(
+    root_dir: &Path,
+    review_state: &ReviewState,
+) -> Option<Arc<ActiveNativeEditor>> {
+    let mut active = active_native_editors().lock().ok()?;
+    let Some(entry) = active.get(root_dir).cloned() else {
+        return None;
+    };
+    if native_child_has_exited(&entry) {
+        active.remove(root_dir);
+        return None;
+    }
+    if entry.session_id == review_state.review_session_id && entry.revision == review_state.revision
+    {
+        Some(entry)
+    } else {
+        None
+    }
+}
+
+fn editor_lease_matches_review(info: &EditorLeaseInfo, review: &ReviewState) -> bool {
+    info.review_session_id
+        .as_deref()
+        .is_none_or(|session| session == review.review_session_id)
+        && info
+            .revision
+            .is_none_or(|revision| revision == review.revision)
+}
+
+fn reap_native_editor(root_dir: &Path) {
+    if let Ok(mut active) = active_native_editors().lock() {
+        if let Some(entry) = active.get(root_dir)
+            && native_child_has_exited(entry)
+        {
+            active.remove(root_dir);
+        }
+    }
+}
+
+fn native_child_has_exited(entry: &ActiveNativeEditor) -> bool {
+    if !entry.alive.load(Ordering::Acquire) {
+        return true;
+    }
+    let exited = match entry.child.lock() {
+        Ok(mut child) => match child.try_wait() {
+            Ok(Some(_)) | Err(_) => true,
+            Ok(None) => false,
+        },
+        Err(_) => true,
+    };
+    if exited {
+        entry.alive.store(false, Ordering::Release);
+    }
+    exited
+}
+
+fn register_native_editor(
+    root_dir: PathBuf,
+    session_id: String,
+    revision: u64,
+    child: Child,
+    lease_path: PathBuf,
+) -> Result<()> {
+    let pid = child.id();
+    let child = Arc::new(Mutex::new(child));
+    let alive = Arc::new(AtomicBool::new(true));
+    let entry = Arc::new(ActiveNativeEditor {
+        session_id,
+        revision,
+        pid,
+        alive: Arc::clone(&alive),
+        child: Arc::clone(&child),
+    });
+    if let Ok(mut active) = active_native_editors().lock() {
+        active.insert(root_dir.clone(), Arc::clone(&entry));
+    }
+    let reaper_child = Arc::clone(&child);
+    let reaper_alive = Arc::clone(&alive);
+    let reaper_entry = Arc::clone(&entry);
+    let reaper_root = root_dir.clone();
+    let reaper_lease_path = lease_path.clone();
+    let reaper = thread::Builder::new()
+        .name("fukidashi-editor-reaper".to_owned())
+        .spawn(move || {
+            loop {
+                if !reaper_alive.load(Ordering::Acquire) {
+                    break;
+                }
+                let exited = match reaper_child.lock() {
+                    Ok(mut child) => match child.try_wait() {
+                        Ok(Some(_)) | Err(_) => true,
+                        Ok(None) => false,
+                    },
+                    Err(_) => true,
+                };
+                if exited {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            reaper_alive.store(false, Ordering::Release);
+            if let Ok(mut active) = active_native_editors().lock()
+                && active
+                    .get(&reaper_root)
+                    .is_some_and(|current| Arc::ptr_eq(current, &reaper_entry))
+            {
+                active.remove(&reaper_root);
+            }
+            remove_editor_lease_if_owner(&reaper_lease_path, pid);
+        })
+        .context("start native editor reaper");
+    if let Err(error) = reaper {
+        if let Ok(mut child) = child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        alive.store(false, Ordering::Release);
+        if let Ok(mut active) = active_native_editors().lock()
+            && active
+                .get(&root_dir)
+                .is_some_and(|current| Arc::ptr_eq(current, &entry))
+        {
+            active.remove(&root_dir);
+        }
+        remove_editor_lease_if_owner(&lease_path, pid);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn launch_native_editor(
+    editor_bin: &Path,
+    review_session_id: &str,
+    revision: u64,
+    root_dir: &Path,
+    lease_path: Option<&Path>,
+) -> Result<Child> {
+    let mut command = Command::new(editor_bin);
+    command
+        .arg("--review-session-id")
+        .arg(review_session_id)
+        .arg("--review-revision")
+        .arg(revision.to_string());
+    if let Some(lease_path) = lease_path {
+        command.arg("--editor-lease").arg(lease_path);
+    }
+    command.arg(root_dir);
+    command
+        .spawn()
+        .with_context(|| format!("launch native editor {}", editor_bin.display()))
+}
+
+enum ManagedEditorLease {
+    Acquired(NativeEditorLease),
+    Reuse(ReviewState),
+}
+
+fn acquire_managed_editor_lease(
+    root_dir: &Path,
+    initial_review: Option<&ReviewState>,
+) -> Result<ManagedEditorLease> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match try_reserve_editor_lease(
+            root_dir,
+            initial_review
+                .map(|review| review.review_session_id.as_str())
+                .unwrap_or("pending"),
+            initial_review.map_or(0, |review| review.revision),
+        )? {
+            EditorLeaseReservation::Acquired(lease) => {
+                return Ok(ManagedEditorLease::Acquired(lease));
+            }
+            EditorLeaseReservation::Active(info) => {
+                if let Some(review) = read_review(root_dir) {
+                    if review.action.as_deref() == Some("approve_export") {
+                        // A completed review is only reopened after the old
+                        // native process releases its lease. Its UI is closing
+                        // immediately after approval, so waiting here preserves
+                        // the explicit reopen semantics without a duplicate UI.
+                    } else if review.status == "awaiting_review"
+                        && review.action.is_none()
+                        && editor_lease_matches_review(&info, &review)
+                    {
+                        return Ok(ManagedEditorLease::Reuse(review));
+                    }
+                }
+                if !editor_process_is_alive(info.pid) {
+                    let _ = fs::remove_file(editor_lease_file(root_dir));
+                    continue;
+                }
+                if Instant::now() >= deadline {
+                    bail!(
+                        "timed out waiting for another native editor to finish job {}",
+                        root_dir.display()
+                    );
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            EditorLeaseReservation::ActiveMetadataPending => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "timed out waiting for native editor lease metadata for job {}",
+                        root_dir.display()
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Session {
     token: String,
@@ -97,7 +682,7 @@ struct Session {
 
 /// Start an editor on an ephemeral loopback port and return immediately.
 pub fn serve_editor(image_path: &Path, json_data: Value) -> Result<Value> {
-    serve_editor_with_allowed_sources_and_options(image_path, json_data, Vec::new(), false)
+    serve_editor_impl(image_path, json_data, Vec::new(), false, None)
 }
 
 pub fn serve_editor_with_allowed_sources(
@@ -105,12 +690,7 @@ pub fn serve_editor_with_allowed_sources(
     json_data: Value,
     allowed_source_paths: Vec<PathBuf>,
 ) -> Result<Value> {
-    serve_editor_with_allowed_sources_and_options(
-        image_path,
-        json_data,
-        allowed_source_paths,
-        false,
-    )
+    serve_editor_impl(image_path, json_data, allowed_source_paths, false, None)
 }
 
 pub fn serve_editor_with_allowed_sources_and_options(
@@ -118,6 +698,22 @@ pub fn serve_editor_with_allowed_sources_and_options(
     json_data: Value,
     allowed_source_paths: Vec<PathBuf>,
     reopen_completed: bool,
+) -> Result<Value> {
+    serve_editor_impl(
+        image_path,
+        json_data,
+        allowed_source_paths,
+        reopen_completed,
+        None,
+    )
+}
+
+fn serve_editor_impl(
+    image_path: &Path,
+    json_data: Value,
+    allowed_source_paths: Vec<PathBuf>,
+    reopen_completed: bool,
+    test_launcher: Option<&dyn Fn(&Path, &str, u64, &Path, &Path) -> Result<Child>>,
 ) -> Result<Value> {
     let image_path = fs::canonicalize(image_path)
         .with_context(|| format!("resolve editor image {}", image_path.display()))?;
@@ -128,6 +724,80 @@ pub fn serve_editor_with_allowed_sources_and_options(
     let server_owned_state = is_managed_editor_root(&root_dir);
     track_editor_root(&root_dir);
     let state_path = root_dir.join("project.json");
+    let review_path = review_file(&root_dir);
+    let editor_bin = test_launcher
+        .map(|_| PathBuf::from("fukidashi-editor-test-launcher"))
+        .or_else(find_editor_binary);
+    let native_requested = editor_bin.is_some();
+    // The registry and the review/lease transition must be one critical
+    // section. This mutex is process-local; the filesystem lease below closes
+    // the same race between independent MCP processes.
+    let _lifecycle_guard = if server_owned_state && native_requested {
+        Some(
+            editor_lifecycle_lock()
+                .lock()
+                .map_err(|_| anyhow!("editor lifecycle lock poisoned"))?,
+        )
+    } else {
+        None
+    };
+    reap_native_editor(&root_dir);
+    let existing_review = if review_path.exists() {
+        Some(
+            serde_json::from_slice::<ReviewState>(
+                &fs::read(&review_path).context("read existing review state")?,
+            )
+            .context("parse existing review state")?,
+        )
+    } else {
+        None
+    };
+    if let Some(existing) = existing_review.as_ref()
+        && existing.action.as_deref() == Some("approve_export")
+        && !reopen_completed
+    {
+        return Ok(json!({
+            "editor_kind": "already_completed",
+            "action": existing.action,
+            "status": existing.status,
+            "review_session_id": existing.review_session_id,
+            "review_revision": existing.revision,
+            "review": existing,
+            "persistence_path": state_path,
+            "review_path": review_path,
+        }));
+    }
+    let mut native_lease = None;
+    if server_owned_state && native_requested {
+        if let Some(existing) = existing_review.as_ref()
+            && existing.status == "awaiting_review"
+            && existing.action.is_none()
+            && let Some(active) = local_native_editor_for_review(&root_dir, existing)
+        {
+            let _ = active.pid;
+            return Ok(native_editor_response(
+                &root_dir,
+                &state_path,
+                &review_path,
+                existing,
+                editor_bin.as_deref(),
+                true,
+            ));
+        }
+        match acquire_managed_editor_lease(&root_dir, existing_review.as_ref())? {
+            ManagedEditorLease::Reuse(review) => {
+                return Ok(native_editor_response(
+                    &root_dir,
+                    &state_path,
+                    &review_path,
+                    &review,
+                    editor_bin.as_deref(),
+                    true,
+                ));
+            }
+            ManagedEditorLease::Acquired(lease) => native_lease = Some(lease),
+        }
+    }
     let mut initial_state = normalize_editor_state(json_data)?;
     if state_path.exists()
         && let Ok(bytes) = fs::read(&state_path)
@@ -144,30 +814,30 @@ pub fn serve_editor_with_allowed_sources_and_options(
     }
     validate_state_for_session(server_owned_state, &initial_state)?;
     validate_project_paths_for_root(&root_dir, &initial_state, &allowed_source_paths)?;
-    atomic_json_save(&state_path, &initial_state)?;
-    let review_path = review_file(&root_dir);
+    let mut existing_review = if review_path.exists() {
+        Some(
+            serde_json::from_slice::<ReviewState>(
+                &fs::read(&review_path).context("read existing review state")?,
+            )
+            .context("parse existing review state")?,
+        )
+    } else {
+        None
+    };
+    let relaunch_existing = server_owned_state
+        && existing_review
+            .as_ref()
+            .is_some_and(|review| review.status == "awaiting_review" && review.action.is_none());
+    if !relaunch_existing {
+        atomic_json_save(&state_path, &initial_state)?;
+    }
     let mut reopened_completed_review = false;
-    let mut review_state = if review_path.exists() {
-        let bytes = fs::read(&review_path).context("read existing review state")?;
-        let existing: ReviewState =
-            serde_json::from_slice::<ReviewState>(&bytes).context("parse existing review state")?;
+    let mut review_state = if let Some(existing) = existing_review.take() {
         // A completed review remains exportable by default. An explicit editor
         // reopen starts a new review cycle without erasing the old audit trail.
         // `request_fixes` is deliberately NOT sticky: the fix loop serves the
         // editor again after feedback is applied, and that call must mint a
         // fresh review round via the reset below.
-        if existing.action.as_deref() == Some("approve_export") && !reopen_completed {
-            return Ok(json!({
-                "editor_kind": "already_completed",
-                "action": existing.action,
-                "status": existing.status,
-                "review_session_id": existing.review_session_id,
-                "review_revision": existing.revision,
-                "review": existing,
-                "persistence_path": state_path,
-                "review_path": review_path,
-            }));
-        }
         let mut existing = existing;
         if existing.action.as_deref() == Some("approve_export") && reopen_completed {
             let previous_session_id = existing.review_session_id.clone();
@@ -200,28 +870,61 @@ pub fn serve_editor_with_allowed_sources_and_options(
             audit: Vec::new(),
         }
     };
-    if !reopened_completed_review {
+    if !relaunch_existing && !reopened_completed_review {
         review_state.revision = review_state.revision.saturating_add(1);
     }
-    review_state.status = "awaiting_review".to_owned();
-    review_state.action = None;
-    review_state.feedback.clear();
-    review_state.approved_pages.clear();
-    review_state.consumed = false;
-    save_review(&root_dir, &review_state)?;
+    if !relaunch_existing {
+        review_state.status = "awaiting_review".to_owned();
+        review_state.action = None;
+        review_state.feedback.clear();
+        review_state.approved_pages.clear();
+        review_state.consumed = false;
+        save_review(&root_dir, &review_state)?;
+    }
     // Prefer one editor surface per review. When the companion native binary
     // is available, it owns the review and writes the same review.json consumed
     // by wait_for_review/export_gate. The HTTP editor is started only when the
     // native process cannot be launched, preventing two competing UIs from
     // submitting actions for one revision.
-    if let Some(editor_bin) = find_editor_binary() {
-        match std::process::Command::new(&editor_bin)
-            .arg("--review-session-id")
-            .arg(&review_state.review_session_id)
-            .arg(&root_dir)
-            .spawn()
-        {
-            Ok(_) => {
+    if let Some(editor_bin) = editor_bin {
+        if let Some(lease) = native_lease.as_mut() {
+            lease.update_metadata(&review_state.review_session_id, review_state.revision)?;
+        }
+        let lease_path = editor_lease_file(&root_dir);
+        let launched = if let Some(launcher) = test_launcher {
+            launcher(
+                &editor_bin,
+                &review_state.review_session_id,
+                review_state.revision,
+                &root_dir,
+                &lease_path,
+            )
+        } else {
+            launch_native_editor(
+                &editor_bin,
+                &review_state.review_session_id,
+                review_state.revision,
+                &root_dir,
+                native_lease.as_ref().map(|_| lease_path.as_path()),
+            )
+        };
+        match launched {
+            Ok(child) => {
+                if let Some(lease) = native_lease.take() {
+                    if let Err(error) = lease.handoff_to_child(child.id()) {
+                        let mut child = child;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error);
+                    }
+                }
+                register_native_editor(
+                    root_dir.clone(),
+                    review_state.review_session_id.clone(),
+                    review_state.revision,
+                    child,
+                    lease_path,
+                )?;
                 return Ok(json!({
                     "editor_kind": "native",
                     "url": format!("native://{}", root_dir.display()),
@@ -2783,6 +3486,160 @@ mod tests {
     use super::*;
     use image::{Rgb, RgbImage};
     use tempfile::tempdir;
+
+    fn test_managed_job() -> (tempfile::TempDir, PathBuf, Value) {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("job.json"), b"{}").expect("write managed job marker");
+        let image_path = dir.path().join("page.png");
+        RgbImage::from_pixel(8, 8, Rgb([255, 255, 255]))
+            .save(&image_path)
+            .unwrap();
+        let state = json!({
+            "schema_version": 1,
+            "pages": [{"id": "p1", "image_path": "page.png", "bubbles": []}]
+        });
+        (dir, image_path, state)
+    }
+
+    fn spawn_test_editor() -> Child {
+        #[cfg(windows)]
+        {
+            Command::new("cmd")
+                .args(["/C", "ping -n 5 127.0.0.1 > nul"])
+                .spawn()
+                .unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("sh").args(["-c", "sleep 1"]).spawn().unwrap()
+        }
+    }
+
+    fn spawn_exited_test_editor() -> Child {
+        #[cfg(windows)]
+        {
+            Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap()
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap()
+        }
+    }
+
+    #[test]
+    fn managed_reentrant_native_editor_reuses_one_child_and_revision() {
+        let (_dir, image_path, state) = test_managed_job();
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let launcher: Arc<dyn Fn(&Path, &str, u64, &Path, &Path) -> Result<Child> + Send + Sync> = {
+            let launches = Arc::clone(&launches);
+            Arc::new(move |_, _, _, _, _| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(spawn_test_editor())
+            })
+        };
+        let first_launcher = Arc::clone(&launcher);
+        let first_image = image_path.clone();
+        let first_state = state.clone();
+        let first = thread::spawn(move || {
+            serve_editor_impl(
+                &first_image,
+                first_state,
+                Vec::new(),
+                false,
+                Some(first_launcher.as_ref()),
+            )
+            .unwrap()
+        });
+        let second_launcher = Arc::clone(&launcher);
+        let second_image = image_path.clone();
+        let second_state = state.clone();
+        let second = thread::spawn(move || {
+            serve_editor_impl(
+                &second_image,
+                second_state,
+                Vec::new(),
+                false,
+                Some(second_launcher.as_ref()),
+            )
+            .unwrap()
+        });
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert_eq!(first["review_session_id"], second["review_session_id"]);
+        assert_eq!(first["review_revision"], second["review_revision"]);
+        assert_eq!(second["reused"], true);
+        assert!(second["message"].as_str().unwrap().contains("already open"));
+    }
+
+    #[test]
+    fn managed_dead_native_child_relaunches_same_review_revision() {
+        let (_dir, image_path, state) = test_managed_job();
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let launcher: Arc<dyn Fn(&Path, &str, u64, &Path, &Path) -> Result<Child> + Send + Sync> = {
+            let launches = Arc::clone(&launches);
+            Arc::new(move |_, _, _, _, _| {
+                launches.fetch_add(1, Ordering::SeqCst);
+                Ok(spawn_exited_test_editor())
+            })
+        };
+        let first = serve_editor_impl(
+            &image_path,
+            state.clone(),
+            Vec::new(),
+            false,
+            Some(launcher.as_ref()),
+        )
+        .unwrap();
+        let session = first["review_session_id"].as_str().unwrap().to_owned();
+        let revision = first["review_revision"].as_u64().unwrap();
+        let root = fs::canonicalize(image_path.parent().unwrap()).unwrap();
+        for _ in 0..200 {
+            reap_native_editor(&root);
+            let active = active_native_editors().lock().unwrap().contains_key(&root);
+            if !active {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let second = serve_editor_impl(
+            &image_path,
+            state,
+            Vec::new(),
+            false,
+            Some(launcher.as_ref()),
+        )
+        .unwrap();
+        assert_eq!(launches.load(Ordering::SeqCst), 2, "second={second}");
+        assert_eq!(second["review_session_id"], session);
+        assert_eq!(second["review_revision"], revision);
+        assert_ne!(second["reused"], true);
+    }
+
+    #[test]
+    fn editor_lease_create_new_is_atomic_and_recovers_dead_owner() {
+        let dir = tempdir().unwrap();
+        let first = create_editor_lease(editor_lease_file(dir.path()), "session-a", 7).unwrap();
+        match try_reserve_editor_lease(dir.path(), "session-b", 8).unwrap() {
+            EditorLeaseReservation::Active(info) => {
+                assert_eq!(info.pid, std::process::id());
+                assert_eq!(info.review_session_id.as_deref(), Some("session-a"));
+                assert_eq!(info.revision, Some(7));
+            }
+            _ => panic!("second reservation unexpectedly acquired the lease"),
+        }
+        drop(first);
+        fs::write(
+            editor_lease_file(dir.path()),
+            "pid=4294967295\nreview_session_id=stale\nrevision=1\n",
+        )
+        .unwrap();
+        let recovered = match try_reserve_editor_lease(dir.path(), "session-b", 8).unwrap() {
+            EditorLeaseReservation::Acquired(lease) => lease,
+            _ => panic!("dead lease was not reclaimed"),
+        };
+        drop(recovered);
+    }
 
     #[test]
     fn correction_strokes_cover_and_restore_clean_pixels() {
