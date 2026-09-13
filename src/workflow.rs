@@ -3324,12 +3324,19 @@ fn acquire_lock_file(path: PathBuf, label: &str) -> Result<LockLease> {
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age > STALE)
-                    && !lock_owner_is_alive(&path);
+                // A killed renderer can leave its lease file behind. Once a
+                // valid owner PID is demonstrably dead, reclaim immediately;
+                // waiting ten minutes makes a repair unnecessarily depend on
+                // manual filesystem cleanup. Files with no readable owner
+                // metadata retain the age guard to avoid racing a process
+                // between create_new and writing its PID.
+                let stale = lock_owner_is_dead(&path)
+                    || (fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .and_then(|modified| modified.elapsed().ok())
+                        .is_some_and(|age| age > STALE)
+                        && !lock_owner_is_alive(&path));
                 if stale {
                     let _ = fs::remove_file(&path);
                     continue;
@@ -3384,6 +3391,19 @@ fn lock_owner_is_alive(path: &Path) -> bool {
     {
         false
     }
+}
+
+fn lock_owner_is_dead(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(pid) = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("pid=")?.trim().parse::<u32>().ok())
+    else {
+        return false;
+    };
+    !lock_owner_is_alive(path) && pid != std::process::id()
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -3518,6 +3538,25 @@ mod tests {
     use super::*;
     use image::{Rgba, RgbaImage};
     use tempfile::tempdir;
+
+    #[test]
+    fn dead_render_lock_owner_is_reclaimed_without_age_wait() {
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join(".fukidashi-render.lock");
+        std::fs::write(&lock, "pid=4294967295\n").unwrap();
+        let lease = acquire_lock_file(lock.clone(), "test render job").unwrap();
+        assert!(lock.exists());
+        drop(lease);
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn current_render_lock_owner_is_not_reclaimed() {
+        let dir = tempdir().unwrap();
+        let lock = dir.path().join(".fukidashi-render.lock");
+        std::fs::write(&lock, format!("pid={}\n", std::process::id())).unwrap();
+        assert!(!lock_owner_is_dead(&lock));
+    }
 
     #[test]
     fn page_progress_reports_current_over_total() {
