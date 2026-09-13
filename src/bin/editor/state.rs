@@ -656,6 +656,7 @@ impl EditorState {
             "padding": null,
             "text_bbox": null,
             "preserve_source": false,
+            "manual": true,
             "flagged": false,
             "render_dirty": true,
         });

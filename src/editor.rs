@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use uuid::Uuid;
 
+use crate::config::{Config, ConfigArgs};
 use crate::domain::{Rect, TypesetPayload};
 
 const MAX_REQUEST: usize = 4 * 1024 * 1024;
@@ -58,9 +59,14 @@ struct ReviewChannel {
 
 static REVIEW_CHANNELS: OnceLock<Mutex<std::collections::HashMap<String, Arc<ReviewChannel>>>> =
     OnceLock::new();
+static MANUAL_CLEAN_ENGINE: OnceLock<Mutex<crate::vision::ocr::OcrEngine>> = OnceLock::new();
 
 fn review_channels() -> &'static Mutex<std::collections::HashMap<String, Arc<ReviewChannel>>> {
     REVIEW_CHANNELS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn manual_clean_engine() -> &'static Mutex<crate::vision::ocr::OcrEngine> {
+    MANUAL_CLEAN_ENGINE.get_or_init(|| Mutex::new(crate::vision::ocr::OcrEngine::default()))
 }
 
 fn review_file(root: &Path) -> PathBuf {
@@ -1970,6 +1976,47 @@ fn bubble_preserve_for_render(bubble: &Value) -> bool {
             .is_some_and(|id| id.starts_with("text-"))
 }
 
+/// A bubble created in the QA editor has no detector provenance.  If the
+/// operator fills one with a translation, treat its rectangle as a missed
+/// source-text repair region so the source is cleaned before Vietnamese is
+/// rasterized over it.  Existing OCR bubbles retain `kind`/`source_text` and
+/// continue to reuse their verified clean stage.
+fn manual_source_repair_regions(
+    bubbles: &[Value],
+    removed_ids: &std::collections::HashSet<String>,
+) -> Vec<Rect> {
+    bubbles
+        .iter()
+        .filter(|bubble| {
+            let id = bubble.get("id").and_then(Value::as_str);
+            if id.is_some_and(|id| removed_ids.contains(id)) || bubble_preserve_for_render(bubble) {
+                return false;
+            }
+            let explicit_manual = bubble
+                .get("manual")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let source_missing = bubble
+                .get("source_text")
+                .and_then(Value::as_str)
+                .is_none_or(|text| text.trim().is_empty());
+            let detector_kind_missing = bubble.get("kind").is_none();
+            let has_translation = bubble
+                .get("translation")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty());
+            has_translation && (explicit_manual || (source_missing && detector_kind_missing))
+        })
+        .filter_map(|bubble| {
+            bubble
+                .get("bbox")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Rect>(value).ok())
+                .and_then(|rect| rect.validate().ok())
+        })
+        .collect()
+}
+
 fn rects_match(left: Rect, right: Rect) -> bool {
     const EPSILON: f32 = 0.001;
     (left.x1 - right.x1).abs() <= EPSILON
@@ -2064,7 +2111,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         .ok_or_else(|| anyhow!("editor job has no jobs root"))?;
     let workflow = crate::workflow::Workflow::new(jobs_root.to_path_buf())?;
     let _render_lock = workflow.acquire_render_lock(&session.root_dir)?;
-    let base_clean = workflow.validate_clean_input(&cleaned)?;
+    let mut base_clean = workflow.validate_clean_input(&cleaned)?;
     let page = state
         .get("pages")
         .and_then(Value::as_array)
@@ -2089,6 +2136,64 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         .filter_map(removed_bubble_id)
         .map(str::to_owned)
         .collect();
+    let manual_regions = manual_source_repair_regions(bubbles, &removed_ids);
+    if !manual_regions.is_empty() {
+        // A newly added editor bubble may cover prose that the detector missed.
+        // Clean those source pixels through the same managed LaMa crop path
+        // used by strict translation before applying any Vietnamese text.  The
+        // existing clean image is retained outside the manual regions so
+        // already-cleaned dialogue and artwork remain untouched.
+        let config = Config::resolve(&ConfigArgs {
+            models_dir: None,
+            ort_dylib: None,
+        })?;
+        let (manual_cleaned, manual_mask) = {
+            let mut engine = manual_clean_engine()
+                .lock()
+                .map_err(|_| anyhow!("manual clean engine lock poisoned"))?;
+            let result = engine
+                .clean_crops(&config, &source_image, None, &manual_regions, 3, 48, 256)
+                .map(|(cleaned, mask, _execution)| (cleaned, mask));
+            let _ = engine.finish_heavy_call(config.session_recycle_pages());
+            result.map_err(|error| anyhow!("background cleaning missed prose: {error}"))?
+        };
+        let mut merged_clean = image::open(&base_clean.cleaned_image)
+            .with_context(|| {
+                format!(
+                    "read existing clean image {} before manual repair",
+                    base_clean.cleaned_image.display()
+                )
+            })?
+            .to_rgb8();
+        let mut merged_mask = image::open(&base_clean.mask_path)
+            .with_context(|| {
+                format!(
+                    "read existing clean mask {} before manual repair",
+                    base_clean.mask_path.display()
+                )
+            })?
+            .to_luma8();
+        if merged_clean.dimensions() != manual_cleaned.dimensions()
+            || merged_mask.dimensions() != manual_mask.dimensions()
+        {
+            bail!("manual clean stage dimensions do not match the managed page");
+        }
+        for (x, y, pixel) in manual_mask.enumerate_pixels() {
+            if pixel[0] == 0 {
+                continue;
+            }
+            merged_clean.put_pixel(x, y, *manual_cleaned.get_pixel(x, y));
+            merged_mask.put_pixel(x, y, image::Luma([255]));
+        }
+        let (cleaned_path, _, _) = workflow.write_clean_artifact_locked(
+            &source_image,
+            &merged_clean,
+            &merged_mask,
+            3,
+            "editor-manual",
+        )?;
+        base_clean = workflow.validate_clean_input(&cleaned_path)?;
+    }
     let preserved_bubbles = bubbles
         .iter()
         .filter(|bubble| {
@@ -2698,6 +2803,38 @@ mod tests {
             *image::open(&clean).unwrap().to_rgb8().get_pixel(8, 8),
             Rgb([12, 34, 56])
         );
+    }
+
+    #[test]
+    fn manual_bubbles_are_marked_for_background_cleaning() {
+        let removed = std::collections::HashSet::new();
+        let regions = manual_source_repair_regions(
+            &[
+                json!({
+                    "id": "bubble-manual",
+                    "bbox": {"x1": 2.0, "y1": 3.0, "x2": 20.0, "y2": 24.0},
+                    "source_text": "",
+                    "translation": "Bản dịch thủ công",
+                }),
+                json!({
+                    "id": "bubble-detected",
+                    "kind": "dialogue",
+                    "source_text": "Detected source",
+                    "translation": "Bản dịch đã nhận dạng",
+                    "bbox": {"x1": 1.0, "y1": 1.0, "x2": 10.0, "y2": 10.0},
+                }),
+                json!({
+                    "id": "bubble-empty",
+                    "manual": true,
+                    "bbox": {"x1": 1.0, "y1": 1.0, "x2": 10.0, "y2": 10.0},
+                    "translation": "",
+                }),
+            ],
+            &removed,
+        );
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].x1, 2.0);
+        assert_eq!(regions[0].y2, 24.0);
     }
 
     #[test]

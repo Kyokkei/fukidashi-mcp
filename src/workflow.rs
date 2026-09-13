@@ -1567,6 +1567,25 @@ impl Workflow {
     ) -> Result<(PathBuf, PathBuf, serde_json::Value)> {
         let source = canonical_path(source)
             .with_context(|| format!("resolve source image {}", source.display()))?;
+        let job = self.allocate_job_for_source(&source)?;
+        let _render_lock = self.acquire_render_lock(&job)?;
+        self.write_clean_artifact_locked(&source, cleaned, mask, dilation, mode)
+    }
+
+    /// Persist a clean artifact while the caller already owns the job render
+    /// lock.  The native editor uses this when an operator adds a bubble over
+    /// detector-missed prose: the source region is inpainted first, then the
+    /// editor render can typeset Vietnamese on the resulting clean stage.
+    pub(crate) fn write_clean_artifact_locked(
+        &self,
+        source: &Path,
+        cleaned: &RgbImage,
+        mask: &GrayImage,
+        dilation: u8,
+        mode: &str,
+    ) -> Result<(PathBuf, PathBuf, serde_json::Value)> {
+        let source = canonical_path(source)
+            .with_context(|| format!("resolve source image {}", source.display()))?;
         let source_image = image::open(&source).context("decode source image for validation")?;
         if source_image.dimensions() != cleaned.dimensions()
             || mask.dimensions() != cleaned.dimensions()
@@ -1623,7 +1642,6 @@ impl Workflow {
             );
         }
         let job = self.allocate_job_for_source(&source)?;
-        let _render_lock = self.acquire_render_lock(&job)?;
         let _manifest_lock = acquire_manifest_lock(&job)?;
         let mut manifest = load_manifest(&job)?;
         if manifest.expected_pages.is_empty() {
@@ -2103,23 +2121,41 @@ impl Workflow {
                 expected_pages.len()
             );
         }
+        // Validate every page before returning.  The old loop returned on the
+        // first failure, which made a large review feel like whack-a-mole:
+        // fixing page 2 simply revealed page 99 on the next approval attempt.
+        // Keep each page's one-based number and source name attached to its
+        // own error so the operator can repair all affected pages in one pass.
+        let mut failures = Vec::new();
         for (page_index, source) in expected_pages.into_iter().enumerate() {
-            let page = manifest
-                .pages
-                .get(&page_key(&source))
-                .ok_or_else(|| anyhow!("expected page is missing from the managed manifest"))?;
-            let rendered = page
-                .rendered_image
-                .as_ref()
-                .ok_or_else(|| anyhow!("expected page is not rendered: {}", source.display()))?;
-            let artifact = self.validate_render_input(rendered)?;
-            validate_typeset_completeness(&job, &source, &artifact.typeset).with_context(|| {
+            let result = (|| -> Result<()> {
+                let page = manifest
+                    .pages
+                    .get(&page_key(&source))
+                    .ok_or_else(|| anyhow!("expected page is missing from the managed manifest"))?;
+                let rendered = page.rendered_image.as_ref().ok_or_else(|| {
+                    anyhow!("expected page is not rendered: {}", source.display())
+                })?;
+                let artifact = self.validate_render_input(rendered)?;
+                validate_typeset_completeness(&job, &source, &artifact.typeset)
+            })()
+            .with_context(|| {
                 format!(
                     "page {} completeness ({})",
                     page_index + 1,
                     source.display()
                 )
-            })?;
+            });
+            if let Err(error) = result {
+                failures.push(format!("page {} ({error:#})", page_index + 1));
+            }
+        }
+        if !failures.is_empty() {
+            bail!(
+                "managed review completeness failed on {} page(s): {}",
+                failures.len(),
+                failures.join("; ")
+            );
         }
         Ok(())
     }
@@ -4542,6 +4578,92 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("detected English prose line 0"));
+    }
+
+    #[test]
+    fn editor_completeness_reports_all_failed_page_numbers_in_one_pass() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let page_one = source_dir.join("page-1.png");
+        let page_two = source_dir.join("page-2.png");
+        for source in [&page_one, &page_two] {
+            RgbImage::from_pixel(32, 32, image::Rgb([255, 255, 255]))
+                .save(source)
+                .unwrap();
+        }
+
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let registration = workflow.register_analysis(&page_one, None).unwrap();
+        workflow.register_analysis(&page_two, None).unwrap();
+        for (index, source) in [&page_one, &page_two].into_iter().enumerate() {
+            let id = format!("bubble-{}", index + 1);
+            workflow
+                .write_analysis_artifact(
+                    source,
+                    &json!({
+                        "target_language": "vi",
+                        "bubbles": [{"id": id, "bbox": {"x1":1.0,"y1":1.0,"x2":20.0,"y2":20.0}}],
+                        "text_lines": [],
+                        "unmatched_text": [],
+                        "translation_handoff": {"items": [{
+                            "id": id,
+                            "kind": "dialogue",
+                            "source_text": "The character speaks to everyone in the room.",
+                            "source_language": "en",
+                            "bbox": {"x1":1.0,"y1":1.0,"x2":20.0,"y2":20.0}
+                        }]}
+                    }),
+                )
+                .unwrap();
+            let cleaned = RgbImage::from_pixel(32, 32, image::Rgb([240, 240, 240]));
+            let mut mask = GrayImage::new(32, 32);
+            mask.put_pixel(2, 2, image::Luma([255]));
+            workflow
+                .write_clean_artifact(source, &cleaned, &mask, 0, "crop")
+                .unwrap();
+            let rendered = workflow.page_artifacts_for_source(source).unwrap().4;
+            cleaned.save(&rendered).unwrap();
+            let clean_path = workflow.page_artifacts_for_source(source).unwrap().2;
+            workflow
+                .register_render(
+                    &rendered,
+                    &workflow.validate_clean_input(&clean_path).unwrap(),
+                    json!({
+                        "request_bubbles": [{
+                            "id": id,
+                            "source_text": "The character speaks to everyone in the room.",
+                            "source_language": "en",
+                            "text": "Nhân vật nói chuyện với mọi người trong phòng.",
+                            "bbox": {"x1":1.0,"y1":1.0,"x2":20.0,"y2":20.0}
+                        }]
+                    }),
+                    json!({}),
+                )
+                .unwrap();
+
+            // Simulate two already-rendered legacy pages that each need a
+            // repair. Approval must report both in one response.
+            let sidecar = render_sidecar(&rendered);
+            let mut render: serde_json::Value =
+                serde_json::from_slice(&fs::read(&sidecar).unwrap()).unwrap();
+            render["typeset"] = json!({"request_bubbles": []});
+            fs::write(&sidecar, serde_json::to_vec(&render).unwrap()).unwrap();
+        }
+
+        let error = workflow
+            .validate_editor_completeness(
+                &registration.job_dir,
+                &json!({
+                    "pages": [{}, {}]
+                }),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2 page(s)"), "unexpected error: {error}");
+        assert!(error.contains("page 1"), "unexpected error: {error}");
+        assert!(error.contains("page 2"), "unexpected error: {error}");
+        assert_eq!(error.matches("no rendered bubble").count(), 2);
     }
 
     #[test]
