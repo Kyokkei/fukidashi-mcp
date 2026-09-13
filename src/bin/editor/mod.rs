@@ -555,7 +555,18 @@ impl EditorApp {
     }
 
     fn approve_and_export(&mut self) {
-        if self.review.action.is_some() || self.review.consumed {
+        if let Some(action) = self.review.action.as_deref() {
+            self.error_message = Some(format!(
+                "review action '{action}' is already submitted for revision {}; reopen this editor for a new review cycle",
+                self.review.revision
+            ));
+            return;
+        }
+        if self.review.consumed {
+            self.error_message = Some(format!(
+                "review revision {} is already consumed; reopen this editor for a new review cycle",
+                self.review.revision
+            ));
             return;
         }
         if !self.review_file_is_current() {
@@ -588,25 +599,29 @@ impl EditorApp {
                 return;
             }
         }
-        self.review.approved_pages =
-            (0..self.state.as_ref().map(|s| s.page_count()).unwrap_or(0)).collect();
-        self.review.status = "approved".to_owned();
-        self.review.action = Some("approve_export".to_owned());
-        self.review.audit.push(serde_json::json!({
-            "event": "approve_export",
-            "review_session_id": self.review.review_session_id.clone(),
-            "revision": self.review.revision,
-        }));
+        // Persist the project before changing the in-memory review.  Approval
+        // must remain retryable when either persistence step fails.
         if let Some(state) = self.state.as_ref() {
             if let Err(error) = self.save_project_sync(state) {
                 self.error_message = Some(format!("save failed before approval: {error}"));
                 return;
             }
         }
-        if let Err(e) = state::save_review_state(&self.job_dir, &self.review) {
+        let mut proposed_review = self.review.clone();
+        proposed_review.approved_pages =
+            (0..self.state.as_ref().map(|s| s.page_count()).unwrap_or(0)).collect();
+        proposed_review.status = "approved".to_owned();
+        proposed_review.action = Some("approve_export".to_owned());
+        proposed_review.audit.push(serde_json::json!({
+            "event": "approve_export",
+            "review_session_id": proposed_review.review_session_id.clone(),
+            "revision": proposed_review.revision,
+        }));
+        if let Err(e) = state::save_review_state(&self.job_dir, &proposed_review) {
             self.error_message = Some(format!("save review failed: {e}"));
             return;
         }
+        self.review = proposed_review;
         self.exit_action = Some(ExitAction::Approve);
         if let Ok(mut s) = self.exit_state.lock() {
             s.action = Some(ExitAction::Approve);
@@ -1241,6 +1256,64 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("approval blocked"))
         );
+    }
+
+    #[test]
+    fn approval_project_write_failure_remains_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let job_dir = directory.path().to_path_buf();
+        let session = "native-approval-retry-test".to_owned();
+        let project = serde_json::json!({
+            "state_revision": 0,
+            "pages": [{
+                "id": "page-1",
+                "image_path": "source.png",
+                "render_dirty": false,
+                "bubbles": []
+            }]
+        });
+        state::atomic_write_json(&job_dir.join("project.json"), &project).unwrap();
+        let review = ReviewState {
+            review_session_id: session.clone(),
+            revision: 7,
+            status: "awaiting_review".to_owned(),
+            action: None,
+            feedback: Vec::new(),
+            approved_pages: Vec::new(),
+            consumed: false,
+            audit: Vec::new(),
+        };
+        state::save_review_state(&job_dir, &review).unwrap();
+
+        let exit_state = Arc::new(Mutex::new(crate::ExitState::default()));
+        let mut app = EditorApp::new(job_dir.clone(), Some(session), exit_state).unwrap();
+        let project_path = job_dir.join("project.json");
+        let backup_path = job_dir.join("project-backup.json");
+        std::fs::rename(&project_path, &backup_path).unwrap();
+        std::fs::create_dir(&project_path).unwrap();
+
+        app.approve_and_export();
+
+        assert!(app.review.action.is_none());
+        assert_eq!(app.review.status, "awaiting_review");
+        assert!(app.exit_action.is_none());
+        assert!(
+            app.error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("save failed before approval"))
+        );
+
+        std::fs::remove_dir(&project_path).unwrap();
+        std::fs::rename(&backup_path, &project_path).unwrap();
+        app.context = Some(Context::default());
+        app.approve_and_export();
+
+        assert_eq!(app.review.action.as_deref(), Some("approve_export"));
+        assert_eq!(app.review.status, "approved");
+        assert_eq!(app.exit_action, Some(ExitAction::Approve));
+        let persisted = read_review(&job_dir).unwrap();
+        assert_eq!(persisted.action.as_deref(), Some("approve_export"));
+        assert_eq!(persisted.status, "approved");
     }
 
     #[test]
