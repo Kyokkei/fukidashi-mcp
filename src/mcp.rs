@@ -1949,6 +1949,10 @@ fn rects_overlap(left: Rect, right: Rect) -> bool {
     left.x1 < right.x2 && right.x1 < left.x2 && left.y1 < right.y2 && right.y1 < left.y2
 }
 
+fn rect_contains(outer: Rect, inner: Rect) -> bool {
+    outer.x1 <= inner.x1 && outer.y1 <= inner.y1 && outer.x2 >= inner.x2 && outer.y2 >= inner.y2
+}
+
 fn json_bbox(item: &serde_json::Value) -> Option<Rect> {
     serde_json::from_value::<Rect>(item.get("bbox").cloned()?)
         .ok()
@@ -2125,7 +2129,23 @@ fn checkpoint_text_regions(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("auto")
                 .to_owned();
-            translatable_bboxes.push((rect, source_text, source_language));
+            // Geometry-only coverage is reserved for an unmatched/manual
+            // source anchor.  A normal detector dialogue with a broad box
+            // still needs matching OCR text, or it could hide an unrelated
+            // prose line merely because the rectangles overlap.
+            let geometry_anchor = item
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "unmatched_text")
+                || item
+                    .get("preserve_by_default")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                || item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| id.starts_with("text-"));
+            translatable_bboxes.push((rect, source_text, source_language, geometry_anchor));
         } else if checkpoint_item_is_preserved(item, replace_sfx) {
             preserved_bboxes.push(rect);
         }
@@ -2147,12 +2167,15 @@ fn checkpoint_text_regions(
             .unwrap_or_default();
         let overlapping_translatable = translatable_bboxes
             .iter()
-            .filter(|(bubble, _, _)| rects_overlap(rect, *bubble))
+            .filter(|(bubble, _, _, _)| rects_overlap(rect, *bubble))
             .collect::<Vec<_>>();
         if !overlapping_translatable.is_empty() {
             if overlapping_translatable
                 .iter()
-                .any(|(_, source, language)| source_text_covers_line(source, line_text, language))
+                .any(|(bubble, source, language, geometry_anchor)| {
+                    source_text_covers_line(source, line_text, language)
+                        || (*geometry_anchor && rect_contains(*bubble, rect))
+                })
             {
                 regions.push(rect);
                 continue;
@@ -4135,7 +4158,52 @@ mod tests {
         let error = checkpoint_text_regions(&path, false)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("not represented"));
+        assert!(error.contains("not represented") || error.contains("no translated item"));
+    }
+
+    #[test]
+    fn clean_mask_accepts_one_full_afterword_anchor_and_rejects_partial_overlap() {
+        let analysis = serde_json::json!({
+            "target_language": "vi",
+            "bubbles": [],
+            "text_lines": [
+                {
+                    "text": "Thank you for reading this afterword.",
+                    "source_language": "en",
+                    "confidence": 0.95,
+                    "bbox": {"x1": 10.0, "y1": 10.0, "x2": 90.0, "y2": 30.0}
+                },
+                {
+                    "text": "I hope you look forward to the next one.",
+                    "source_language": "en",
+                    "confidence": 0.95,
+                    "bbox": {"x1": 10.0, "y1": 40.0, "x2": 90.0, "y2": 60.0}
+                }
+            ],
+            "translation_handoff": {"items": [{
+                "id": "afterword-anchor",
+                "kind": "unmatched_text",
+                "preserve_by_default": true,
+                "source_text": "full afterword source anchor",
+                "source_language": "en",
+                "bbox": {"x1": 5.0, "y1": 5.0, "x2": 95.0, "y2": 65.0}
+            }]}
+        });
+        let (_dir, path) = write_checkpoint(&analysis);
+        assert_eq!(checkpoint_text_regions(&path, false).unwrap().len(), 2);
+
+        let mut partial = analysis;
+        partial["translation_handoff"]["items"][0]["bbox"] = serde_json::json!({
+            "x1": 5.0,
+            "y1": 5.0,
+            "x2": 95.0,
+            "y2": 35.0
+        });
+        let (_dir, path) = write_checkpoint(&partial);
+        let error = checkpoint_text_regions(&path, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not represented") || error.contains("no translated item"));
     }
 
     #[test]

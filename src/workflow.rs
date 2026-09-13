@@ -2403,6 +2403,40 @@ fn explicit_or_default_source_preserve(item: &serde_json::Value, replace_sfx: bo
     explicit_source_preserve(item) || default_source_preserve(item, replace_sfx)
 }
 
+/// Return a rectangle that represents the source area owned by an editor
+/// request.  Native editor bubbles can retain detector geometry in
+/// `text_bbox`, while newer edits make `bubble_bbox` follow the operator's
+/// `bbox`; a full-page afterword may use either form.  Prefer any valid
+/// containing rectangle instead of assuming one field is authoritative.
+fn request_source_anchor_covers_line(
+    request: &serde_json::Value,
+    line_bbox: Option<crate::domain::Rect>,
+) -> bool {
+    let Some(line_bbox) = line_bbox.and_then(|bbox| bbox.validate().ok()) else {
+        return false;
+    };
+    [
+        "source_anchor",
+        "source_bbox",
+        "bubble_bbox",
+        "bbox",
+        "text_bbox",
+    ]
+    .into_iter()
+    .filter_map(|key| request.get(key))
+    .filter_map(|value| serde_json::from_value::<crate::domain::Rect>(value.clone()).ok())
+    .filter_map(|bbox| bbox.validate().ok())
+    .any(|anchor| {
+        // Containment is deliberate.  A mere overlap can leave part of a
+        // prose line outside the source anchor and must not satisfy the
+        // completeness gate.
+        anchor.x1 <= line_bbox.x1
+            && anchor.y1 <= line_bbox.y1
+            && anchor.x2 >= line_bbox.x2
+            && anchor.y2 >= line_bbox.y2
+    })
+}
+
 fn validate_typeset_completeness(
     job: &Path,
     source: &Path,
@@ -2541,7 +2575,11 @@ fn validate_typeset_completeness(
             if !is_english_prose(source_language, line_text) {
                 continue;
             }
-            let covered = requests.iter().any(|request| {
+            let line_bbox = line
+                .get("bbox")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<crate::domain::Rect>(value).ok());
+            let covered_by_rendered_request = requests.iter().any(|request| {
                 let source = request
                     .get("source_text")
                     .or_else(|| request.get("original_text"))
@@ -2551,7 +2589,10 @@ fn validate_typeset_completeness(
                     .get("source_language")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or(source_language);
-                if !source_text_covers_line(source, line_text, request_language) {
+                let source_text_matches =
+                    source_text_covers_line(source, line_text, request_language);
+                let source_anchor_matches = request_source_anchor_covers_line(request, line_bbox);
+                if !source_text_matches && !source_anchor_matches {
                     return false;
                 }
                 if explicit_or_default_source_preserve(request, replace_sfx) {
@@ -2562,9 +2603,44 @@ fn validate_typeset_completeness(
                     .or_else(|| request.get("translation"))
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_default();
-                !text.trim().is_empty()
-                    && normalized_source_text(source) != normalized_source_text(text)
+                if text.trim().is_empty() {
+                    return false;
+                }
+                if !source.trim().is_empty()
+                    && normalized_source_text(source) == normalized_source_text(text)
+                {
+                    return false;
+                }
+                // A manually added editor bubble may have no OCR source text.
+                // Keep an unchanged ASCII prose entry from passing solely on
+                // broad geometry, while allowing ordinary Vietnamese text.
+                source_text_matches
+                    || !(source.trim().is_empty()
+                        && text.is_ascii()
+                        && is_english_prose(request_language, text))
             });
+            // An all-keep strict submission intentionally has no rendered
+            // bubbles.  Its handoff items still carry the source decision and
+            // detector anchor, so use those anchors for the explicit
+            // preserve path while keeping uncovered lines rejected.
+            let covered_by_preserved_handoff = items.iter().any(|item| {
+                let item_source = item
+                    .get("source_text")
+                    .or_else(|| item.get("ocr_text"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let item_language = item
+                    .get("source_language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(source_language);
+                let item_prose = is_english_prose(item_language, item_source);
+                let preserved = explicit_source_preserve(item)
+                    || (default_source_preserve(item, replace_sfx) && !item_prose);
+                preserved
+                    && (source_text_covers_line(item_source, line_text, item_language)
+                        || request_source_anchor_covers_line(item, line_bbox))
+            });
+            let covered = covered_by_rendered_request || covered_by_preserved_handoff;
             if !covered {
                 bail!(
                     "detected English prose line {index} has no translated or explicitly preserved item"
@@ -4378,6 +4454,94 @@ mod tests {
             }]}),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn render_completeness_accepts_one_full_afterword_editor_anchor() {
+        let dir = tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        let source = dir.path().join("page.png");
+        RgbImage::from_pixel(128, 96, image::Rgb([255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let workflow = Workflow::new(jobs).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+        workflow
+            .write_analysis_artifact(
+                &source,
+                &json!({
+                    "target_language": "vi",
+                    "bubbles": [],
+                    "text_lines": [
+                        {
+                            "text": "Thank you for reading this afterword.",
+                            "source_language": "en",
+                            "bbox": {"x1": 10.0, "y1": 10.0, "x2": 90.0, "y2": 30.0}
+                        },
+                        {
+                            "text": "I hope you look forward to the next one.",
+                            "source_language": "en",
+                            "bbox": {"x1": 10.0, "y1": 40.0, "x2": 90.0, "y2": 60.0}
+                        }
+                    ],
+                    "unmatched_text": [],
+                    "translation_handoff": {"items": []}
+                }),
+            )
+            .unwrap();
+
+        // A native editor item can be the single source anchor for a prose
+        // block whose detector emitted several lines. Its geometry must fully
+        // contain each line; source_text may be unavailable for a new item.
+        let full_afterword = json!({
+            "request_bubbles": [{
+                "id": "editor-afterword",
+                "bbox": {"x1": 5.0, "y1": 5.0, "x2": 95.0, "y2": 65.0},
+                "text_bbox": {"x1": 5.0, "y1": 5.0, "x2": 95.0, "y2": 65.0},
+                "source_text": "",
+                "text": "Cảm ơn bạn đã đọc phần hậu truyện này. Hy vọng bạn sẽ đón chờ phần tiếp theo."
+            }]
+        });
+        validate_typeset_completeness(&registration.job_dir, &source, &full_afterword).unwrap();
+
+        let incomplete = json!({
+            "request_bubbles": [{
+                "id": "editor-afterword",
+                "bbox": {"x1": 5.0, "y1": 5.0, "x2": 95.0, "y2": 35.0},
+                "source_text": "",
+                "text": "Cảm ơn bạn đã đọc phần hậu truyện này."
+            }]
+        });
+        let error = validate_typeset_completeness(&registration.job_dir, &source, &incomplete)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("detected English prose line 1"));
+
+        let overlap_only = json!({
+            "request_bubbles": [{
+                "id": "editor-afterword",
+                "bbox": {"x1": 5.0, "y1": 25.0, "x2": 95.0, "y2": 50.0},
+                "source_text": "",
+                "text": "Cảm ơn bạn đã đọc phần hậu truyện này."
+            }]
+        });
+        let error = validate_typeset_completeness(&registration.job_dir, &source, &overlap_only)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("detected English prose line 0"));
+
+        let unchanged = json!({
+            "request_bubbles": [{
+                "id": "editor-afterword",
+                "bbox": {"x1": 5.0, "y1": 5.0, "x2": 95.0, "y2": 65.0},
+                "source_text": "Thank you for reading this afterword. I hope you look forward to the next one.",
+                "text": "Thank you for reading this afterword. I hope you look forward to the next one."
+            }]
+        });
+        let error = validate_typeset_completeness(&registration.job_dir, &source, &unchanged)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("detected English prose line 0"));
     }
 
     #[test]
