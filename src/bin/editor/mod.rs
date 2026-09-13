@@ -67,7 +67,9 @@ pub struct EditorApp {
 
 const MAX_OPERATOR_HISTORY: usize = 64;
 const PAGE_TEXTURE_CACHE_CAPACITY: usize = 2;
-const THUMB_TEXTURE_CACHE_CAPACITY: usize = 12;
+// Enough for a tall desktop viewport while remaining a fixed, small GPU
+// footprint: 32 thumbnails at 160px are roughly 3.3 MiB of RGBA pixels.
+const THUMB_TEXTURE_CACHE_CAPACITY: usize = 32;
 const THUMBNAIL_MAX_EDGE: u32 = 160;
 pub(crate) const THUMBNAIL_ROW_HEIGHT: f32 = 100.0;
 
@@ -230,11 +232,7 @@ impl EditorApp {
     }
 
     fn current_page_view(&self) -> Option<PageView> {
-        self.state
-            .as_ref()?
-            .pages()
-            .into_iter()
-            .nth(self.current_page)
+        self.state.as_ref()?.page(self.current_page)
     }
 
     fn load_texture_for(&mut self, path: &PathBuf, key: &str) -> TextureHandle {
@@ -405,7 +403,7 @@ impl EditorApp {
         let image_path = self
             .state
             .as_ref()
-            .and_then(|state| state.pages().into_iter().nth(page_index))
+            .and_then(|state| state.page(page_index))
             .and_then(|page| {
                 page.rendered_image_path
                     .or(Some(page.cleaned_image_path))
@@ -480,7 +478,7 @@ impl EditorApp {
         let current_dirty = self
             .state
             .as_ref()
-            .and_then(|state| state.pages().into_iter().nth(self.current_page))
+            .and_then(|state| state.page(self.current_page))
             .is_some_and(|page| {
                 page.render_dirty || page.bubbles.iter().any(|bubble| bubble.render_dirty)
             });
@@ -830,14 +828,8 @@ fn adjust_brush_radius(radius: f32, delta: f32) -> f32 {
 }
 
 fn render_dirty_page_indices(state: &EditorState) -> Vec<usize> {
-    state
-        .pages()
-        .into_iter()
-        .enumerate()
-        .filter_map(|(index, page)| {
-            (page.render_dirty || page.bubbles.iter().any(|bubble| bubble.render_dirty))
-                .then_some(index)
-        })
+    (0..state.page_count())
+        .filter(|&index| state.page_has_render_dirty(index))
         .collect()
 }
 

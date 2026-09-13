@@ -148,6 +148,18 @@ impl EditorState {
             .unwrap_or_default()
     }
 
+    /// Materialize one page view without cloning the other pages. The native
+    /// editor uses this accessor on every frame so a large project stays in
+    /// the raw JSON state while only the current/visible pages are adapted for
+    /// painting and inspection.
+    pub fn page(&self, index: usize) -> Option<PageView> {
+        self.value
+            .get("pages")
+            .and_then(|v| v.as_array())
+            .and_then(|pages| pages.get(index))
+            .map(|page| self.page_view(page))
+    }
+
     fn page_view(&self, page: &serde_json::Value) -> PageView {
         let source = self.resolve_path(
             page.get("image_path")
@@ -326,6 +338,31 @@ impl EditorState {
             .and_then(|page| page.get("render_dirty"))
             .and_then(|value| value.as_bool())
             .unwrap_or(false)
+    }
+
+    pub(crate) fn page_has_render_dirty(&self, page_index: usize) -> bool {
+        let Some(page) = self
+            .value
+            .get("pages")
+            .and_then(|pages| pages.as_array())
+            .and_then(|pages| pages.get(page_index))
+        else {
+            return false;
+        };
+        page.get("render_dirty")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+            || page
+                .get("bubbles")
+                .and_then(|bubbles| bubbles.as_array())
+                .is_some_and(|bubbles| {
+                    bubbles.iter().any(|bubble| {
+                        bubble
+                            .get("render_dirty")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false)
+                    })
+                })
     }
 
     pub(crate) fn set_page_render_dirty(&mut self, page_index: usize, dirty: bool) {

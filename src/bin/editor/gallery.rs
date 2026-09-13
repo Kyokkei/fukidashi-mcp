@@ -3,6 +3,7 @@
 use eframe::egui::{self, SidePanel, StrokeKind};
 
 use super::EditorApp;
+use super::state::EditorState;
 
 impl EditorApp {
     pub fn gallery_ui(&mut self, ctx: &egui::Context) {
@@ -11,16 +12,23 @@ impl EditorApp {
             .default_width(120.0)
             .show(ctx, |ui| {
                 ui.heading("Pages");
-                let pages = self.state.as_ref().map(|s| s.pages()).unwrap_or_default();
-                let page_count = pages.len();
+                let page_count = self
+                    .state
+                    .as_ref()
+                    .map(EditorState::page_count)
+                    .unwrap_or_default();
                 egui::ScrollArea::vertical().show_rows(
                     ui,
                     super::THUMBNAIL_ROW_HEIGHT,
                     page_count,
                     |ui, row_range| {
                         for index in row_range {
-                            let page = &pages[index];
-                            let thumb = self.load_thumbnail(index, page);
+                            let Some(page) =
+                                self.state.as_ref().and_then(|state| state.page(index))
+                            else {
+                                continue;
+                            };
+                            let thumb = self.load_thumbnail(index, &page);
                             let is_current = index == self.current_page;
                             let flagged = page.has_bubble_flags();
                             let has_issues = !page.issues.is_empty();
