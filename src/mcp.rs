@@ -100,7 +100,7 @@ pub struct TypesetRequest {
     #[serde(default)]
     pub fallback_font_paths: Vec<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct EditorRequest {
     /// A verified rendered artifact. Optional when `job_path` or `job_id` is
     /// supplied; the server then selects the first verified render.
@@ -121,12 +121,51 @@ pub struct EditorRequest {
     /// Reopen a completed review in a new native/loopback review cycle.
     /// Defaults to true for direct editor requests; the combined review/export
     /// flow disables this to preserve its already-approved fast path.
-    #[serde(default = "default_reopen_completed")]
+    #[schemars(schema_with = "reopen_completed_schema")]
     pub reopen_completed: bool,
+}
+
+impl<'de> Deserialize<'de> for EditorRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            image_path: Option<String>,
+            #[serde(default)]
+            job_path: Option<String>,
+            #[serde(default)]
+            job_id: Option<String>,
+            #[serde(default)]
+            json_data: Option<serde_json::Value>,
+            #[serde(default)]
+            reopen_completed: Option<bool>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(Self {
+            image_path: wire.image_path,
+            job_path: wire.job_path,
+            job_id: wire.job_id,
+            json_data: wire.json_data,
+            reopen_completed: wire
+                .reopen_completed
+                .unwrap_or_else(default_reopen_completed),
+        })
+    }
 }
 
 fn json_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({"type": "object"})
+}
+
+fn reopen_completed_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "boolean",
+        "description": "Whether a completed review should be reopened as a new review cycle"
+    })
 }
 
 fn lore_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -639,7 +678,72 @@ fn saved_translation_items(
                 .unwrap_or(false),
         });
     }
+    validate_analysis_handoff_coverage(analysis, &parsed)?;
     Ok(parsed)
+}
+
+fn validate_analysis_handoff_coverage(
+    analysis: &serde_json::Value,
+    items: &[SavedTranslationItem],
+) -> Result<(), FukidashiError> {
+    let ids = items
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for key in ["bubbles", "unmatched_text"] {
+        let Some(regions) = analysis.get(key).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for (index, region) in regions.iter().enumerate() {
+            let id = region
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    FukidashiError::InvalidInput(format!(
+                        "detected {key} region {index} has no stable id in the translation handoff"
+                    ))
+                })?;
+            if !ids.contains(id) {
+                return Err(FukidashiError::InvalidInput(format!(
+                    "detected {key} region {id:?} is missing from the translation handoff"
+                )));
+            }
+        }
+    }
+    let has_detected_regions = ["bubbles", "unmatched_text"].into_iter().any(|key| {
+        analysis
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|regions| !regions.is_empty())
+    });
+    if !has_detected_regions && items.is_empty() {
+        let target = analysis
+            .get("target_language")
+            .and_then(serde_json::Value::as_str);
+        let prose_line = analysis
+            .get("text_lines")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|line| {
+                let source_language = line
+                    .get("source_language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("auto");
+                let text = line
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                is_vietnamese_target(target) && is_english_prose(source_language, text)
+            });
+        if prose_line {
+            return Err(FukidashiError::InvalidInput(
+                "detected sentence-like text has no translation handoff item; refusing a silent pass-through".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn strict_item_json(item: &SavedTranslationItem) -> serde_json::Value {
@@ -705,12 +809,131 @@ fn resolve_sfx_mode(raw: Option<&str>) -> Result<bool, FukidashiError> {
 fn translatable_items(
     items: &[SavedTranslationItem],
     replace_sfx: bool,
+    target_language: Option<&str>,
 ) -> Vec<SavedTranslationItem> {
     items
         .iter()
-        .filter(|item| replace_sfx || !item.preserve_by_default)
+        .filter(|item| {
+            if item.keep_source {
+                return false;
+            }
+            replace_sfx
+                || !item.preserve_by_default
+                || (is_vietnamese_target(target_language)
+                    && is_english_prose(&item.source_language, &item.source_text))
+        })
         .cloned()
         .collect()
+}
+
+fn is_vietnamese_target(target_language: Option<&str>) -> bool {
+    target_language
+        .unwrap_or_default()
+        .split(['-', '_'])
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("vi"))
+}
+
+/// Detect a sentence-like Latin source conservatively enough to leave short
+/// labels and sound effects in the default preserve scope.  Long English
+/// prose still needs a translation decision when the target is Vietnamese,
+/// even if OCR placed it outside a speech-bubble contour.
+fn is_english_prose(source_language: &str, text: &str) -> bool {
+    let language = source_language.to_ascii_lowercase();
+    let language_is_english = language == "en"
+        || language.starts_with("en-")
+        || language.starts_with("en|")
+        || language == "auto"
+        || language == "und"
+        || language.is_empty();
+    if !language_is_english {
+        return false;
+    }
+    let text = text.trim();
+    if text.len() < 12 {
+        return false;
+    }
+    let latin_letters = text
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .count();
+    let letters = text
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .count();
+    if latin_letters < 10 || letters == 0 || latin_letters * 100 < letters * 65 {
+        return false;
+    }
+    let words = text
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphabetic()))
+        .filter(|word| {
+            !word.is_empty()
+                && word
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+        })
+        .collect::<Vec<_>>();
+    if words.len() < 3 {
+        return false;
+    }
+    let stopword_hits = words
+        .iter()
+        .filter(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "a" | "an"
+                    | "and"
+                    | "are"
+                    | "but"
+                    | "for"
+                    | "from"
+                    | "he"
+                    | "i"
+                    | "in"
+                    | "is"
+                    | "it"
+                    | "of"
+                    | "on"
+                    | "she"
+                    | "that"
+                    | "the"
+                    | "this"
+                    | "to"
+                    | "was"
+                    | "we"
+                    | "were"
+                    | "with"
+                    | "you"
+            )
+        })
+        .count();
+    let unique_words = words
+        .iter()
+        .map(|word| word.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>()
+        .len();
+    text.chars()
+        .any(|character| ".?!,:;'\"".contains(character))
+        || stopword_hits >= 2
+        || (words.len() >= 4 && unique_words >= 2)
+}
+
+fn normalized_source_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn translation_is_unchanged(
+    item: &SavedTranslationItem,
+    translation: &str,
+    target: Option<&str>,
+) -> bool {
+    is_vietnamese_target(target)
+        && is_english_prose(&item.source_language, &item.source_text)
+        && normalized_source_text(&item.source_text) == normalized_source_text(translation)
 }
 
 fn preserved_item_json(item: &SavedTranslationItem) -> serde_json::Value {
@@ -736,7 +959,7 @@ impl FukidashiServer {
         replace_sfx: bool,
     ) -> Result<String, FukidashiError> {
         let all_items = saved_translation_items(analysis)?;
-        let items = translatable_items(&all_items, replace_sfx);
+        let items = translatable_items(&all_items, replace_sfx, target_language.as_deref());
         if items.is_empty() {
             return Err(FukidashiError::InvalidInput(
                 "page has no translation items; keep the page outside the translation scope or review it manually instead of fabricating an unchanged clean artifact".into(),
@@ -887,13 +1110,15 @@ impl FukidashiServer {
         replace_sfx: bool,
     ) -> Result<serde_json::Value, FukidashiError> {
         let all_items = saved_translation_items(analysis)?;
-        let items = translatable_items(&all_items, replace_sfx);
+        let items = translatable_items(&all_items, replace_sfx, target_language.as_deref());
         let preserved_items = if replace_sfx {
             Vec::new()
         } else {
             all_items
                 .iter()
-                .filter(|item| item.preserve_by_default)
+                .filter(|item| {
+                    item.preserve_by_default && !items.iter().any(|required| required.id == item.id)
+                })
                 .map(preserved_item_json)
                 .collect::<Vec<_>>()
         };
@@ -1159,7 +1384,13 @@ impl FukidashiServer {
                 self.analyze_strict_page(&pending, request).await?
             };
             let all_items = saved_translation_items(&analysis)?;
-            let items = translatable_items(&all_items, replace_sfx);
+            let items = translatable_items(
+                &all_items,
+                replace_sfx,
+                analysis
+                    .get("target_language")
+                    .and_then(serde_json::Value::as_str),
+            );
             if !replace_sfx && items.is_empty() {
                 emit_page_progress(
                     pending.page_number,
@@ -1356,7 +1587,11 @@ impl FukidashiServer {
         submissions: &[TranslationSubmission],
     ) -> Result<StrictSubmissionPlan, FukidashiError> {
         let all_items = saved_translation_items(analysis)?;
-        let items = translatable_items(&all_items, claim.replace_sfx);
+        let items = translatable_items(
+            &all_items,
+            claim.replace_sfx,
+            claim.target_language.as_deref(),
+        );
         let index_by_id = items
             .iter()
             .enumerate()
@@ -1407,6 +1642,12 @@ impl FukidashiServer {
                 if text.trim().is_empty() {
                     return Err(FukidashiError::InvalidInput(format!(
                         "translation id {id:?} is empty; use keep_source=true to preserve OCR text"
+                    )));
+                }
+                if translation_is_unchanged(&items[*index], text, claim.target_language.as_deref())
+                {
+                    return Err(FukidashiError::InvalidInput(format!(
+                        "translation id {id:?} is unchanged source-language prose; provide a Vietnamese translation or keep_source=true explicitly"
                     )));
                 }
                 text.to_owned()
@@ -1479,6 +1720,16 @@ impl FukidashiServer {
         }
         if !claim.replace_sfx {
             for item in item_values.iter_mut() {
+                let selected = plan.selected.iter().find(|selection| {
+                    selection.id
+                        == item
+                            .get("id")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default()
+                });
+                if selected.is_some() {
+                    continue;
+                }
                 let preserve = item
                     .get("preserve_by_default")
                     .and_then(serde_json::Value::as_bool)
@@ -1765,8 +2016,49 @@ fn checkpoint_item_is_preserved(item: &serde_json::Value, replace_sfx: bool) -> 
             .is_some_and(|id| id.starts_with("text-"))
 }
 
-fn checkpoint_item_is_translatable_dialogue(item: &serde_json::Value, replace_sfx: bool) -> bool {
-    if checkpoint_item_is_preserved(item, replace_sfx) {
+fn checkpoint_item_is_translatable_dialogue(
+    item: &serde_json::Value,
+    replace_sfx: bool,
+    target_language: Option<&str>,
+) -> bool {
+    if item
+        .get("keep_source")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if replace_sfx {
+        return true;
+    }
+    if !replace_sfx
+        && item
+            .get("preserve_by_default")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        && !(is_vietnamese_target(target_language)
+            && is_english_prose(
+                item.get("source_language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("auto"),
+                item.get("source_text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            ))
+    {
+        return false;
+    }
+    if checkpoint_item_is_preserved(item, replace_sfx)
+        && !(is_vietnamese_target(target_language)
+            && is_english_prose(
+                item.get("source_language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("auto"),
+                item.get("source_text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            ))
+    {
         return false;
     }
     let id = item
@@ -1778,6 +2070,15 @@ fn checkpoint_item_is_translatable_dialogue(item: &serde_json::Value, replace_sf
         .and_then(serde_json::Value::as_str)
         .unwrap_or("dialogue");
     !id.starts_with("text-") && kind != "unmatched_text"
+        || is_vietnamese_target(target_language)
+            && is_english_prose(
+                item.get("source_language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("auto"),
+                item.get("source_text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            )
 }
 
 fn checkpoint_text_regions(
@@ -1800,41 +2101,33 @@ fn checkpoint_text_regions(
         .unwrap_or(&[]);
     let mut preserved_bboxes = Vec::new();
     let mut translatable_bboxes = Vec::new();
-    let mut preserved_ids = BTreeSet::new();
+    let target_language = value
+        .get("target_language")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("translation_handoff")
+                .and_then(|handoff| handoff.get("target_language"))
+                .and_then(serde_json::Value::as_str)
+        });
     for item in handoff_items {
         let Some(rect) = json_bbox(item) else {
             continue;
         };
-        let id = item
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        if checkpoint_item_is_preserved(item, replace_sfx) {
-            preserved_bboxes.push(rect);
-            if !id.is_empty() {
-                preserved_ids.insert(id.to_owned());
-            }
-        } else if checkpoint_item_is_translatable_dialogue(item, replace_sfx) {
-            translatable_bboxes.push(rect);
-        }
-    }
-    // Dialogue strokes must stay in the inpaint mask even when a nearby
-    // preserved SFX/unmatched box overlaps them. Dropping those lines leaves
-    // source glyphs under the typeset translation.
-    if let Some(bubbles) = value.get("bubbles").and_then(serde_json::Value::as_array) {
-        for bubble in bubbles {
-            let Some(rect) = json_bbox(bubble) else {
-                continue;
-            };
-            let id = bubble
-                .get("id")
+        if checkpoint_item_is_translatable_dialogue(item, replace_sfx, target_language) {
+            let source_text = item
+                .get("source_text")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            if preserved_ids.contains(id) {
-                preserved_bboxes.push(rect);
-            } else if !id.starts_with("text-") {
-                translatable_bboxes.push(rect);
-            }
+                .unwrap_or_default()
+                .to_owned();
+            let source_language = item
+                .get("source_language")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("auto")
+                .to_owned();
+            translatable_bboxes.push((rect, source_text, source_language));
+        } else if checkpoint_item_is_preserved(item, replace_sfx) {
+            preserved_bboxes.push(rect);
         }
     }
     let lines = value
@@ -1848,11 +2141,30 @@ fn checkpoint_text_regions(
         let rect = serde_json::from_value::<Rect>(line.get("bbox").cloned().unwrap_or_default())
             .map_err(FukidashiError::from)
             .and_then(Rect::validate)?;
-        let belongs_to_dialogue = translatable_bboxes
+        let line_text = line
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let overlapping_translatable = translatable_bboxes
             .iter()
-            .any(|bubble| rects_overlap(rect, *bubble));
-        if belongs_to_dialogue {
-            regions.push(rect);
+            .filter(|(bubble, _, _)| rects_overlap(rect, *bubble))
+            .collect::<Vec<_>>();
+        if !overlapping_translatable.is_empty() {
+            if overlapping_translatable
+                .iter()
+                .any(|(_, source, language)| source_text_covers_line(source, line_text, language))
+            {
+                regions.push(rect);
+                continue;
+            }
+            return Err(FukidashiError::InvalidInput(
+                "detected text inside a translated region is not represented by its source item; refusing destructive cleaning".into(),
+            ));
+        }
+        if preserved_bboxes
+            .iter()
+            .any(|preserved| rects_overlap(rect, *preserved))
+        {
             continue;
         }
         // Low-confidence unmatched detections are commonly art/sfx geometry
@@ -1866,15 +2178,61 @@ fn checkpoint_text_regions(
         if !confident {
             continue;
         }
-        if preserved_bboxes
-            .iter()
-            .any(|preserved| rects_overlap(rect, *preserved))
-        {
-            continue;
+        let source_language = line
+            .get("source_language")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto");
+        if is_vietnamese_target(target_language) && is_english_prose(source_language, line_text) {
+            return Err(FukidashiError::InvalidInput(
+                "detected sentence-like text has no translated item; refusing destructive cleaning"
+                    .into(),
+            ));
         }
-        regions.push(rect);
+        // A line without a matching item may be a sound effect or artwork.
+        // Leave it in the source image; only item-backed lines may enter a
+        // destructive clean mask.
     }
     Ok(regions)
+}
+
+fn source_text_covers_line(source: &str, line: &str, source_language: &str) -> bool {
+    if line.trim().is_empty() || source.trim().is_empty() {
+        return false;
+    }
+    let source_normalized = normalized_source_text(source);
+    let line_normalized = normalized_source_text(line);
+    if !line_normalized.is_empty() && source_normalized == line_normalized {
+        return true;
+    }
+    if line_normalized.len() < 8 {
+        return false;
+    }
+    if source_normalized.contains(&line_normalized) {
+        return true;
+    }
+    if !is_english_prose(source_language, line) {
+        return false;
+    }
+    let source_words = source
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let line_words = line
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if line_words.len() < 2 {
+        return false;
+    }
+    let matching = line_words
+        .iter()
+        .filter(|word| source_words.iter().any(|candidate| candidate == *word))
+        .count();
+    matching * 4 >= line_words.len() * 3
 }
 
 #[tool_router]
@@ -3701,8 +4059,8 @@ mod tests {
     #[test]
     fn strict_sfx_policy_preserves_legacy_text_ids_by_default() {
         let items = saved_translation_items(&strict_fixture_analysis()).unwrap();
-        let preserved = translatable_items(&items, false);
-        let replaced = translatable_items(&items, true);
+        let preserved = translatable_items(&items, false, Some("vi"));
+        let replaced = translatable_items(&items, true, Some("vi"));
         assert_eq!(
             preserved
                 .iter()
@@ -3714,6 +4072,93 @@ mod tests {
         assert_eq!(items[1].kind, "unmatched_text");
         assert!(items[1].preserve_by_default);
         assert_eq!(preserved_item_json(&items[1])["translation_allowed"], false);
+    }
+
+    #[test]
+    fn vietnamese_target_promotes_english_prose_outside_bubbles() {
+        let analysis = serde_json::json!({
+            "source_language": "en",
+            "target_language": "vi",
+            "bubbles": [],
+            "text_lines": [],
+            "unmatched_text": [{
+                "id": "text-prose",
+                "bbox": {"x1": 1.0, "y1": 1.0, "x2": 80.0, "y2": 40.0}
+            }],
+            "translation_handoff": {"items": [{
+                "id": "text-prose",
+                "kind": "unmatched_text",
+                "preserve_by_default": true,
+                "source_text": "The old friend came back and everyone heard the story.",
+                "source_language": "en",
+                "confidence": 0.9,
+                "bbox": {"x1": 1.0, "y1": 1.0, "x2": 80.0, "y2": 40.0}
+            }]}
+        });
+        let items = saved_translation_items(&analysis).unwrap();
+        let required = translatable_items(&items, false, Some("vi"));
+        assert_eq!(
+            required
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["text-prose"]
+        );
+        assert!(translatable_items(&items, false, Some("en")).is_empty());
+    }
+
+    #[test]
+    fn detected_regions_must_have_handoff_items() {
+        let mut analysis = strict_fixture_analysis();
+        analysis["bubbles"] = serde_json::json!([
+            {"id":"bubble-1","detector_label":0,"bbox":{"x1":0.5,"y1":0.5,"x2":20.0,"y2":20.0}},
+            {"id":"bubble-missing","detector_label":0,"bbox":{"x1":21.0,"y1":1.0,"x2":40.0,"y2":20.0}}
+        ]);
+        let error = saved_translation_items(&analysis).unwrap_err().to_string();
+        assert!(error.contains("bubble-missing"));
+    }
+
+    #[test]
+    fn clean_mask_rejects_text_inside_a_broad_untranslated_region() {
+        let mut analysis = overlapping_double_text_checkpoint();
+        analysis["text_lines"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "id": "line-unrepresented",
+                "text": "ANOTHER ENGLISH SENTENCE HERE",
+                "source_language": "en",
+                "confidence": 0.99,
+                "bbox": {"x1": 30.0, "y1": 58.0, "x2": 70.0, "y2": 78.0}
+            }));
+        let (_dir, path) = write_checkpoint(&analysis);
+        let error = checkpoint_text_regions(&path, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not represented"));
+    }
+
+    #[test]
+    fn empty_handoff_cannot_silently_preserve_detected_english_prose() {
+        let analysis = serde_json::json!({
+            "target_language": "vi",
+            "bubbles": [],
+            "unmatched_text": [],
+            "text_lines": [{
+                "text": "This long English paragraph was detected on the page.",
+                "source_language": "en",
+                "confidence": 0.95,
+                "bbox": {"x1": 1.0, "y1": 1.0, "x2": 80.0, "y2": 40.0}
+            }],
+            "translation_handoff": {"items": []}
+        });
+        let (_dir, path) = write_checkpoint(&analysis);
+        let error = saved_translation_items(&analysis).unwrap_err().to_string();
+        assert!(error.contains("silent pass-through"));
+        let error = checkpoint_text_regions(&path, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no translated item"));
     }
 
     fn write_checkpoint(value: &serde_json::Value) -> (tempfile::TempDir, std::path::PathBuf) {
@@ -3732,21 +4177,25 @@ mod tests {
             "text_lines": [
                 {
                     "id": "line-dialogue",
+                    "text": "原文",
                     "confidence": 0.91,
                     "bbox": {"x1": 20.0, "y1": 20.0, "x2": 60.0, "y2": 40.0}
                 },
                 {
                     "id": "line-low-conf-dialogue",
+                    "text": "原文",
                     "confidence": 0.21,
                     "bbox": {"x1": 22.0, "y1": 42.0, "x2": 58.0, "y2": 55.0}
                 },
                 {
                     "id": "line-sfx",
+                    "text": "ドン",
                     "confidence": 0.96,
                     "bbox": {"x1": 82.0, "y1": 82.0, "x2": 110.0, "y2": 110.0}
                 },
                 {
                     "id": "line-noise",
+                    "text": "",
                     "confidence": 0.18,
                     "bbox": {"x1": 1.0, "y1": 1.0, "x2": 8.0, "y2": 8.0}
                 }

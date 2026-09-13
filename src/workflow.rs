@@ -1902,6 +1902,7 @@ impl Workflow {
                 );
             }
         }
+        validate_typeset_completeness(&output_job, &source, &typeset)?;
         let sidecar = render_sidecar(&output);
         let artifact = RenderArtifact {
             stage: "rendered".into(),
@@ -2070,6 +2071,53 @@ impl Workflow {
         Ok(())
     }
 
+    /// Validate every rendered sidecar before a managed review is approved.
+    ///
+    /// The editor may reopen legacy jobs whose older artifacts predate the
+    /// completeness checks. Keeping this gate at approval time lets an
+    /// operator repair those pages in the editor while still preventing an
+    /// unchanged English or silently erased region from reaching export.
+    pub fn validate_editor_completeness(
+        &self,
+        job: &Path,
+        state: &serde_json::Value,
+    ) -> Result<()> {
+        let job = canonical_path(job)?;
+        let manifest = load_manifest(&job)?;
+        let expected_pages = if manifest.expected_pages.is_empty() {
+            manifest
+                .pages
+                .values()
+                .map(|page| page.source_image.clone())
+                .collect::<Vec<_>>()
+        } else {
+            manifest.expected_pages.clone()
+        };
+        let page_count = state
+            .get("pages")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        if page_count != expected_pages.len() {
+            bail!(
+                "review state has {page_count} pages but the managed job requires {}",
+                expected_pages.len()
+            );
+        }
+        for source in expected_pages {
+            let page = manifest
+                .pages
+                .get(&page_key(&source))
+                .ok_or_else(|| anyhow!("expected page is missing from the managed manifest"))?;
+            let rendered = page
+                .rendered_image
+                .as_ref()
+                .ok_or_else(|| anyhow!("expected page is not rendered: {}", source.display()))?;
+            let artifact = self.validate_render_input(rendered)?;
+            validate_typeset_completeness(&job, &source, &artifact.typeset)?;
+        }
+        Ok(())
+    }
+
     pub fn validate_export_job(&self, project_dir: &Path) -> Result<()> {
         let project_dir = self.require_owned(project_dir, "export project")?;
         let manifest = load_manifest(&project_dir)?;
@@ -2184,6 +2232,341 @@ fn stable_page_id(path: &Path) -> String {
     let identity = path_identity(path).unwrap_or_else(|_| path.to_string_lossy().into_owned());
     hasher.update(identity.as_bytes());
     format!("page-{:x}", hasher.finalize())
+}
+
+fn is_vietnamese_target(target_language: Option<&str>) -> bool {
+    target_language
+        .unwrap_or_default()
+        .split(['-', '_'])
+        .next()
+        .is_some_and(|language| language.eq_ignore_ascii_case("vi"))
+}
+
+fn is_english_prose(source_language: &str, text: &str) -> bool {
+    let language = source_language.to_ascii_lowercase();
+    let language_is_english = language == "en"
+        || language.starts_with("en-")
+        || language.starts_with("en|")
+        || language == "auto"
+        || language == "und"
+        || language.is_empty();
+    if !language_is_english {
+        return false;
+    }
+    let text = text.trim();
+    if text.len() < 12 {
+        return false;
+    }
+    let latin_letters = text
+        .chars()
+        .filter(|character| character.is_ascii_alphabetic())
+        .count();
+    let letters = text
+        .chars()
+        .filter(|character| character.is_alphabetic())
+        .count();
+    if latin_letters < 10 || letters == 0 || latin_letters * 100 < letters * 65 {
+        return false;
+    }
+    let words = text
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_ascii_alphabetic()))
+        .filter(|word| {
+            !word.is_empty()
+                && word
+                    .chars()
+                    .all(|character| character.is_ascii_alphabetic())
+        })
+        .collect::<Vec<_>>();
+    if words.len() < 3 {
+        return false;
+    }
+    let stopword_hits = words
+        .iter()
+        .filter(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "a" | "an"
+                    | "and"
+                    | "are"
+                    | "but"
+                    | "for"
+                    | "from"
+                    | "he"
+                    | "i"
+                    | "in"
+                    | "is"
+                    | "it"
+                    | "of"
+                    | "on"
+                    | "she"
+                    | "that"
+                    | "the"
+                    | "this"
+                    | "to"
+                    | "was"
+                    | "we"
+                    | "were"
+                    | "with"
+                    | "you"
+            )
+        })
+        .count();
+    let unique_words = words
+        .iter()
+        .map(|word| word.to_ascii_lowercase())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    text.chars()
+        .any(|character| ".?!,:;'\"".contains(character))
+        || stopword_hits >= 2
+        || (words.len() >= 4 && unique_words >= 2)
+}
+
+fn normalized_source_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn source_text_covers_line(source: &str, line: &str, source_language: &str) -> bool {
+    if source.trim().is_empty() || line.trim().is_empty() {
+        return false;
+    }
+    let source_normalized = normalized_source_text(source);
+    let line_normalized = normalized_source_text(line);
+    if !line_normalized.is_empty() && source_normalized == line_normalized {
+        return true;
+    }
+    if line_normalized.len() < 8 || source_normalized.contains(&line_normalized) {
+        return !line_normalized.is_empty() && source_normalized.contains(&line_normalized);
+    }
+    if !is_english_prose(source_language, line) {
+        return false;
+    }
+    let source_words = source
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    let line_words = line
+        .split_whitespace()
+        .map(|word| word.trim_matches(|character: char| !character.is_alphanumeric()))
+        .filter(|word| !word.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
+    if line_words.len() < 2 {
+        return false;
+    }
+    let matching = line_words
+        .iter()
+        .filter(|word| source_words.iter().any(|candidate| candidate == *word))
+        .count();
+    matching * 4 >= line_words.len() * 3
+}
+
+fn explicit_source_preserve(item: &serde_json::Value) -> bool {
+    item.get("keep_source")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || item
+            .get("preserve_source")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn default_source_preserve(item: &serde_json::Value, replace_sfx: bool) -> bool {
+    !replace_sfx
+        && (item
+            .get("preserve_by_default")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || item
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "unmatched_text")
+            || item
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("text-")))
+}
+
+fn explicit_or_default_source_preserve(item: &serde_json::Value, replace_sfx: bool) -> bool {
+    explicit_source_preserve(item) || default_source_preserve(item, replace_sfx)
+}
+
+fn validate_typeset_completeness(
+    job: &Path,
+    source: &Path,
+    typeset: &serde_json::Value,
+) -> Result<()> {
+    let manifest = load_manifest(job)?;
+    let analysis = page_artifacts(job, &manifest, source)?.analysis;
+    if !analysis.is_file() {
+        return Ok(());
+    }
+    let bytes = fs::read(&analysis).context("read analysis for render completeness")?;
+    let analysis: serde_json::Value =
+        serde_json::from_slice(&bytes).context("parse analysis for render completeness")?;
+    let items = analysis
+        .get("translation_handoff")
+        .and_then(|handoff| handoff.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let target = analysis
+        .get("target_language")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            analysis
+                .get("translation_handoff")
+                .and_then(|handoff| handoff.get("target_language"))
+                .and_then(serde_json::Value::as_str)
+        });
+    let replace_sfx = analysis
+        .get("strict_v1")
+        .and_then(|strict| strict.get("sfx_mode"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|mode| mode == "replace");
+    let requests = typeset
+        .get("request_bubbles")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    // A detector region must be represented by the persisted handoff before
+    // it can be cleaned. This also catches the historical broad-bubble case
+    // where one OCR item accidentally erased several independent text lines.
+    let handoff_ids = items
+        .iter()
+        .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    for key in ["bubbles", "unmatched_text"] {
+        let Some(regions) = analysis.get(key).and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for (index, region) in regions.iter().enumerate() {
+            let Some(id) = region.get("id").and_then(serde_json::Value::as_str) else {
+                bail!("detected {key} region {index} has no stable id");
+            };
+            if !handoff_ids.contains(id) {
+                bail!("detected {key} region {id:?} has no translation handoff item");
+            }
+        }
+    }
+    for item in items {
+        let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
+            bail!("translation item without an id cannot be rendered");
+        };
+        let source_language = item
+            .get("source_language")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto");
+        let source_text = item
+            .get("source_text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let prose = is_vietnamese_target(target) && is_english_prose(source_language, source_text);
+        let preserved = explicit_source_preserve(item)
+            || (default_source_preserve(item, replace_sfx) && !prose);
+        if preserved {
+            continue;
+        }
+        let request = requests
+            .iter()
+            .find(|request| request.get("id").and_then(serde_json::Value::as_str) == Some(id));
+        let Some(request) = request else {
+            bail!("translation item {id:?} has no rendered bubble");
+        };
+        let text = request
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            bail!("translation item {id:?} has an empty rendered translation");
+        }
+        if prose && normalized_source_text(source_text) == normalized_source_text(text) {
+            bail!("translation item {id:?} retained unchanged English prose");
+        }
+    }
+    for (index, request) in requests.iter().enumerate() {
+        let text = request
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let preserved = explicit_source_preserve(request)
+            || request
+                .get("preserve_by_default")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            || request
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|kind| kind == "unmatched_text")
+            || request
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id.starts_with("text-"));
+        if text.trim().is_empty() && !preserved {
+            bail!("rendered bubble {index} has an empty translation");
+        }
+    }
+
+    // OCR prose can exist outside a detector bubble. Require a translated
+    // request for every such line, while permitting an explicit preserve
+    // decision. A manual editor bubble may supply the missing source text for
+    // a legacy checkpoint, but an empty request cannot satisfy this gate.
+    if is_vietnamese_target(target)
+        && let Some(lines) = analysis
+            .get("text_lines")
+            .and_then(serde_json::Value::as_array)
+    {
+        for (index, line) in lines.iter().enumerate() {
+            let source_language = line
+                .get("source_language")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("auto");
+            let line_text = line
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if !is_english_prose(source_language, line_text) {
+                continue;
+            }
+            let covered = requests.iter().any(|request| {
+                let source = request
+                    .get("source_text")
+                    .or_else(|| request.get("original_text"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                let request_language = request
+                    .get("source_language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(source_language);
+                if !source_text_covers_line(source, line_text, request_language) {
+                    return false;
+                }
+                if explicit_or_default_source_preserve(request, replace_sfx) {
+                    return true;
+                }
+                let text = request
+                    .get("text")
+                    .or_else(|| request.get("translation"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                !text.trim().is_empty()
+                    && normalized_source_text(source) != normalized_source_text(text)
+            });
+            if !covered {
+                bail!(
+                    "detected English prose line {index} has no translated or explicitly preserved item"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json::Value> {
@@ -3863,6 +4246,93 @@ mod tests {
         assert_eq!(bubbles[0]["text_color"], "white");
         assert_eq!(bubbles[0]["resolved_text_color"], "white");
         assert_eq!(bubbles[0]["sampled_luminance"], 23);
+    }
+
+    #[test]
+    fn render_completeness_rejects_missing_or_unchanged_translation() {
+        let dir = tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        let source = dir.path().join("page.png");
+        RgbImage::from_pixel(32, 32, image::Rgb([255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let workflow = Workflow::new(jobs).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+        workflow
+            .write_analysis_artifact(
+                &source,
+                &json!({
+                    "target_language": "vi",
+                    "bubbles": [{"id":"bubble-1","bbox":{"x1":1.0,"y1":1.0,"x2":20.0,"y2":20.0}}],
+                    "text_lines": [],
+                    "unmatched_text": [],
+                    "translation_handoff": {"items": [{
+                        "id":"bubble-1",
+                        "kind":"dialogue",
+                        "source_text":"The character speaks to everyone in the room.",
+                        "source_language":"en",
+                        "bbox":{"x1":1.0,"y1":1.0,"x2":20.0,"y2":20.0}
+                    }]}
+                }),
+            )
+            .unwrap();
+        let missing = json!({"request_bubbles": []});
+        let error = validate_typeset_completeness(&registration.job_dir, &source, &missing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no rendered bubble"));
+        let unchanged = json!({"request_bubbles": [{
+            "id":"bubble-1",
+            "text":"The character speaks to everyone in the room."
+        }]});
+        let error = validate_typeset_completeness(&registration.job_dir, &source, &unchanged)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unchanged English prose"));
+        let translated = json!({"request_bubbles": [{
+            "id":"bubble-1",
+            "text":"Nhân vật nói chuyện với mọi người trong phòng.",
+            "preserve_source": false
+        }]});
+        validate_typeset_completeness(&registration.job_dir, &source, &translated).unwrap();
+
+        workflow
+            .write_analysis_artifact(
+                &source,
+                &json!({
+                    "target_language": "vi",
+                    "bubbles": [],
+                    "text_lines": [{
+                        "text":"This legacy prose line was detected outside a bubble.",
+                        "source_language":"en",
+                        "confidence":0.98,
+                        "bbox":{"x1":1.0,"y1":1.0,"x2":30.0,"y2":8.0}
+                    }],
+                    "unmatched_text": [],
+                    "translation_handoff": {"items": []}
+                }),
+            )
+            .unwrap();
+        let error = validate_typeset_completeness(
+            &registration.job_dir,
+            &source,
+            &json!({"request_bubbles": []}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no translated or explicitly preserved item"));
+        validate_typeset_completeness(
+            &registration.job_dir,
+            &source,
+            &json!({"request_bubbles": [{
+                "id":"manual-prose",
+                "source_text":"This legacy prose line was detected outside a bubble.",
+                "source_language":"en",
+                "text":"Dòng văn bản cũ này được phát hiện bên ngoài bong bóng thoại.",
+                "bbox":{"x1":1.0,"y1":1.0,"x2":30.0,"y2":8.0}
+            }]}),
+        )
+        .unwrap();
     }
 
     #[test]

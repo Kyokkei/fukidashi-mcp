@@ -568,6 +568,26 @@ impl EditorApp {
             ));
             return;
         }
+        if (self.job_dir.join("job.json").is_file()
+            || self.job_dir.join(".fukidashi-job.json").is_file())
+            && self.job_dir.join("pages").is_dir()
+        {
+            let validation = fukidashi_mcp::workflow::Workflow::new(
+                self.job_dir.parent().unwrap_or(&self.job_dir).to_path_buf(),
+            )
+            .and_then(|workflow| {
+                self.state
+                    .as_ref()
+                    .map(|state| workflow.validate_editor_completeness(&self.job_dir, &state.value))
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("editor state is unavailable")))
+            });
+            if let Err(error) = validation {
+                self.error_message = Some(format!(
+                    "approval blocked by translation completeness validation: {error}"
+                ));
+                return;
+            }
+        }
         self.review.approved_pages =
             (0..self.state.as_ref().map(|s| s.page_count()).unwrap_or(0)).collect();
         self.review.status = "approved".to_owned();

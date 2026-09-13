@@ -543,7 +543,7 @@ fn approval_overrides_flags_issues_and_dirty_render_state() {
     assert_eq!(approved["status"], "approved");
     assert_eq!(
         approved["audit"].as_array().unwrap().last().unwrap()["advisory_count"],
-        3
+        4
     );
     let export = fukidashi_mcp::export::export_project(dir.path(), "zip");
     assert!(export.is_ok(), "unexpected export result: {export:?}");

@@ -604,6 +604,15 @@ fn submit_review(session: &Session, request: &Value) -> Result<Value> {
             {
                 bail!("approve_export requires every page to be explicitly approved");
             }
+            if session.server_owned_state && session.root_dir.join("pages").is_dir() {
+                let jobs_root = session
+                    .root_dir
+                    .parent()
+                    .ok_or_else(|| anyhow!("managed editor job has no jobs root"))?;
+                crate::workflow::Workflow::new(jobs_root.to_path_buf())?
+                    .validate_editor_completeness(&session.root_dir, &project)
+                    .context("managed review completeness validation")?;
+            }
             current.approved_pages = pages;
             current.status = "approved".to_owned();
         }
@@ -1484,6 +1493,30 @@ fn review_blockers(state: &Value) -> Vec<Value> {
                     bubbles
                         .iter()
                         .filter(|bubble| {
+                            let explicitly_preserved = bubble
+                                .get("preserve_source")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false)
+                                || bubble
+                                    .get("keep_source")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                                || bubble
+                                    .get("preserve_by_default")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                                || bubble
+                                    .get("kind")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|kind| kind == "unmatched_text")
+                                || bubble
+                                    .get("id")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|id| id.starts_with("text-"));
+                            let empty_translation = bubble
+                                .get("translation")
+                                .and_then(Value::as_str)
+                                .is_none_or(|text| text.trim().is_empty());
                             bubble
                                 .get("flagged")
                                 .and_then(Value::as_bool)
@@ -1492,6 +1525,7 @@ fn review_blockers(state: &Value) -> Vec<Value> {
                                     .get("problem")
                                     .and_then(Value::as_bool)
                                     .unwrap_or(false)
+                                || (empty_translation && !explicitly_preserved)
                         })
                         .map(|bubble| {
                             let explicit_flag = bubble
@@ -1502,6 +1536,10 @@ fn review_blockers(state: &Value) -> Vec<Value> {
                                     .get("problem")
                                     .and_then(Value::as_bool)
                                     .unwrap_or(false);
+                            let empty_translation = bubble
+                                .get("translation")
+                                .and_then(Value::as_str)
+                                .is_none_or(|text| text.trim().is_empty());
                             let source_ocr = bubble
                                 .get("source_text")
                                 .or_else(|| bubble.get("original_text"))
@@ -1514,12 +1552,24 @@ fn review_blockers(state: &Value) -> Vec<Value> {
                                 .unwrap_or_else(|| Value::String(String::new()));
                             json!({
                                 "page": page_index,
-                                "kind": "flagged_bubble",
+                                "kind": if empty_translation && !explicit_flag { "missing_translation" } else { "flagged_bubble" },
                                 "bubble_id": bubble.get("id").cloned().unwrap_or(Value::Null),
                                 "bbox": bubble.get("bbox").cloned().unwrap_or(Value::Null),
                                 "source_ocr": source_ocr,
                                 "current_translation": current_translation,
-                                "origin": if explicit_flag { "bubble-flag" } else { "bubble-problem" },
+                                "origin": if explicit_flag {
+                                    if bubble
+                                        .get("flagged")
+                                        .and_then(Value::as_bool)
+                                        .unwrap_or(false)
+                                    {
+                                        "bubble-flag"
+                                    } else {
+                                        "bubble-problem"
+                                    }
+                                } else {
+                                    "missing-translation"
+                                },
                             })
                         }),
                 );
@@ -1894,13 +1944,6 @@ fn translation_manifest(state: &Value) -> Value {
 }
 
 fn bubble_preserve_for_render(bubble: &Value) -> bool {
-    let text_is_empty = bubble
-        .get("translation")
-        .and_then(Value::as_str)
-        .is_none_or(|text| text.trim().is_empty());
-    if text_is_empty {
-        return true;
-    }
     if let Some(explicit) = bubble.get("preserve_source").and_then(Value::as_bool) {
         return explicit;
     }
