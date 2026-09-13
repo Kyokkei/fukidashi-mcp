@@ -11,6 +11,10 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
+// Managed jobs may contain a complete long-form chapter whose rendered pages
+// exceed the legacy aggregate input budget. Keep a separate hard ceiling for
+// those server-owned roots while retaining the smaller ad-hoc export limit.
+const MAX_MANAGED_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -73,10 +77,11 @@ pub fn export_project_to(
 ) -> Result<serde_json::Value> {
     let root = fs::canonicalize(project_dir)
         .with_context(|| format!("resolve project root {}", project_dir.display()))?;
+    let max_input_bytes = max_input_bytes(&root);
     crate::editor::export_gate(&root)?;
     let manifest_path = root.join("project.json");
     let manifest_bytes = fs::read(&manifest_path).context("read project.json")?;
-    if manifest_bytes.len() as u64 > MAX_INPUT_BYTES {
+    if manifest_bytes.len() as u64 > max_input_bytes {
         bail!("project manifest exceeds export limit");
     }
     let project: Project = serde_json::from_slice(&manifest_bytes).context("parse project.json")?;
@@ -89,7 +94,7 @@ pub fn export_project_to(
     if project.pages.is_empty() {
         bail!("project contains no pages");
     }
-    let pages = resolve_pages(&root, project.pages.clone())?;
+    let pages = resolve_pages(&root, project.pages.clone(), max_input_bytes)?;
     let output_dir = configured_output_dir
         .map(Path::to_path_buf)
         .unwrap_or_else(|| root.join("fukidashi-output"));
@@ -119,7 +124,15 @@ pub fn export_project_to(
     )
 }
 
-fn resolve_pages(root: &Path, pages: Vec<Page>) -> Result<Vec<ResolvedPage>> {
+fn max_input_bytes(root: &Path) -> u64 {
+    if root.join("job.json").is_file() || root.join(".fukidashi-job.json").is_file() {
+        MAX_MANAGED_INPUT_BYTES
+    } else {
+        MAX_INPUT_BYTES
+    }
+}
+
+fn resolve_pages(root: &Path, pages: Vec<Page>, max_input_bytes: u64) -> Result<Vec<ResolvedPage>> {
     let mut total = 0u64;
     pages
         .into_iter()
@@ -171,7 +184,7 @@ fn resolve_pages(root: &Path, pages: Vec<Page>) -> Result<Vec<ResolvedPage>> {
             total = total
                 .checked_add(size)
                 .ok_or_else(|| anyhow!("export size overflow"))?;
-            if total > MAX_INPUT_BYTES {
+            if total > max_input_bytes {
                 bail!("project assets exceed export input limit");
             }
             let image = fs::read(&source)
@@ -376,4 +389,24 @@ fn xml_attr(value: &str) -> String {
 }
 fn html_escape(value: &str) -> String {
     xml_escape(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn managed_export_budget_is_larger_but_still_bounded() {
+        let ad_hoc = tempdir().unwrap();
+        assert_eq!(max_input_bytes(ad_hoc.path()), MAX_INPUT_BYTES);
+
+        fs::write(ad_hoc.path().join("job.json"), b"{}").unwrap();
+        assert_eq!(max_input_bytes(ad_hoc.path()), MAX_MANAGED_INPUT_BYTES);
+
+        fs::remove_file(ad_hoc.path().join("job.json")).unwrap();
+        fs::write(ad_hoc.path().join(".fukidashi-job.json"), b"{}").unwrap();
+        assert_eq!(max_input_bytes(ad_hoc.path()), MAX_MANAGED_INPUT_BYTES);
+    }
 }
