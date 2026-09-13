@@ -39,8 +39,9 @@ pub struct EditorApp {
     job_dir: PathBuf,
     current_page: usize,
     canvas: canvas::CanvasState,
-    page_textures: HashMap<usize, TextureHandle>,
-    thumb_textures: HashMap<usize, TextureHandle>,
+    page_textures: TextureCache,
+    thumb_textures: TextureCache,
+    thumbnail_decodes: usize,
     dirty_since: Option<Instant>,
     /// Sender for the background autosave writer: `(epoch, project_value)`.
     /// The epoch is the sync-save counter at send time; the writer skips any
@@ -65,6 +66,69 @@ pub struct EditorApp {
 }
 
 const MAX_OPERATOR_HISTORY: usize = 64;
+const PAGE_TEXTURE_CACHE_CAPACITY: usize = 2;
+const THUMB_TEXTURE_CACHE_CAPACITY: usize = 12;
+const THUMBNAIL_MAX_EDGE: u32 = 160;
+pub(crate) const THUMBNAIL_ROW_HEIGHT: f32 = 100.0;
+
+/// Small LRU cache for GPU textures. The gallery can represent thousands of
+/// pages, but only the visible thumbnails and the current/previous canvas page
+/// need to stay resident. Dropping the handle releases the egui texture after
+/// the frame, so memory use follows the bound instead of the project size.
+struct TextureCache {
+    textures: HashMap<usize, TextureHandle>,
+    order: VecDeque<usize>,
+    capacity: usize,
+}
+
+impl TextureCache {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            textures: HashMap::new(),
+            order: VecDeque::new(),
+            capacity,
+        }
+    }
+
+    fn get(&mut self, index: usize) -> Option<TextureHandle> {
+        if self.textures.contains_key(&index) {
+            self.touch(index);
+            self.textures.get(&index).cloned()
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, index: usize, texture: TextureHandle) {
+        self.textures.insert(index, texture);
+        self.touch(index);
+        while self.textures.len() > self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.textures.remove(&oldest);
+        }
+    }
+
+    fn remove(&mut self, index: usize) {
+        self.textures.remove(&index);
+        self.order.retain(|entry| *entry != index);
+    }
+
+    fn clear(&mut self) {
+        self.textures.clear();
+        self.order.clear();
+    }
+
+    fn len(&self) -> usize {
+        self.textures.len()
+    }
+
+    fn touch(&mut self, index: usize) {
+        self.order.retain(|entry| *entry != index);
+        self.order.push_back(index);
+    }
+}
 
 fn push_history_snapshot(history: &mut VecDeque<serde_json::Value>, snapshot: serde_json::Value) {
     history.push_back(snapshot);
@@ -141,8 +205,9 @@ impl EditorApp {
             job_dir,
             current_page: 0,
             canvas: canvas::CanvasState::default(),
-            page_textures: HashMap::new(),
-            thumb_textures: HashMap::new(),
+            page_textures: TextureCache::with_capacity(PAGE_TEXTURE_CACHE_CAPACITY),
+            thumb_textures: TextureCache::with_capacity(THUMB_TEXTURE_CACHE_CAPACITY),
+            thumbnail_decodes: 0,
             dirty_since: None,
             save_tx,
             save_epoch,
@@ -174,16 +239,18 @@ impl EditorApp {
 
     fn load_texture_for(&mut self, path: &PathBuf, key: &str) -> TextureHandle {
         let expected = format!("page-{key}");
-        let cached = self.page_textures.get(&self.current_page);
-        let needs_reload = match cached {
-            Some(tex) => tex.name() != expected,
-            None => true,
-        };
-        if needs_reload {
+        if self
+            .page_textures
+            .get(self.current_page)
+            .is_some_and(|tex| tex.name() == expected)
+        {
+            return self.page_textures.get(self.current_page).unwrap();
+        }
+        {
             let tex = self.load_image_texture(path, &expected);
             self.page_textures.insert(self.current_page, tex);
         }
-        self.page_textures.get(&self.current_page).cloned().unwrap()
+        self.page_textures.get(self.current_page).unwrap()
     }
 
     fn load_image_texture(&self, path: &PathBuf, name: &str) -> TextureHandle {
@@ -203,7 +270,7 @@ impl EditorApp {
     }
 
     fn load_thumbnail(&mut self, index: usize, page: &PageView) -> Option<TextureHandle> {
-        if let Some(existing) = self.thumb_textures.get(&index) {
+        if let Some(existing) = self.thumb_textures.get(index) {
             return Some(existing.clone());
         }
         let path = page
@@ -212,9 +279,39 @@ impl EditorApp {
             .or_else(|| Some(page.cleaned_image_path.clone()))
             .filter(|p| p.exists())
             .or_else(|| Some(page.source_image_path.clone()))?;
-        let tex = self.load_image_texture(&path, &format!("thumb-{index}"));
+        self.thumbnail_decodes = self.thumbnail_decodes.saturating_add(1);
+        let tex = self.load_thumbnail_texture(&path, &format!("thumb-{index}"));
         self.thumb_textures.insert(index, tex.clone());
         Some(tex)
+    }
+
+    fn load_thumbnail_texture(&self, path: &PathBuf, name: &str) -> TextureHandle {
+        let ctx = self.ctx();
+        match image::open(path) {
+            Ok(image) => {
+                let rgba = image
+                    .thumbnail(THUMBNAIL_MAX_EDGE, THUMBNAIL_MAX_EDGE)
+                    .to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let pixels = rgba.into_raw();
+                let color_image = ColorImage::from_rgba_unmultiplied(size, &pixels);
+                ctx.load_texture(name, color_image, TextureOptions::default())
+            }
+            Err(_) => {
+                let color_image = ColorImage::from_rgba_unmultiplied([1, 1], &[200, 200, 200, 255]);
+                ctx.load_texture(name, color_image, TextureOptions::default())
+            }
+        }
+    }
+
+    fn clear_texture_caches(&mut self) {
+        self.page_textures.clear();
+        self.thumb_textures.clear();
+    }
+
+    fn invalidate_page_textures(&mut self, index: usize) {
+        self.page_textures.remove(index);
+        self.thumb_textures.remove(index);
     }
 
     fn load_brush_overlay(&mut self, page: &PageView) -> TextureHandle {
@@ -332,8 +429,7 @@ impl EditorApp {
         if let Some(state) = self.state.as_mut() {
             state.value = value;
         }
-        self.page_textures.clear();
-        self.thumb_textures.clear();
+        self.invalidate_page_textures(page_index);
         self.canvas.brush_overlay = None;
         self.canvas.brush_overlay_dirty = true;
         self.dirty_since = None;
@@ -398,7 +494,7 @@ impl EditorApp {
                 "✓ Saved and re-rendered current page".to_owned(),
                 std::time::Instant::now(),
             ));
-            self.page_textures.clear();
+            self.invalidate_page_textures(self.current_page);
         } else {
             self.notify_message = Some(("✓ Saved".to_owned(), std::time::Instant::now()));
         }
@@ -436,8 +532,7 @@ impl EditorApp {
         self.canvas.pan_start = None;
         self.canvas.brush_overlay = None;
         self.canvas.brush_overlay_dirty = true;
-        self.page_textures.clear();
-        self.thumb_textures.clear();
+        self.clear_texture_caches();
         self.schedule_save();
     }
 
@@ -710,7 +805,6 @@ impl EditorApp {
             self.canvas.selected_issue = None;
             self.canvas.brush_overlay_dirty = true;
             self.canvas.fit_applied = false;
-            self.page_textures.clear();
         }
         if undo || redo {
             if self.canvas.drag != canvas::DragState::None {
@@ -960,6 +1054,75 @@ mod tests {
             history.back().unwrap()["revision"],
             MAX_OPERATOR_HISTORY + 2
         );
+    }
+
+    #[test]
+    fn texture_cache_evicts_old_pages_at_a_fixed_bound() {
+        let context = Context::default();
+        let mut cache = TextureCache::with_capacity(PAGE_TEXTURE_CACHE_CAPACITY);
+        for index in 0..142 {
+            let texture = context.load_texture(
+                format!("page-{index}"),
+                ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]),
+                TextureOptions::default(),
+            );
+            cache.insert(index, texture);
+        }
+
+        assert_eq!(cache.len(), PAGE_TEXTURE_CACHE_CAPACITY);
+        assert!(cache.get(141).is_some());
+        assert!(cache.get(140).is_some());
+        assert!(cache.get(0).is_none());
+    }
+
+    #[test]
+    fn large_gallery_loads_only_visible_downscaled_thumbnails() {
+        let directory = tempfile::tempdir().unwrap();
+        let job_dir = directory.path().to_path_buf();
+        let image_path = job_dir.join("page.png");
+        image::ImageBuffer::<image::Rgb<u8>, _>::from_pixel(
+            1024,
+            1536,
+            image::Rgb([220, 220, 220]),
+        )
+        .save(&image_path)
+        .unwrap();
+        let pages = (0..142)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("page-{index}"),
+                    "image_path": "page.png",
+                    "cleaned_image_path": "missing-clean.png",
+                    "bubbles": []
+                })
+            })
+            .collect::<Vec<_>>();
+        state::atomic_write_json(
+            &job_dir.join("project.json"),
+            &serde_json::json!({"state_revision": 0, "pages": pages}),
+        )
+        .unwrap();
+
+        let exit_state = Arc::new(Mutex::new(crate::ExitState::default()));
+        let mut app = EditorApp::new(job_dir, None, exit_state).unwrap();
+        let context = Context::default();
+        app.context = Some(context.clone());
+        let _ = context.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 800.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| app.gallery_ui(ctx),
+        );
+
+        assert!(app.thumbnail_decodes < 142);
+        assert!(app.thumb_textures.len() <= THUMB_TEXTURE_CACHE_CAPACITY);
+        let thumbnail = app.thumb_textures.get(0).unwrap();
+        assert!(thumbnail.size_vec2().x <= THUMBNAIL_MAX_EDGE as f32);
+        assert!(thumbnail.size_vec2().y <= THUMBNAIL_MAX_EDGE as f32);
     }
 
     #[test]
