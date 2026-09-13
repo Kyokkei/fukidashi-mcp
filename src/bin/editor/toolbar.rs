@@ -114,72 +114,78 @@ impl EditorApp {
             .resizable(false)
             .exact_width(STRIP_WIDTH)
             .show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(6.0);
-                    for def in TOOLS {
-                        let active = self.canvas.active_tool == def.tool;
-                        let icon_tex = self.icon_textures.get(def.icon).cloned();
-                        let (rect, response) = ui.allocate_exact_size(
-                            Vec2::splat(ICON_SIZE + 8.0),
-                            egui::Sense::click(),
-                        );
-                        if active {
-                            ui.painter().rect_filled(
-                                rect,
-                                4.0,
-                                Color32::from_rgba_unmultiplied(0, 229, 255, 45),
+                let editing_enabled = !self.operation_active();
+                ui.add_enabled_ui(editing_enabled, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(6.0);
+                        for def in TOOLS {
+                            let active = self.canvas.active_tool == def.tool;
+                            let icon_tex = self.icon_textures.get(def.icon).cloned();
+                            let (rect, response) = ui.allocate_exact_size(
+                                Vec2::splat(ICON_SIZE + 8.0),
+                                egui::Sense::click(),
                             );
-                            ui.painter().rect_stroke(
-                                rect,
-                                4.0,
-                                egui::Stroke::new(1.5_f32, ACTIVE_COLOR),
-                                egui::StrokeKind::Middle,
-                            );
+                            if active {
+                                ui.painter().rect_filled(
+                                    rect,
+                                    4.0,
+                                    Color32::from_rgba_unmultiplied(0, 229, 255, 45),
+                                );
+                                ui.painter().rect_stroke(
+                                    rect,
+                                    4.0,
+                                    egui::Stroke::new(1.5_f32, ACTIVE_COLOR),
+                                    egui::StrokeKind::Middle,
+                                );
+                            }
+                            if let Some(tex) = icon_tex {
+                                let icon_rect = egui::Rect::from_center_size(
+                                    rect.center(),
+                                    Vec2::splat(ICON_SIZE),
+                                );
+                                ui.painter().image(
+                                    tex.id(),
+                                    icon_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::Pos2::ZERO,
+                                        egui::Pos2::new(1.0, 1.0),
+                                    ),
+                                    if active {
+                                        ACTIVE_COLOR
+                                    } else {
+                                        Color32::from_gray(190)
+                                    },
+                                );
+                            } else {
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    def.hotkey,
+                                    egui::FontId::monospace(12.0),
+                                    if active {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_gray(160)
+                                    },
+                                );
+                            }
+                            let resp = response.on_hover_ui(|ui| {
+                                ui.label(format!("{} ({})", def.tooltip, def.hotkey));
+                            });
+                            if resp.clicked() {
+                                self.set_active_tool(def.tool);
+                            }
+                            ui.add_space(2.0);
                         }
-                        if let Some(tex) = icon_tex {
-                            let icon_rect =
-                                egui::Rect::from_center_size(rect.center(), Vec2::splat(ICON_SIZE));
-                            ui.painter().image(
-                                tex.id(),
-                                icon_rect,
-                                egui::Rect::from_min_max(
-                                    egui::Pos2::ZERO,
-                                    egui::Pos2::new(1.0, 1.0),
-                                ),
-                                if active {
-                                    ACTIVE_COLOR
-                                } else {
-                                    Color32::from_gray(190)
-                                },
-                            );
-                        } else {
-                            ui.painter().text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                def.hotkey,
-                                egui::FontId::monospace(12.0),
-                                if active {
-                                    Color32::WHITE
-                                } else {
-                                    Color32::from_gray(160)
-                                },
-                            );
-                        }
-                        let resp = response.on_hover_ui(|ui| {
-                            ui.label(format!("{} ({})", def.tooltip, def.hotkey));
-                        });
-                        if resp.clicked() {
-                            self.set_active_tool(def.tool);
-                        }
-                        ui.add_space(2.0);
-                    }
+                    });
                 });
             });
     }
 
     pub fn tool_options_ui(&mut self, ui: &mut egui::Ui) {
         use super::canvas::{ActiveTool, BrushMode};
-        match self.canvas.active_tool {
+        let editing_enabled = !self.operation_active();
+        ui.add_enabled_ui(editing_enabled, |ui| match self.canvas.active_tool {
             ActiveTool::DrawBubble => {
                 ui.label("Shape: Ellipse");
             }
@@ -257,7 +263,7 @@ impl EditorApp {
                     });
             }
             ActiveTool::Select => {}
-        }
+        });
     }
 
     pub fn set_active_tool(&mut self, tool: super::canvas::ActiveTool) {

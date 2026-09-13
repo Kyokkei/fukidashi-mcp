@@ -847,6 +847,13 @@ impl EditorApp {
             }
         }
 
+        // Heavy save/render and approval operations run from a snapshot. Keep
+        // the canvas available for pan/zoom above, but do not let a new brush,
+        // bubble or transform mutation race that snapshot.
+        if self.operation_active() {
+            return;
+        }
+
         // Tool-based primary input routing.
         match self.canvas.active_tool {
             ActiveTool::Eyedropper => {

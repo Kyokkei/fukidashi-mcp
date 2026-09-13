@@ -11,90 +11,97 @@ impl EditorApp {
             .resizable(true)
             .default_width(300.0)
             .show(ctx, |ui| {
-                ui.heading("Inspector");
-                ui.separator();
-
-                // Variant picker.
-                let mut variant = self.canvas.current_variant;
-                ComboBox::from_label("Variant")
-                    .selected_text(match variant {
-                        super::canvas::Variant::Source => "Source",
-                        super::canvas::Variant::Cleaned => "Cleaned",
-                        super::canvas::Variant::Rendered => "Rendered",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut variant, super::canvas::Variant::Source, "Source");
-                        ui.selectable_value(
-                            &mut variant,
-                            super::canvas::Variant::Cleaned,
-                            "Cleaned",
-                        );
-                        ui.selectable_value(
-                            &mut variant,
-                            super::canvas::Variant::Rendered,
-                            "Rendered",
-                        );
-                    });
-                if variant != self.canvas.current_variant {
-                    self.cancel_drag();
-                    self.canvas.current_variant = variant;
-                }
-
-                ui.separator();
-
-                // Color palette (recent brush colors).
-                ui.collapsing("Color palette", |ui| {
-                    ui.label("Defaults and recent colors");
-                    ui.horizontal_wrapped(|ui| {
-                        for (label, color) in [
-                            ("White", egui::Color32::WHITE),
-                            ("Black", egui::Color32::BLACK),
-                        ] {
-                            if ui
-                                .add(
-                                    egui::Button::new(label)
-                                        .fill(color)
-                                        .min_size(egui::vec2(48.0, 24.0)),
-                                )
-                                .clicked()
-                            {
-                                self.canvas.brush_color = color;
-                            }
-                        }
-                        for color in self.canvas.recent_colors.clone() {
-                            if ui
-                                .add(
-                                    egui::Button::new("Recent")
-                                        .fill(color)
-                                        .min_size(egui::vec2(48.0, 24.0)),
-                                )
-                                .clicked()
-                            {
-                                self.canvas.brush_color = color;
-                            }
-                        }
-                    });
-                    ui.label(format!(
-                        "Current: {}",
-                        super::canvas::color32_to_hex(self.canvas.brush_color)
-                    ));
-                });
-
-                ui.separator();
-
-                // Bubble inspector or prompt.
-                let sel = self.canvas.selected;
-                if let Some((pi, bi)) = sel {
-                    self.bubble_inspector(ui, pi, bi);
-                } else {
-                    ui.label("Click a bubble on the canvas to edit it.");
-                }
-
-                // Error message at the very bottom.
-                if let Some(err) = &self.error_message {
+                let editing_enabled = !self.operation_active();
+                ui.add_enabled_ui(editing_enabled, |ui| {
+                    ui.heading("Inspector");
                     ui.separator();
-                    ui.colored_label(Color32::RED, format!("Error: {err}"));
-                }
+
+                    // Variant picker.
+                    let mut variant = self.canvas.current_variant;
+                    ComboBox::from_label("Variant")
+                        .selected_text(match variant {
+                            super::canvas::Variant::Source => "Source",
+                            super::canvas::Variant::Cleaned => "Cleaned",
+                            super::canvas::Variant::Rendered => "Rendered",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut variant,
+                                super::canvas::Variant::Source,
+                                "Source",
+                            );
+                            ui.selectable_value(
+                                &mut variant,
+                                super::canvas::Variant::Cleaned,
+                                "Cleaned",
+                            );
+                            ui.selectable_value(
+                                &mut variant,
+                                super::canvas::Variant::Rendered,
+                                "Rendered",
+                            );
+                        });
+                    if variant != self.canvas.current_variant {
+                        self.cancel_drag();
+                        self.canvas.current_variant = variant;
+                    }
+
+                    ui.separator();
+
+                    // Color palette (recent brush colors).
+                    ui.collapsing("Color palette", |ui| {
+                        ui.label("Defaults and recent colors");
+                        ui.horizontal_wrapped(|ui| {
+                            for (label, color) in [
+                                ("White", egui::Color32::WHITE),
+                                ("Black", egui::Color32::BLACK),
+                            ] {
+                                if ui
+                                    .add(
+                                        egui::Button::new(label)
+                                            .fill(color)
+                                            .min_size(egui::vec2(48.0, 24.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.canvas.brush_color = color;
+                                }
+                            }
+                            for color in self.canvas.recent_colors.clone() {
+                                if ui
+                                    .add(
+                                        egui::Button::new("Recent")
+                                            .fill(color)
+                                            .min_size(egui::vec2(48.0, 24.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.canvas.brush_color = color;
+                                }
+                            }
+                        });
+                        ui.label(format!(
+                            "Current: {}",
+                            super::canvas::color32_to_hex(self.canvas.brush_color)
+                        ));
+                    });
+
+                    ui.separator();
+
+                    // Bubble inspector or prompt.
+                    let sel = self.canvas.selected;
+                    if let Some((pi, bi)) = sel {
+                        self.bubble_inspector(ui, pi, bi);
+                    } else {
+                        ui.label("Click a bubble on the canvas to edit it.");
+                    }
+
+                    // Error message at the very bottom.
+                    if let Some(err) = &self.error_message {
+                        ui.separator();
+                        ui.colored_label(Color32::RED, format!("Error: {err}"));
+                    }
+                });
             });
     }
 

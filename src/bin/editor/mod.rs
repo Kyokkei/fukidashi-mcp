@@ -32,6 +32,59 @@ pub enum ExitAction {
     RequestFixes,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorOperationKind {
+    SaveRender,
+    Approve,
+}
+
+impl EditorOperationKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SaveRender => "Save & Render",
+            Self::Approve => "Approve & Export",
+        }
+    }
+}
+
+enum OperationEvent {
+    Progress {
+        current: usize,
+        total: usize,
+        message: String,
+    },
+    Succeeded {
+        kind: EditorOperationKind,
+        state: serde_json::Value,
+        review: Option<ReviewState>,
+        rendered_pages: Vec<usize>,
+        message: String,
+    },
+    Failed {
+        kind: EditorOperationKind,
+        error: String,
+    },
+}
+
+struct OperationRuntime {
+    kind: EditorOperationKind,
+    rx: std::sync::mpsc::Receiver<OperationEvent>,
+    current: usize,
+    total: usize,
+    message: String,
+}
+
+struct OperationRequest {
+    kind: EditorOperationKind,
+    job_dir: PathBuf,
+    state_value: serde_json::Value,
+    current_page: usize,
+    review: ReviewState,
+    save_epoch: Arc<Mutex<u64>>,
+    save_lock: Arc<Mutex<()>>,
+    repaint: Context,
+}
+
 pub struct EditorApp {
     /// `None` only transiently during construction of the surrounding `Box`.
     state: Option<EditorState>,
@@ -50,6 +103,13 @@ pub struct EditorApp {
     save_tx: std::sync::mpsc::SyncSender<(u64, serde_json::Value)>,
     /// Counter bumped by every synchronous save; shared with the writer.
     save_epoch: Arc<Mutex<u64>>,
+    /// Serializes every project write, including the autosave writer and the
+    /// explicit worker. This prevents a stale debounce snapshot from landing
+    /// in the middle of a render or approval operation.
+    save_lock: Arc<Mutex<()>>,
+    /// At most one heavy editor operation is active. The UI only polls this
+    /// channel; all disk/render work happens on the worker thread.
+    operation: Option<OperationRuntime>,
     exit_action: Option<ExitAction>,
     error_message: Option<String>,
     exit_state: Arc<Mutex<crate::ExitState>>,
@@ -179,6 +239,7 @@ impl EditorApp {
         let review = state::load_or_create_review(&job_dir, &review_session_id);
         let (save_tx, save_rx) = std::sync::mpsc::sync_channel::<(u64, serde_json::Value)>(1);
         let save_epoch: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+        let save_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
         // Background autosave writer. `atomic_write_json` fsyncs, which can
         // block for seconds on slow disks — that must never happen on the egui
         // UI thread, so debounced saves are handed off here. `try_send` drops
@@ -187,10 +248,14 @@ impl EditorApp {
         {
             let writer_dir = job_dir.clone();
             let writer_epoch = Arc::clone(&save_epoch);
+            let writer_lock = Arc::clone(&save_lock);
             std::thread::Builder::new()
                 .name("editor-autosave".to_owned())
                 .spawn(move || {
                     while let Ok((queued_epoch, value)) = save_rx.recv() {
+                        let Ok(_save_guard) = writer_lock.lock() else {
+                            break;
+                        };
                         // Skip snapshots superseded by a later synchronous save.
                         if *writer_epoch.lock().unwrap() > queued_epoch {
                             continue;
@@ -213,6 +278,8 @@ impl EditorApp {
             dirty_since: None,
             save_tx,
             save_epoch,
+            save_lock,
+            operation: None,
             exit_action: None,
             error_message: None,
             exit_state,
@@ -349,20 +416,24 @@ impl EditorApp {
         }
     }
 
-    /// Synchronous save used by explicit user-triggered one-shots (render,
-    /// approve, request fixes, Ctrl+S, exit). Bumps the save epoch so any
-    /// queued background snapshot from before this save is discarded — the
-    /// in-memory state it carried is now older than what's on disk.
+    /// Synchronous save retained for the small review/exit paths. Heavy render
+    /// and approval actions use the operation worker below.
     fn save_project_sync(&self, state: &EditorState) -> anyhow::Result<()> {
-        let result = state::save_project(state);
-        if result.is_ok() {
-            let mut epoch = self.save_epoch.lock().unwrap();
-            *epoch = epoch.saturating_add(1);
-        }
-        result
+        save_editor_snapshot(
+            &state.job_dir,
+            &state.value,
+            &self.save_epoch,
+            &self.save_lock,
+        )
     }
 
     fn flush_save_if_due(&mut self) {
+        // The explicit worker owns the project snapshot until it completes.
+        // Queueing the pre-operation UI state here could overwrite a
+        // normalized render result after the worker exits.
+        if self.operation_active() {
+            return;
+        }
         if let Some(since) = self.dirty_since {
             if since.elapsed() >= Duration::from_millis(800) {
                 // Snapshot the epoch alongside the value: if a synchronous
@@ -391,112 +462,178 @@ impl EditorApp {
     }
 
     fn rerender_current_page(&mut self) {
-        if let Err(error) = self.rerender_page_at(self.current_page) {
-            self.error_message = Some(format!("render failed: {error}"));
-        }
-    }
-
-    /// Render one page after saving the current in-memory edits, then reload
-    /// the server-normalized state.  Approval uses this same path for every
-    /// dirty page so it cannot record a review against stale bitmaps.
-    fn rerender_page_at(&mut self, page_index: usize) -> anyhow::Result<()> {
-        let image_path = self
-            .state
-            .as_ref()
-            .and_then(|state| state.page(page_index))
-            .and_then(|page| {
-                page.rendered_image_path
-                    .or(Some(page.cleaned_image_path))
-                    .or(Some(page.source_image_path))
-            })
-            .ok_or_else(|| anyhow::anyhow!("page has no image path"))?;
-        let state = self
-            .state
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("editor state is unavailable"))?;
-        // Inspector edits are debounced for normal work, but an explicit
-        // render must include every edit made immediately before the click.
-        self.save_project_sync(state)
-            .map_err(|error| anyhow::anyhow!("save failed before render: {error}"))?;
-        render::rerender_page(state, page_index, &image_path)?;
-
-        let bytes = std::fs::read(self.job_dir.join("project.json"))
-            .map_err(|error| anyhow::anyhow!("reload rendered project: {error}"))?;
-        let value = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .map_err(|error| anyhow::anyhow!("parse rendered project: {error}"))?;
-        if let Some(state) = self.state.as_mut() {
-            state.value = value;
-        }
-        self.invalidate_page_textures(page_index);
-        self.canvas.brush_overlay = None;
-        self.canvas.brush_overlay_dirty = true;
-        self.dirty_since = None;
-        Ok(())
-    }
-
-    fn rerender_dirty_pages_before_approval(&mut self) -> anyhow::Result<()> {
-        let dirty_pages = self
-            .state
-            .as_ref()
-            .map(render_dirty_page_indices)
-            .unwrap_or_default();
-        if dirty_pages.is_empty() {
-            return Ok(());
-        }
-        let original_page = self.current_page;
-        for (position, page_index) in dirty_pages.iter().copied().enumerate() {
-            self.current_page = page_index;
-            self.error_message = Some(format!(
-                "Re-rendering page {} of {} before approval…",
-                position + 1,
-                dirty_pages.len()
-            ));
-            if let Some(context) = &self.context {
-                context.request_repaint();
-            }
-            self.rerender_page_at(page_index).map_err(|error| {
-                anyhow::anyhow!("page {} could not be re-rendered: {error}", page_index + 1)
-            })?;
-        }
-        let page_count = self
-            .state
-            .as_ref()
-            .map(EditorState::page_count)
-            .unwrap_or(0);
-        self.current_page = original_page.min(page_count.saturating_sub(1));
-        self.error_message = None;
-        Ok(())
+        self.start_operation(EditorOperationKind::SaveRender);
     }
 
     fn save_and_render(&mut self) {
-        if let Some(state) = self.state.as_ref() {
-            if let Err(e) = self.save_project_sync(state) {
-                self.error_message = Some(format!("save failed: {e}"));
-                return;
-            }
-        }
-        let current_dirty = self
-            .state
-            .as_ref()
-            .and_then(|state| state.page(self.current_page))
-            .is_some_and(|page| {
-                page.render_dirty || page.bubbles.iter().any(|bubble| bubble.render_dirty)
-            });
-        if current_dirty {
-            if let Err(e) = self.rerender_page_at(self.current_page) {
-                self.error_message =
-                    Some(format!("render page {} failed: {e}", self.current_page + 1));
-                return;
-            }
-            self.notify_message = Some((
-                "✓ Saved and re-rendered current page".to_owned(),
-                std::time::Instant::now(),
+        self.start_operation(EditorOperationKind::SaveRender);
+    }
+
+    fn start_operation(&mut self, kind: EditorOperationKind) {
+        if self.operation.is_some() {
+            self.error_message = Some(format!(
+                "{} is already running; wait for it to finish before submitting again",
+                self.operation.as_ref().unwrap().kind.label()
             ));
-            self.invalidate_page_textures(self.current_page);
-        } else {
-            self.notify_message = Some(("✓ Saved".to_owned(), std::time::Instant::now()));
+            return;
         }
+        let Some(state) = self.state.as_ref() else {
+            self.error_message = Some("editor state is unavailable".to_owned());
+            return;
+        };
+
+        // Take a bounded snapshot on the UI thread, then immediately return
+        // control to egui. The worker owns the heavy disk, cleaning, font and
+        // typesetting calls from this point onward.
+        let request = OperationRequest {
+            kind,
+            job_dir: self.job_dir.clone(),
+            state_value: state.value.clone(),
+            current_page: self.current_page,
+            review: self.review.clone(),
+            save_epoch: Arc::clone(&self.save_epoch),
+            save_lock: Arc::clone(&self.save_lock),
+            repaint: self.context.clone().unwrap_or_default(),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.cancel_drag();
+        // The accepted snapshot is now owned by the explicit operation. A
+        // failed operation re-arms the debounce when control returns below.
+        self.dirty_since = None;
         self.error_message = None;
+        self.operation = Some(OperationRuntime {
+            kind,
+            rx,
+            current: 0,
+            total: 1,
+            message: format!("Starting {}…", kind.label()),
+        });
+
+        let spawn_result = std::thread::Builder::new()
+            .name(format!("editor-{}", kind.label().replace(' ', "-")))
+            .spawn(move || {
+                let event = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_editor_operation(request, &tx)
+                })) {
+                    Ok(Ok(success)) => OperationEvent::Succeeded {
+                        kind: success.kind,
+                        state: success.state,
+                        review: success.review,
+                        rendered_pages: success.rendered_pages,
+                        message: success.message,
+                    },
+                    Ok(Err(error)) => OperationEvent::Failed {
+                        kind,
+                        error: format!("{error:#}"),
+                    },
+                    Err(payload) => OperationEvent::Failed {
+                        kind,
+                        error: format!("worker panicked: {}", panic_payload(payload)),
+                    },
+                };
+                let _ = tx.send(event);
+            });
+        if let Err(error) = spawn_result {
+            self.operation = None;
+            self.dirty_since = Some(Instant::now());
+            self.error_message = Some(format!("could not start {} worker: {error}", kind.label()));
+        }
+    }
+
+    pub(crate) fn operation_active(&self) -> bool {
+        self.operation.is_some()
+    }
+
+    fn poll_operation(&mut self, ctx: &Context) {
+        let Some(mut operation) = self.operation.take() else {
+            return;
+        };
+        let mut finished = None;
+        loop {
+            match operation.rx.try_recv() {
+                Ok(event) => match event {
+                    OperationEvent::Progress {
+                        current,
+                        total,
+                        message,
+                    } => {
+                        operation.current = current;
+                        operation.total = total.max(1);
+                        operation.message = message;
+                    }
+                    OperationEvent::Succeeded {
+                        kind,
+                        state,
+                        review,
+                        rendered_pages,
+                        message,
+                    } => {
+                        finished = Some(Ok((kind, state, review, rendered_pages, message)));
+                        break;
+                    }
+                    OperationEvent::Failed { kind, error } => {
+                        finished = Some(Err(format!("{} failed: {}", kind.label(), error)));
+                        break;
+                    }
+                },
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    finished = Some(Err(format!(
+                        "{} worker disconnected before completing; retry the operation",
+                        operation.kind.label()
+                    )));
+                    break;
+                }
+            }
+        }
+
+        if let Some(result) = finished {
+            match result {
+                Ok((kind, value, review, rendered_pages, message)) => {
+                    if let Some(state) = self.state.as_mut() {
+                        state.value = value;
+                    }
+                    for page_index in rendered_pages {
+                        self.invalidate_page_textures(page_index);
+                    }
+                    self.canvas.brush_overlay = None;
+                    self.canvas.brush_overlay_dirty = true;
+                    self.dirty_since = None;
+                    self.error_message = None;
+                    self.notify_message = Some((
+                        if kind == EditorOperationKind::Approve {
+                            "✓ Approval saved; closing editor".to_owned()
+                        } else {
+                            message
+                        },
+                        Instant::now(),
+                    ));
+                    if kind == EditorOperationKind::Approve {
+                        if let Some(review) = review {
+                            self.review = review;
+                        }
+                        self.exit_action = Some(ExitAction::Approve);
+                        if let Ok(mut exit_state) = self.exit_state.lock() {
+                            exit_state.action = Some(ExitAction::Approve);
+                        }
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+                Err(error) => {
+                    // Keep the in-memory review untouched and the operation
+                    // retryable. The worker only returns a review after all
+                    // validation and persistence steps succeed.
+                    self.error_message = Some(error);
+                    // The accepted snapshot may have contained metadata-only
+                    // edits, so always re-arm autosave after a failed worker.
+                    self.dirty_since = Some(Instant::now());
+                }
+            }
+            return;
+        }
+
+        ctx.request_repaint_after(Duration::from_millis(100));
+        self.operation = Some(operation);
     }
 
     fn begin_pending_history(&mut self) {
@@ -573,60 +710,7 @@ impl EditorApp {
             self.error_message = Some("review changed on disk; reopen this editor".to_owned());
             return;
         }
-        if let Err(error) = self.rerender_dirty_pages_before_approval() {
-            self.error_message = Some(format!(
-                "approval blocked until all dirty pages render successfully: {error}"
-            ));
-            return;
-        }
-        if (self.job_dir.join("job.json").is_file()
-            || self.job_dir.join(".fukidashi-job.json").is_file())
-            && self.job_dir.join("pages").is_dir()
-        {
-            let validation = fukidashi_mcp::workflow::Workflow::new(
-                self.job_dir.parent().unwrap_or(&self.job_dir).to_path_buf(),
-            )
-            .and_then(|workflow| {
-                self.state
-                    .as_ref()
-                    .map(|state| workflow.validate_editor_completeness(&self.job_dir, &state.value))
-                    .unwrap_or_else(|| Err(anyhow::anyhow!("editor state is unavailable")))
-            });
-            if let Err(error) = validation {
-                self.error_message = Some(format!(
-                    "approval blocked by translation completeness validation: {error}"
-                ));
-                return;
-            }
-        }
-        // Persist the project before changing the in-memory review.  Approval
-        // must remain retryable when either persistence step fails.
-        if let Some(state) = self.state.as_ref() {
-            if let Err(error) = self.save_project_sync(state) {
-                self.error_message = Some(format!("save failed before approval: {error}"));
-                return;
-            }
-        }
-        let mut proposed_review = self.review.clone();
-        proposed_review.approved_pages =
-            (0..self.state.as_ref().map(|s| s.page_count()).unwrap_or(0)).collect();
-        proposed_review.status = "approved".to_owned();
-        proposed_review.action = Some("approve_export".to_owned());
-        proposed_review.audit.push(serde_json::json!({
-            "event": "approve_export",
-            "review_session_id": proposed_review.review_session_id.clone(),
-            "revision": proposed_review.revision,
-        }));
-        if let Err(e) = state::save_review_state(&self.job_dir, &proposed_review) {
-            self.error_message = Some(format!("save review failed: {e}"));
-            return;
-        }
-        self.review = proposed_review;
-        self.exit_action = Some(ExitAction::Approve);
-        if let Ok(mut s) = self.exit_state.lock() {
-            s.action = Some(ExitAction::Approve);
-        }
-        self.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+        self.start_operation(EditorOperationKind::Approve);
     }
 
     fn request_fixes(&mut self) {
@@ -695,6 +779,7 @@ impl EditorApp {
         // navigation and brush shortcuts out of text fields/modal-like widgets
         // while keeping document shortcuts from stealing text edits as well.
         let text_focus = ctx.memory(|memory| memory.focused().is_some());
+        let operation_active = self.operation_active();
         ctx.input(|i| {
             for event in &i.events {
                 if let egui::Event::Key {
@@ -725,6 +810,7 @@ impl EditorApp {
                         }
                         egui::Key::B
                             if tool_shortcuts_allowed(text_focus)
+                                && !operation_active
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
                             // toggle Brush / back to Select
@@ -738,6 +824,7 @@ impl EditorApp {
                         }
                         egui::Key::E
                             if tool_shortcuts_allowed(text_focus)
+                                && !operation_active
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
                             let next_tool = if self.canvas.active_tool == canvas::ActiveTool::Eraser
@@ -750,6 +837,7 @@ impl EditorApp {
                         }
                         egui::Key::I
                             if tool_shortcuts_allowed(text_focus)
+                                && !operation_active
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
                             let next_tool =
@@ -762,24 +850,28 @@ impl EditorApp {
                         }
                         egui::Key::V
                             if tool_shortcuts_allowed(text_focus)
+                                && !operation_active
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
                             self.set_active_tool(canvas::ActiveTool::Select);
                         }
                         egui::Key::O
                             if tool_shortcuts_allowed(text_focus)
+                                && !operation_active
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
                             self.set_active_tool(canvas::ActiveTool::DrawBubble);
                         }
                         egui::Key::T
                             if tool_shortcuts_allowed(text_focus)
+                                && !operation_active
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
                             self.set_active_tool(canvas::ActiveTool::AddText);
                         }
                         egui::Key::OpenBracket
                             if tool_shortcuts_allowed(text_focus)
+                                && !operation_active
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
                             self.canvas.brush_radius =
@@ -787,6 +879,7 @@ impl EditorApp {
                         }
                         egui::Key::CloseBracket
                             if tool_shortcuts_allowed(text_focus)
+                                && !operation_active
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
                             self.canvas.brush_radius =
@@ -794,6 +887,7 @@ impl EditorApp {
                         }
                         egui::Key::Delete | egui::Key::Backspace
                             if tool_shortcuts_allowed(text_focus)
+                                && !operation_active
                                 && *modifiers == egui::Modifiers::NONE =>
                         {
                             if self.canvas.drag != canvas::DragState::None {
@@ -828,7 +922,7 @@ impl EditorApp {
         let ctrl_s = ctx.input(|i| i.events.iter().any(|e| {
             matches!(e, egui::Event::Key { key: egui::Key::S, modifiers, pressed: true, .. } if modifiers.ctrl)
         }));
-        if ctrl_s && !text_focus {
+        if ctrl_s && !text_focus && !operation_active {
             self.save_and_render();
         }
         if next != self.current_page {
@@ -852,6 +946,257 @@ impl EditorApp {
             }
         }
     }
+}
+
+struct OperationSuccess {
+    kind: EditorOperationKind,
+    state: serde_json::Value,
+    review: Option<ReviewState>,
+    rendered_pages: Vec<usize>,
+    message: String,
+}
+
+fn save_editor_snapshot(
+    job_dir: &std::path::Path,
+    value: &serde_json::Value,
+    save_epoch: &Arc<Mutex<u64>>,
+    save_lock: &Arc<Mutex<()>>,
+) -> anyhow::Result<()> {
+    let _save_guard = save_lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("editor save lock poisoned"))?;
+    let result = state::atomic_write_json(&job_dir.join("project.json"), value);
+    if result.is_ok() {
+        let mut epoch = save_epoch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("editor save epoch lock poisoned"))?;
+        *epoch = epoch.saturating_add(1);
+    }
+    result
+}
+
+fn advance_save_epoch(save_epoch: &Arc<Mutex<u64>>) -> anyhow::Result<()> {
+    let mut epoch = save_epoch
+        .lock()
+        .map_err(|_| anyhow::anyhow!("editor save epoch lock poisoned"))?;
+    *epoch = epoch.saturating_add(1);
+    Ok(())
+}
+
+fn worker_page_image_path(state: &EditorState, page_index: usize) -> anyhow::Result<PathBuf> {
+    state
+        .page(page_index)
+        .and_then(|page| {
+            page.rendered_image_path
+                .or(Some(page.cleaned_image_path))
+                .or(Some(page.source_image_path))
+        })
+        .ok_or_else(|| anyhow::anyhow!("page {} has no image path", page_index + 1))
+}
+
+fn report_operation(
+    tx: &std::sync::mpsc::Sender<OperationEvent>,
+    repaint: &Context,
+    current: usize,
+    total: usize,
+    message: impl Into<String>,
+) {
+    let _ = tx.send(OperationEvent::Progress {
+        current,
+        total: total.max(1),
+        message: message.into(),
+    });
+    repaint.request_repaint();
+}
+
+fn run_editor_operation(
+    request: OperationRequest,
+    tx: &std::sync::mpsc::Sender<OperationEvent>,
+) -> anyhow::Result<OperationSuccess> {
+    let mut state = EditorState {
+        value: request.state_value,
+        job_dir: request.job_dir.clone(),
+        image_path: PathBuf::new(),
+    };
+    match request.kind {
+        EditorOperationKind::SaveRender => {
+            report_operation(
+                tx,
+                &request.repaint,
+                1,
+                2,
+                "Saving the current editor snapshot…",
+            );
+            save_editor_snapshot(
+                &request.job_dir,
+                &state.value,
+                &request.save_epoch,
+                &request.save_lock,
+            )
+            .map_err(|error| anyhow::anyhow!("save failed: {error}"))?;
+
+            let mut rendered_pages = Vec::new();
+            if state.page_has_render_dirty(request.current_page) {
+                report_operation(
+                    tx,
+                    &request.repaint,
+                    2,
+                    2,
+                    format!("Rendering page {}…", request.current_page + 1),
+                );
+                let image_path = worker_page_image_path(&state, request.current_page)?;
+                // render_editor_page writes project.json as part of its atomic
+                // normalized result. Hold the same lock as autosave so no
+                // stale debounce can race that write.
+                let _save_guard = request
+                    .save_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("editor save lock poisoned"))?;
+                let rendered =
+                    render::rerender_page_with_state(&state, request.current_page, &image_path)?;
+                state.value = rendered.state;
+                advance_save_epoch(&request.save_epoch)?;
+                rendered_pages.push(request.current_page);
+            }
+            let rerendered = !rendered_pages.is_empty();
+            Ok(OperationSuccess {
+                kind: request.kind,
+                state: state.value,
+                review: None,
+                rendered_pages,
+                message: if rerendered {
+                    "✓ Saved and re-rendered current page".to_owned()
+                } else {
+                    "✓ Saved".to_owned()
+                },
+            })
+        }
+        EditorOperationKind::Approve => {
+            let dirty_pages = render_dirty_page_indices(&state);
+            let total = dirty_pages.len().saturating_add(3);
+            report_operation(
+                tx,
+                &request.repaint,
+                1,
+                total,
+                "Saving the approval snapshot…",
+            );
+            save_editor_snapshot(
+                &request.job_dir,
+                &state.value,
+                &request.save_epoch,
+                &request.save_lock,
+            )
+            .map_err(|error| anyhow::anyhow!("save failed before approval: {error}"))?;
+
+            let mut rendered_pages = Vec::new();
+            for (position, page_index) in dirty_pages.iter().copied().enumerate() {
+                report_operation(
+                    tx,
+                    &request.repaint,
+                    position + 2,
+                    total,
+                    format!(
+                        "Rendering page {} of {} before approval…",
+                        position + 1,
+                        dirty_pages.len()
+                    ),
+                );
+                let image_path = worker_page_image_path(&state, page_index)?;
+                let _save_guard = request
+                    .save_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("editor save lock poisoned"))?;
+                let rendered = render::rerender_page_with_state(&state, page_index, &image_path)
+                    .map_err(|error| {
+                        anyhow::anyhow!("page {} could not be re-rendered: {error}", page_index + 1)
+                    })?;
+                state.value = rendered.state;
+                advance_save_epoch(&request.save_epoch)?;
+                rendered_pages.push(page_index);
+            }
+
+            report_operation(
+                tx,
+                &request.repaint,
+                dirty_pages.len() + 2,
+                total,
+                "Validating translation completeness…",
+            );
+            if (request.job_dir.join("job.json").is_file()
+                || request.job_dir.join(".fukidashi-job.json").is_file())
+                && request.job_dir.join("pages").is_dir()
+            {
+                let workflow = fukidashi_mcp::workflow::Workflow::new(
+                    request
+                        .job_dir
+                        .parent()
+                        .unwrap_or(&request.job_dir)
+                        .to_path_buf(),
+                )?;
+                workflow
+                    .validate_editor_completeness(&request.job_dir, &state.value)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "approval blocked by translation completeness validation: {error}"
+                        )
+                    })?;
+            }
+
+            if !review_file_matches(&request.job_dir, &request.review) {
+                anyhow::bail!("review changed on disk; reopen this editor");
+            }
+            let mut proposed_review = request.review.clone();
+            proposed_review.approved_pages = (0..state.page_count()).collect();
+            proposed_review.status = "approved".to_owned();
+            proposed_review.action = Some("approve_export".to_owned());
+            proposed_review.audit.push(serde_json::json!({
+                "event": "approve_export",
+                "review_session_id": proposed_review.review_session_id.clone(),
+                "revision": proposed_review.revision,
+            }));
+
+            report_operation(
+                tx,
+                &request.repaint,
+                total,
+                total,
+                "Saving approval and closing the editor…",
+            );
+            save_editor_snapshot(
+                &request.job_dir,
+                &state.value,
+                &request.save_epoch,
+                &request.save_lock,
+            )
+            .map_err(|error| anyhow::anyhow!("save failed before approval: {error}"))?;
+            state::save_review_state(&request.job_dir, &proposed_review)
+                .map_err(|error| anyhow::anyhow!("save review failed: {error}"))?;
+            Ok(OperationSuccess {
+                kind: request.kind,
+                state: state.value,
+                review: Some(proposed_review),
+                rendered_pages,
+                message: "✓ Approval saved; closing editor".to_owned(),
+            })
+        }
+    }
+}
+fn review_file_matches(job_dir: &std::path::Path, expected: &ReviewState) -> bool {
+    read_review(job_dir).is_some_and(|current| {
+        current.review_session_id == expected.review_session_id
+            && current.revision == expected.revision
+            && current.action.is_none()
+            && !current.consumed
+    })
+}
+
+fn panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_owned())
 }
 
 fn tool_shortcuts_allowed(text_focus: bool) -> bool {
@@ -1056,6 +1401,18 @@ fn rects_overlap(left: fukidashi_mcp::domain::Rect, right: fukidashi_mcp::domain
 mod tests {
     use super::*;
 
+    fn wait_for_operation(app: &mut EditorApp) {
+        let context = Context::default();
+        for _ in 0..200 {
+            app.poll_operation(&context);
+            if !app.operation_active() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("editor operation did not finish during the test window");
+    }
+
     #[test]
     fn bracket_radius_changes_by_four_and_clamps() {
         assert_eq!(adjust_brush_radius(20.0, -4.0), 16.0);
@@ -1248,13 +1605,14 @@ mod tests {
         let exit_state = Arc::new(Mutex::new(crate::ExitState::default()));
         let mut app = EditorApp::new(job_dir.clone(), Some(session), exit_state).unwrap();
         app.approve_and_export();
+        wait_for_operation(&mut app);
         let persisted = read_review(&job_dir).unwrap();
         assert!(persisted.action.is_none());
         assert_eq!(persisted.status, "awaiting_review");
         assert!(
             app.error_message
                 .as_deref()
-                .is_some_and(|message| message.contains("approval blocked"))
+                .is_some_and(|message| message.contains("could not be re-rendered"))
         );
     }
 
@@ -1293,6 +1651,7 @@ mod tests {
         std::fs::create_dir(&project_path).unwrap();
 
         app.approve_and_export();
+        wait_for_operation(&mut app);
 
         assert!(app.review.action.is_none());
         assert_eq!(app.review.status, "awaiting_review");
@@ -1302,11 +1661,13 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("save failed before approval"))
         );
+        assert!(app.dirty_since.is_some());
 
         std::fs::remove_dir(&project_path).unwrap();
         std::fs::rename(&backup_path, &project_path).unwrap();
         app.context = Some(Context::default());
         app.approve_and_export();
+        wait_for_operation(&mut app);
 
         assert_eq!(app.review.action.as_deref(), Some("approve_export"));
         assert_eq!(app.review.status, "approved");
@@ -1314,6 +1675,113 @@ mod tests {
         let persisted = read_review(&job_dir).unwrap();
         assert_eq!(persisted.action.as_deref(), Some("approve_export"));
         assert_eq!(persisted.status, "approved");
+    }
+
+    #[test]
+    fn save_render_dispatch_is_nonblocking_and_reentry_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let job_dir = directory.path().to_path_buf();
+        state::atomic_write_json(
+            &job_dir.join("project.json"),
+            &serde_json::json!({
+                "state_revision": 0,
+                "pages": [{
+                    "id": "page-1",
+                    "image_path": "source.png",
+                    "render_dirty": false,
+                    "bubbles": []
+                }]
+            }),
+        )
+        .unwrap();
+        let exit_state = Arc::new(Mutex::new(crate::ExitState::default()));
+        let mut app = EditorApp::new(job_dir, None, exit_state).unwrap();
+        app.context = Some(Context::default());
+
+        app.save_and_render();
+        assert!(app.operation_active());
+        app.save_and_render();
+        assert!(
+            app.error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("already running"))
+        );
+        wait_for_operation(&mut app);
+        assert!(!app.operation_active());
+    }
+
+    #[test]
+    fn autosave_does_not_enqueue_a_stale_snapshot_during_explicit_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let job_dir = directory.path().to_path_buf();
+        state::atomic_write_json(
+            &job_dir.join("project.json"),
+            &serde_json::json!({
+                "state_revision": 0,
+                "pages": [{
+                    "id": "page-1",
+                    "image_path": "source.png",
+                    "render_dirty": true,
+                    "bubbles": []
+                }]
+            }),
+        )
+        .unwrap();
+        let exit_state = Arc::new(Mutex::new(crate::ExitState::default()));
+        let mut app = EditorApp::new(job_dir, None, exit_state).unwrap();
+        let (_tx, rx) = std::sync::mpsc::channel();
+        app.operation = Some(OperationRuntime {
+            kind: EditorOperationKind::SaveRender,
+            rx,
+            current: 1,
+            total: 2,
+            message: "Rendering…".to_owned(),
+        });
+        app.dirty_since = Some(Instant::now() - Duration::from_secs(2));
+
+        app.flush_save_if_due();
+
+        assert!(app.dirty_since.is_some());
+    }
+
+    #[test]
+    fn disconnected_worker_fails_operation_and_leaves_it_retryable() {
+        let directory = tempfile::tempdir().unwrap();
+        let job_dir = directory.path().to_path_buf();
+        state::atomic_write_json(
+            &job_dir.join("project.json"),
+            &serde_json::json!({
+                "state_revision": 0,
+                "pages": [{
+                    "id": "page-1",
+                    "image_path": "source.png",
+                    "render_dirty": false,
+                    "bubbles": []
+                }]
+            }),
+        )
+        .unwrap();
+        let exit_state = Arc::new(Mutex::new(crate::ExitState::default()));
+        let mut app = EditorApp::new(job_dir, None, exit_state).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        app.operation = Some(OperationRuntime {
+            kind: EditorOperationKind::SaveRender,
+            rx: receiver,
+            current: 0,
+            total: 1,
+            message: "Saving…".to_owned(),
+        });
+
+        app.poll_operation(&Context::default());
+
+        assert!(!app.operation_active());
+        assert!(
+            app.error_message
+                .as_deref()
+                .is_some_and(|message| { message.contains("worker disconnected") })
+        );
+        assert!(app.dirty_since.is_some());
     }
 
     #[test]
@@ -1372,6 +1840,7 @@ mod tests {
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.context = Some(ctx.clone());
+        self.poll_operation(ctx);
 
         // Lazy-load icon textures on first frame.
         if self.icon_textures.is_empty() {
@@ -1390,11 +1859,29 @@ impl eframe::App for EditorApp {
                 self.tool_options_ui(ui);
                 ui.separator();
 
-                if ui.button("Approve & Export").clicked() {
+                let operation_active = self.operation.is_some();
+                if ui
+                    .add_enabled(!operation_active, egui::Button::new("Approve & Export"))
+                    .clicked()
+                {
                     self.approve_and_export();
                 }
-                if ui.button("⚡ Save & Render  Ctrl+S").clicked() {
+                if ui
+                    .add_enabled(
+                        !operation_active,
+                        egui::Button::new("⚡ Save & Render  Ctrl+S"),
+                    )
+                    .clicked()
+                {
                     self.save_and_render();
+                }
+                if let Some(operation) = &self.operation {
+                    ui.separator();
+                    let progress = format!(
+                        "{} · {}/{}",
+                        operation.message, operation.current, operation.total
+                    );
+                    ui.colored_label(egui::Color32::LIGHT_BLUE, progress);
                 }
                 let dirty = self
                     .current_page_view()
