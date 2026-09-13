@@ -1,6 +1,7 @@
 use fukidashi_mcp::domain::{Rect, TypesetPayload};
 use fukidashi_mcp::editor::{
-    render_editor_page, serve_editor, serve_editor_with_allowed_sources, wait_for_review,
+    render_editor_page, serve_editor, serve_editor_with_allowed_sources,
+    serve_editor_with_allowed_sources_and_options, wait_for_review,
 };
 use fukidashi_mcp::workflow::Workflow;
 use image::{ImageBuffer, Rgb};
@@ -1404,6 +1405,131 @@ async fn consumed_review_approval_still_allows_export() {
     let consumed = wait_for_review(&session, revision, 5).await.unwrap();
     assert_eq!(consumed["action"], "approve_export");
     assert!(fukidashi_mcp::export::export_project(dir.path(), "zip").is_ok());
+}
+
+#[tokio::test]
+async fn completed_review_can_reopen_for_a_new_edit_and_export_cycle() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("job.json"), b"{}").unwrap();
+    let image_path = dir.path().join("page.png");
+    ImageBuffer::<Rgb<u8>, _>::from_pixel(20, 20, Rgb([255, 255, 255]))
+        .save(&image_path)
+        .unwrap();
+    let state = json!({
+        "schema_version": 1,
+        "pages": [{
+            "id": "p1",
+            "image_path": "page.png",
+            "bubbles": [{
+                "id": "b1",
+                "bbox": {"x1": 2, "y1": 2, "x2": 10, "y2": 10},
+                "text": "source",
+                "translation": "first"
+            }]
+        }]
+    });
+    let first = serve_editor(&image_path, state.clone()).unwrap();
+    let first_endpoint = first["url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://")
+        .unwrap();
+    let (first_host, _) = first_endpoint.split_once('/').unwrap();
+    let first_token = first["session_token"].as_str().unwrap();
+    let first_session = first["review_session_id"].as_str().unwrap().to_owned();
+    let first_revision = first["review_revision"].as_u64().unwrap();
+    let approve = json!({
+        "revision": first_revision,
+        "action": "approve_export",
+        "approved_pages": [0]
+    });
+    assert!(
+        request(
+            first_host,
+            &format!("/{first_token}/review/submit"),
+            "POST",
+            Some(&approve.to_string()),
+            first_host
+        )
+        .starts_with("HTTP/1.1 200")
+    );
+    let consumed = wait_for_review(&first_session, first_revision, 5)
+        .await
+        .unwrap();
+    assert_eq!(consumed["action"], "approve_export");
+
+    let completed = serve_editor(&image_path, state.clone()).unwrap();
+    assert_eq!(completed["editor_kind"], "already_completed");
+    assert_eq!(completed["review_session_id"], first_session);
+    assert_eq!(completed["review_revision"], first_revision);
+
+    let reopened =
+        serve_editor_with_allowed_sources_and_options(&image_path, state, Vec::new(), true)
+            .unwrap();
+    assert_ne!(reopened["review_session_id"], first_session);
+    assert_eq!(
+        reopened["review_revision"],
+        serde_json::json!(first_revision + 1)
+    );
+    assert!(reopened["url"].is_string());
+    let endpoint = reopened["url"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("http://")
+        .unwrap();
+    let (host, _) = endpoint.split_once('/').unwrap();
+    let token = reopened["session_token"].as_str().unwrap();
+    let mut edited: serde_json::Value =
+        serde_json::from_slice(&fs::read(reopened["persistence_path"].as_str().unwrap()).unwrap())
+            .unwrap();
+    edited["pages"][0]["bubbles"][0]["translation"] = json!("corrected");
+    edited["pages"][0]["bubbles"][0]["text"] = json!("corrected");
+    let save = request(
+        host,
+        &format!("/{token}/save"),
+        "POST",
+        Some(&edited.to_string()),
+        host,
+    );
+    assert!(save.starts_with("HTTP/1.1 200"), "unexpected save: {save}");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(reopened["persistence_path"].as_str().unwrap()).unwrap())
+            .unwrap();
+    assert_eq!(saved["pages"][0]["bubbles"][0]["translation"], "corrected");
+    assert!(fukidashi_mcp::export::export_project(dir.path(), "zip").is_err());
+    let approve = json!({
+        "revision": reopened["review_revision"],
+        "action": "approve_export",
+        "approved_pages": [0]
+    });
+    let response = request(
+        host,
+        &format!("/{token}/review/submit"),
+        "POST",
+        Some(&approve.to_string()),
+        host,
+    );
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "unexpected reopened approval: {response}"
+    );
+    let second_session = reopened["review_session_id"].as_str().unwrap();
+    let second_revision = reopened["review_revision"].as_u64().unwrap();
+    let consumed = wait_for_review(second_session, second_revision, 5)
+        .await
+        .unwrap();
+    assert_eq!(consumed["action"], "approve_export");
+    assert!(fukidashi_mcp::export::export_project(dir.path(), "zip").is_ok());
+
+    let review: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("review.json")).unwrap()).unwrap();
+    assert!(
+        review["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "review_reopened")
+    );
 }
 
 #[test]

@@ -118,6 +118,11 @@ pub struct EditorRequest {
     #[serde(default)]
     #[schemars(schema_with = "json_object_schema")]
     pub json_data: Option<serde_json::Value>,
+    /// Reopen a completed review in a new native/loopback review cycle.
+    /// Defaults to true for direct editor requests; the combined review/export
+    /// flow disables this to preserve its already-approved fast path.
+    #[serde(default = "default_reopen_completed")]
+    pub reopen_completed: bool,
 }
 
 fn json_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -266,6 +271,10 @@ fn default_review_timeout() -> u64 {
 
 fn default_export_format() -> String {
     "zip".to_owned()
+}
+
+fn default_reopen_completed() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -2961,6 +2970,7 @@ impl FukidashiServer {
                 job_path: req.job_path,
                 job_id: req.job_id,
                 json_data: None,
+                reopen_completed: false,
             }))
             .await;
         let served = match extract_tool_json(served, "serve editor") {
@@ -3205,7 +3215,7 @@ impl FukidashiServer {
 
     #[tool(
         name = "fukidashi_serve_editor",
-        description = "Serve the local loopback comic editor. Reopen an existing managed job with job_path (directory or job.json; legacy .fukidashi-job.json is also accepted) or job_id; the server selects a verified render and reconstructs every page. image_path remains supported for a known rendered artifact; json_data is metadata only."
+        description = "Serve the local loopback comic editor. Reopen an existing managed job with job_path (directory or job.json; legacy .fukidashi-job.json is also accepted) or job_id; the server selects a verified render and reconstructs every page. Direct editor requests default to reopen_completed=true, minting a new review session after a completed approval; pass reopen_completed=false to retain the already-completed fast path. image_path remains supported for a known rendered artifact; json_data is metadata only."
     )]
     pub async fn serve_editor(&self, Parameters(req): Parameters<EditorRequest>) -> CallToolResult {
         let inferred_job_path = if req.job_path.is_none() && req.job_id.is_none() {
@@ -3363,7 +3373,12 @@ impl FukidashiServer {
             .collect::<Vec<_>>();
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            crate::editor::serve_editor_with_allowed_sources(&image_path, state, allowed_sources)
+            crate::editor::serve_editor_with_allowed_sources_and_options(
+                &image_path,
+                state,
+                allowed_sources,
+                req.reopen_completed,
+            )
         })
         .await;
         match result {
@@ -3581,6 +3596,22 @@ mod tests {
             instructions
                 .contains("character name strings are returned canonically as {id,names,notes}")
         );
+    }
+
+    #[test]
+    fn direct_editor_requests_reopen_completed_reviews_by_default() {
+        let request: EditorRequest = serde_json::from_value(serde_json::json!({
+            "job_id": "completed-job"
+        }))
+        .unwrap();
+        assert!(request.reopen_completed);
+
+        let request: EditorRequest = serde_json::from_value(serde_json::json!({
+            "job_id": "completed-job",
+            "reopen_completed": false
+        }))
+        .unwrap();
+        assert!(!request.reopen_completed);
     }
 
     fn test_config(root: &std::path::Path) -> Config {

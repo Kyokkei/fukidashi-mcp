@@ -91,13 +91,27 @@ struct Session {
 
 /// Start an editor on an ephemeral loopback port and return immediately.
 pub fn serve_editor(image_path: &Path, json_data: Value) -> Result<Value> {
-    serve_editor_with_allowed_sources(image_path, json_data, Vec::new())
+    serve_editor_with_allowed_sources_and_options(image_path, json_data, Vec::new(), false)
 }
 
 pub fn serve_editor_with_allowed_sources(
     image_path: &Path,
     json_data: Value,
     allowed_source_paths: Vec<PathBuf>,
+) -> Result<Value> {
+    serve_editor_with_allowed_sources_and_options(
+        image_path,
+        json_data,
+        allowed_source_paths,
+        false,
+    )
+}
+
+pub fn serve_editor_with_allowed_sources_and_options(
+    image_path: &Path,
+    json_data: Value,
+    allowed_source_paths: Vec<PathBuf>,
+    reopen_completed: bool,
 ) -> Result<Value> {
     let image_path = fs::canonicalize(image_path)
         .with_context(|| format!("resolve editor image {}", image_path.display()))?;
@@ -126,18 +140,17 @@ pub fn serve_editor_with_allowed_sources(
     validate_project_paths_for_root(&root_dir, &initial_state, &allowed_source_paths)?;
     atomic_json_save(&state_path, &initial_state)?;
     let review_path = review_file(&root_dir);
+    let mut reopened_completed_review = false;
     let mut review_state = if review_path.exists() {
         let bytes = fs::read(&review_path).context("read existing review state")?;
         let existing: ReviewState =
             serde_json::from_slice::<ReviewState>(&bytes).context("parse existing review state")?;
-        // A review that was already approved for export is complete. Re-serving
-        // must not reset it to a fresh revision — that respawns the editor and
-        // forces the operator to approve a second time just so the export tool
-        // can read the same decision. Surface the recorded action instead.
+        // A completed review remains exportable by default. An explicit editor
+        // reopen starts a new review cycle without erasing the old audit trail.
         // `request_fixes` is deliberately NOT sticky: the fix loop serves the
         // editor again after feedback is applied, and that call must mint a
         // fresh review round via the reset below.
-        if existing.action.as_deref() == Some("approve_export") {
+        if existing.action.as_deref() == Some("approve_export") && !reopen_completed {
             return Ok(json!({
                 "editor_kind": "already_completed",
                 "action": existing.action,
@@ -148,6 +161,25 @@ pub fn serve_editor_with_allowed_sources(
                 "persistence_path": state_path,
                 "review_path": review_path,
             }));
+        }
+        let mut existing = existing;
+        if existing.action.as_deref() == Some("approve_export") && reopen_completed {
+            let previous_session_id = existing.review_session_id.clone();
+            let previous_revision = existing.revision;
+            let next_revision = previous_revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("cannot reopen review at the maximum revision"))?;
+            let next_session_id = Uuid::new_v4().simple().to_string();
+            existing.review_session_id = next_session_id.clone();
+            existing.revision = next_revision;
+            existing.audit.push(json!({
+                "event": "review_reopened",
+                "previous_review_session_id": previous_session_id,
+                "previous_revision": previous_revision,
+                "review_session_id": next_session_id,
+                "revision": next_revision,
+            }));
+            reopened_completed_review = true;
         }
         existing
     } else {
@@ -162,7 +194,9 @@ pub fn serve_editor_with_allowed_sources(
             audit: Vec::new(),
         }
     };
-    review_state.revision = review_state.revision.saturating_add(1);
+    if !reopened_completed_review {
+        review_state.revision = review_state.revision.saturating_add(1);
+    }
     review_state.status = "awaiting_review".to_owned();
     review_state.action = None;
     review_state.feedback.clear();
