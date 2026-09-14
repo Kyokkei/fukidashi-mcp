@@ -2083,6 +2083,7 @@ fn removed_bubble_id(value: &Value) -> Option<&str> {
     value
         .as_str()
         .or_else(|| value.get("id").and_then(Value::as_str))
+        .filter(|id| !id.trim().is_empty())
 }
 
 pub(crate) fn bubble_has_renderer_report(bubble: &Value) -> bool {
@@ -2794,11 +2795,14 @@ fn normalize_editor_state(mut state: Value) -> Result<Value> {
 }
 
 fn bubble_has_stable_id(bubble: &Value) -> bool {
-    bubble.get("id").and_then(Value::as_str).is_some()
+    bubble
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| !id.trim().is_empty())
 }
 
 fn legacy_bubble_match(base: &Value, saved: &Value) -> bool {
-    if bubble_has_stable_id(base) || bubble_has_stable_id(saved) {
+    if bubble_has_stable_id(saved) {
         return false;
     }
     let Some(base_bbox) = base
@@ -2837,17 +2841,13 @@ fn migrate_legacy_bubble_ids(page: &mut Value, saved_bubbles: &mut [Value], page
     if base_bubbles.len() > 512 || saved_bubbles.len() > 512 {
         return;
     }
-    let legacy_base_indices = base_bubbles
-        .iter()
-        .enumerate()
-        .filter_map(|(index, bubble)| (!bubble_has_stable_id(bubble)).then_some(index))
-        .collect::<Vec<_>>();
+    let base_indices = (0..base_bubbles.len()).collect::<Vec<_>>();
     let mut matched_base_indices = std::collections::HashSet::new();
     for saved in saved_bubbles
         .iter_mut()
         .filter(|bubble| !bubble_has_stable_id(bubble))
     {
-        let candidates = legacy_base_indices
+        let candidates = base_indices
             .iter()
             .copied()
             .filter(|index| {
@@ -2859,12 +2859,17 @@ fn migrate_legacy_bubble_ids(page: &mut Value, saved_bubbles: &mut [Value], page
             continue;
         }
         let base_index = candidates[0];
-        let id = format!("legacy-page-{}-bubble-{}", page_index + 1, base_index + 1);
+        let id = base_bubbles[base_index]
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("legacy-page-{}-bubble-{}", page_index + 1, base_index + 1));
         base_bubbles[base_index]["id"] = Value::String(id.clone());
         saved["id"] = Value::String(id);
         matched_base_indices.insert(base_index);
     }
-    for base_index in legacy_base_indices {
+    for base_index in base_indices {
         if !bubble_has_stable_id(&base_bubbles[base_index]) {
             base_bubbles[base_index]["id"] = Value::String(format!(
                 "legacy-page-{}-bubble-{}",
@@ -2945,7 +2950,7 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
         let Some(saved_object) = saved_page.and_then(Value::as_object) else {
             continue;
         };
-        let saved_removed_bubbles = saved_object
+        let mut saved_removed_bubbles = saved_object
             .get("removed_bubbles")
             .and_then(Value::as_array)
             .cloned()
@@ -2956,6 +2961,7 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
             .cloned()
             .unwrap_or_default();
         migrate_legacy_bubble_ids(base_page, &mut saved_bubbles, index);
+        migrate_legacy_bubble_ids(base_page, &mut saved_removed_bubbles, index);
         let baseline_signature = page_render_signature(base_page);
 
         {
@@ -3058,6 +3064,9 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                         "preserve_source",
                     ] {
                         if let Some(value) = saved_bubble.get(key) {
+                            if value.is_null() && matches!(key, "source_text" | "kind") {
+                                continue;
+                            }
                             base_bubble_object.insert(key.to_owned(), value.clone());
                         }
                     }
@@ -3067,8 +3076,8 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                         // Only that unambiguous shape gets the compatibility
                         // normalization; a modern saved bubble missing its
                         // translation remains visibly dirty.
-                        if saved_bubble.get("source_text").is_none()
-                            && saved_bubble.get("kind").is_none()
+                        if saved_bubble.get("source_text").is_none_or(Value::is_null)
+                            && saved_bubble.get("kind").is_none_or(Value::is_null)
                             && saved_bubble.get("text").and_then(Value::as_str).is_some()
                         {
                             base_bubble_object.insert(
@@ -3122,7 +3131,10 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                     };
                     if !removed_ids.contains(id)
                         && !base_ids.contains(id)
-                        && saved_bubble.get("bbox").is_some()
+                        && saved_bubble
+                            .get("bbox")
+                            .or_else(|| saved_bubble.get("bubble_bbox"))
+                            .is_some()
                     {
                         base_bubbles.push(saved_bubble.clone());
                     }
@@ -3378,6 +3390,10 @@ fn editor_requested_font_path(bubble: &Value) -> Option<&str> {
         .get("_editor_requested_font_path")
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty());
+    let reported_requested = bubble
+        .get("requested_font_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty());
     let rendered = bubble
         .get("rendered_font_path")
         .and_then(Value::as_str)
@@ -3396,12 +3412,18 @@ fn editor_requested_font_path(bubble: &Value) -> Option<&str> {
         return Some(current);
     };
     if bubble_has_renderer_report(bubble)
-        && !crate::workflow::is_generic_desktop_font(Path::new(current))
+        && reported_requested == Some(marker)
+        && current != marker
+        && rendered != Some(current)
     {
+        // A reconstructed report can carry a stale public `font_path` while
+        // retaining the request echoed by the renderer. Keep that echoed
+        // request until merge_saved_edits has evidence of a later edit.
         return Some(marker);
     }
     if current == marker
-        || (rendered == Some(current)
+        || (bubble_has_renderer_report(bubble)
+            && rendered == Some(current)
             && !crate::workflow::is_generic_desktop_font(Path::new(current)))
     {
         Some(marker)
@@ -4847,6 +4869,23 @@ mod tests {
     }
 
     #[test]
+    fn stale_report_font_marker_cannot_hide_a_changed_raw_font() {
+        let bubble = json!({
+            "id": "bubble-1",
+            "translation": "dịch",
+            "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
+            "font_path": "fonts/new.ttf",
+            "_editor_requested_font_path": "fonts/old.ttf",
+            "rendered_font_path": "fonts/old.ttf",
+            "input_bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8}
+        });
+        assert_eq!(editor_requested_font_path(&bubble), Some("fonts/new.ttf"));
+        let mut same = bubble.clone();
+        same["font_path"] = json!("fonts/old.ttf");
+        assert_eq!(editor_requested_font_path(&same), Some("fonts/old.ttf"));
+    }
+
+    #[test]
     fn legacy_font_marker_migration_keeps_raw_edits_and_clears_null() {
         let bbox = json!({"x1": 1, "y1": 1, "x2": 8, "y2": 8});
         let mut base = normalize_editor_state(json!({
@@ -4972,6 +5011,58 @@ mod tests {
     }
 
     #[test]
+    fn idless_saved_bubble_and_tombstone_match_reconstructed_ids() {
+        let bbox = json!({"x1": 1, "y1": 1, "x2": 8, "y2": 8});
+        let mut base = normalize_editor_state(json!({
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{
+                    "id": "page-1-bubble-reconstructed",
+                    "bbox": bbox,
+                    "translation": "old"
+                }]
+            }]
+        }))
+        .unwrap();
+        merge_saved_edits(
+            &mut base,
+            &json!({
+                "pages": [{
+                    "id": "page-1",
+                    "bubbles": [{
+                        "id": "",
+                        "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
+                        "translation": "new"
+                    }]
+                }]
+            }),
+        );
+        assert_eq!(
+            base["pages"][0]["bubbles"][0]["id"],
+            "page-1-bubble-reconstructed"
+        );
+        assert_eq!(base["pages"][0]["bubbles"][0]["translation"], "new");
+
+        merge_saved_edits(
+            &mut base,
+            &json!({
+                "pages": [{
+                    "id": "page-1",
+                    "removed_bubbles": [{
+                        "id": null,
+                        "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8}
+                    }]
+                }]
+            }),
+        );
+        assert!(base["pages"][0]["bubbles"].as_array().unwrap().is_empty());
+        assert_eq!(
+            base["pages"][0]["removed_bubbles"][0]["id"],
+            "page-1-bubble-reconstructed"
+        );
+    }
+
+    #[test]
     fn preserved_bubble_signature_excludes_unrelated_metadata() {
         let first = json!({
             "bubbles": [{
@@ -5078,6 +5169,36 @@ mod tests {
             }),
         );
         assert_eq!(modern_base["pages"][0]["render_dirty"], true);
+
+        let mut null_legacy = normalize_editor_state(json!({
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{
+                    "id": "a",
+                    "bbox": bbox,
+                    "source_text": "ocr",
+                    "kind": "dialogue",
+                    "translation": "dịch"
+                }]
+            }]
+        }))
+        .unwrap();
+        merge_saved_edits(
+            &mut null_legacy,
+            &json!({
+                "pages": [{
+                    "id": "page-1",
+                    "bubbles": [{
+                        "id": "a",
+                        "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
+                        "text": "dịch",
+                        "source_text": null,
+                        "kind": null
+                    }]
+                }]
+            }),
+        );
+        assert_eq!(null_legacy["pages"][0]["render_dirty"], false);
     }
 
     #[test]

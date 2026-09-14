@@ -2898,9 +2898,6 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 .get("_editor_render_payload")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            let report_bubble = reports.and_then(|items| items.get(index));
-            let report_derived = is_editor_render_payload
-                || report_bubble.is_some_and(crate::editor::bubble_has_renderer_report);
             let requested_font_path = bubble
                 .get("_editor_requested_font_path")
                 .or_else(|| bubble.get("requested_font_path"))
@@ -2908,7 +2905,7 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 .filter(|path| !path.trim().is_empty())
                 .map(str::to_owned)
                 .or_else(|| {
-                    (!report_derived).then(|| {
+                    (!is_editor_render_payload).then(|| {
                         bubble
                             .get("font_path")
                             .and_then(serde_json::Value::as_str)
@@ -2921,32 +2918,28 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 .filter(|value| value.is_array())
                 .cloned()
                 .or_else(|| {
-                    (!report_derived).then(|| {
-                        bubble
-                            .get("fallback_font_paths")
-                            .filter(|value| value.is_array())
-                            .cloned()
-                    })?
+                    bubble
+                        .get("fallback_font_paths")
+                        .filter(|value| value.is_array())
+                        .cloned()
                 });
             let requested_min_font_size = bubble
                 .get("_editor_requested_min_font_size")
                 .cloned()
-                .or_else(|| (!report_derived).then(|| bubble.get("min_font_size").cloned())?);
+                .or_else(|| bubble.get("min_font_size").cloned());
             let requested_max_font_size = bubble
                 .get("_editor_requested_max_font_size")
                 .cloned()
-                .or_else(|| (!report_derived).then(|| bubble.get("max_font_size").cloned())?);
+                .or_else(|| bubble.get("max_font_size").cloned());
             let requested_padding =
                 bubble
                     .get("_editor_requested_padding")
                     .cloned()
                     .or_else(|| {
-                        (!report_derived).then(|| {
-                            bubble
-                                .get("padding")
-                                .filter(|value| !value.is_null())
-                                .cloned()
-                        })?
+                        bubble
+                            .get("padding")
+                            .filter(|value| !value.is_null())
+                            .cloned()
                     });
             if let Some(text) = request.get("text") {
                 bubble.insert("translation".into(), text.clone());
@@ -4675,6 +4668,40 @@ mod tests {
         );
         assert_eq!(bubbles[0]["_editor_font_size_override"], 18.0);
         assert_eq!(bubbles[0]["_editor_padding_override"], 6.0);
+    }
+
+    #[test]
+    fn editor_bubbles_keep_unmarked_request_font_settings_with_report_metadata() {
+        let bubbles = editor_bubbles(
+            &json!({
+                "request_bubbles": [{
+                    "id": "b1",
+                    "bbox": {"x1":1,"y1":1,"x2":8,"y2":8},
+                    "text": "Hello",
+                    "font_path": "fonts/requested.ttf",
+                    "fallback_font_paths": ["fonts/fallback.ttf"],
+                    "min_font_size": 12.0,
+                    "max_font_size": 36.0,
+                    "padding": 6.0,
+                    "_editor_render_payload": true
+                }],
+                "report": {"bubbles": [{
+                    "input_bbox": {"x1":1,"y1":1,"x2":8,"y2":8},
+                    "font_size": 18.0,
+                    "padding": 2.0,
+                    "resolved_font_path": "fonts/resolved.ttf",
+                    "fallback_font_paths": ["fonts/used.ttf"]
+                }]}
+            }),
+            "page-1",
+        );
+        assert_eq!(
+            bubbles[0]["_editor_requested_fallback_font_paths"],
+            json!(["fonts/fallback.ttf"])
+        );
+        assert_eq!(bubbles[0]["_editor_requested_min_font_size"], 12.0);
+        assert_eq!(bubbles[0]["_editor_requested_max_font_size"], 36.0);
+        assert_eq!(bubbles[0]["_editor_requested_padding"], 6.0);
     }
 
     #[test]
