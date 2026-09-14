@@ -2086,49 +2086,319 @@ fn removed_bubble_id(value: &Value) -> Option<&str> {
 }
 
 pub(crate) fn page_render_signature(page: &Value) -> Value {
-    fn without_review_metadata(value: &Value) -> Value {
+    fn rect_signature(value: Option<&Value>) -> Value {
+        value
+            .and_then(|value| serde_json::from_value::<Rect>(value.clone()).ok())
+            .map(|rect| json!([rect.x1, rect.y1, rect.x2, rect.y2]))
+            .unwrap_or(Value::Null)
+    }
+
+    fn field(value: Option<&Value>) -> Value {
+        let Some(value) = value.filter(|value| !value.is_null()) else {
+            return Value::Null;
+        };
         match value {
-            Value::Array(values) => Value::Array(
-                values
-                    .iter()
-                    .map(without_review_metadata)
-                    .collect::<Vec<_>>(),
-            ),
-            Value::Object(object) => Value::Object(
-                object
-                    .iter()
-                    .filter(|(key, value)| {
-                        !matches!(
-                            key.as_str(),
-                            "flagged"
-                                | "problem"
-                                | "render_dirty"
-                                | "needs_review"
-                                | "flag_reason"
-                                | "problem_reason"
-                                | "removed_reason"
-                        ) && !value.is_null()
-                    })
-                    .map(|(key, value)| (key.clone(), without_review_metadata(value)))
-                    .collect(),
-            ),
+            Value::Number(number) => number
+                .as_f64()
+                .map(|number| json!(number))
+                .unwrap_or(Value::Null),
             _ => value.clone(),
         }
     }
 
+    fn text_field(value: Option<&Value>) -> Value {
+        value
+            .and_then(Value::as_str)
+            .map(|text| Value::String(text.to_owned()))
+            .unwrap_or(Value::Null)
+    }
+
+    fn has_renderer_report(bubble: &Value) -> bool {
+        [
+            "input_bbox",
+            "safe_bbox",
+            "safe_mask_bbox",
+            "lines",
+            "line_count",
+            "ink_bbox",
+            "placement_center",
+            "font_runs",
+            "sampled_luminance",
+            "resolved_text_color",
+            "resolved_font_path",
+            "rendered_font_path",
+            "fallback_fonts_used",
+            "font_substituted",
+        ]
+        .iter()
+        .any(|key| bubble.get(*key).is_some())
+    }
+
+    fn string_or_null(value: Option<&Value>) -> Value {
+        value
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+            .map(|text| Value::String(text.to_owned()))
+            .unwrap_or(Value::Null)
+    }
+
+    fn bool_or_false(value: Option<&Value>) -> Value {
+        Value::Bool(value.and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    fn kind_field(bubble: &Value) -> Value {
+        match bubble.get("kind") {
+            None => Value::Null,
+            Some(Value::Null) => Value::String(String::new()),
+            Some(value) => text_field(Some(value)),
+        }
+    }
+
+    fn string_array(value: Option<&Value>) -> Value {
+        Value::Array(
+            value
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|path| !path.trim().is_empty())
+                        .map(|path| Value::String(path.to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        )
+    }
+
+    fn requested_font_path(bubble: &Value) -> Value {
+        if bubble
+            .get("font_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty())
+        {
+            if let Some(path) = bubble
+                .get("_editor_requested_font_path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+            {
+                return Value::String(path.to_owned());
+            }
+        }
+        // An editor-render payload uses the resolved path required by the
+        // typesetter. Without the private request marker it is legacy report
+        // state, so treating it as an operator font edit would dirty every
+        // reopened page after fallback selection changed.
+        if bubble
+            .get("_editor_render_payload")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || has_renderer_report(bubble)
+        {
+            return Value::Null;
+        }
+        string_or_null(
+            bubble
+                .get("requested_font_path")
+                .or_else(|| bubble.get("font_path")),
+        )
+    }
+
+    fn requested_page_font_path(page: &Value) -> Value {
+        if page
+            .get("font_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty())
+        {
+            if let Some(path) = page
+                .get("_editor_requested_global_font_path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+            {
+                return Value::String(path.to_owned());
+            }
+        }
+        string_or_null(page.get("font_path"))
+    }
+
+    fn requested_array(bubble: &Value, key: &str, marker: &str) -> Value {
+        if bubble.get(marker).is_some_and(Value::is_array) {
+            return string_array(bubble.get(marker));
+        }
+        if has_renderer_report(bubble) {
+            return Value::Array(Vec::new());
+        }
+        string_array(bubble.get(key))
+    }
+
+    fn requested_layout_value(bubble: &Value, key: &str, marker: &str) -> Value {
+        if let Some(value) = bubble.get(marker).filter(|value| !value.is_null()) {
+            return field(Some(value));
+        }
+        if has_renderer_report(bubble) {
+            return Value::Null;
+        }
+        field(bubble.get(key))
+    }
+
+    fn requested_font_range(bubble: &Value) -> Value {
+        let min = bubble
+            .get("_editor_requested_min_font_size")
+            .or_else(|| bubble.get("min_font_size"));
+        let max = bubble
+            .get("_editor_requested_max_font_size")
+            .or_else(|| bubble.get("max_font_size"));
+        if bubble.get("_editor_requested_min_font_size").is_none()
+            && bubble.get("_editor_requested_max_font_size").is_none()
+            && has_renderer_report(bubble)
+        {
+            return Value::Null;
+        }
+        json!([
+            min.and_then(Value::as_f64)
+                .map(|value| json!(value))
+                .unwrap_or_else(|| json!(DEFAULT_EDITOR_MIN_FONT)),
+            max.and_then(Value::as_f64)
+                .map(|value| json!(value))
+                .unwrap_or_else(|| json!(DEFAULT_EDITOR_MAX_FONT)),
+        ])
+    }
+
+    fn bubble_signature(bubble: &Value) -> Value {
+        let bbox = bubble.get("bbox").or_else(|| bubble.get("bubble_bbox"));
+        let bbox_rect = bbox.and_then(|value| serde_json::from_value::<Rect>(value.clone()).ok());
+        let operator_geometry = bbox_rect.is_some_and(|bbox| {
+            bubble
+                .get("bubble_bbox")
+                .and_then(|value| serde_json::from_value::<Rect>(value.clone()).ok())
+                .is_some_and(|bubble_bbox| rects_match(bbox, bubble_bbox))
+        });
+        let preserve_source = bubble_preserve_for_render(bubble);
+        json!({
+            // IDs and array order are render semantics: overlapping bubbles
+            // are painted in this order and tombstones address an ID.
+            "id": text_field(bubble.get("id")),
+            "bbox": rect_signature(bbox),
+            "translation": if preserve_source { Value::Null } else {
+                text_field(bubble.get("translation"))
+            },
+            "preserve_source": preserve_source,
+            "preserve_by_default": bool_or_false(bubble.get("preserve_by_default")),
+            "keep_source": bool_or_false(bubble.get("keep_source")),
+            "manual": bool_or_false(
+                bubble
+                    .get("manual")
+                    .or_else(|| bubble.get("_editor_manual")),
+            ),
+            "kind": kind_field(bubble),
+            // Empty and absent source OCR have the same manual-cleaning
+            // behavior; non-empty source text remains part of the request.
+            "source_text": string_or_null(bubble.get("source_text")),
+            "text_bbox": if preserve_source || operator_geometry {
+                Value::Null
+            } else {
+                rect_signature(bubble.get("text_bbox"))
+            },
+            "text_color": if preserve_source { Value::Null } else {
+                field(bubble.get("text_color"))
+            },
+            // The request font is a user input. `rendered_font_path` and the
+            // report's resolved face are renderer products and are omitted.
+            "font_path": if preserve_source {
+                Value::Null
+            } else {
+                requested_font_path(bubble)
+            },
+            "fallback_font_paths": if preserve_source {
+                Value::Null
+            } else {
+                requested_array(
+                    bubble,
+                    "fallback_font_paths",
+                    "_editor_requested_fallback_font_paths",
+                )
+            },
+            "font_range": if preserve_source {
+                Value::Null
+            } else {
+                requested_font_range(bubble)
+            },
+            "shape": if preserve_source { Value::Null } else {
+                Value::String(bubble.get("shape").and_then(Value::as_str).unwrap_or("ellipse").to_owned())
+            },
+            // `font_size` and `padding` in a reconstructed editor bubble are
+            // usually fitted report values. Native edits leave an explicit
+            // marker so those derived values can stay out of this identity.
+            "font_size_override": requested_layout_value(
+                bubble,
+                "font_size",
+                "_editor_font_size_override",
+            ),
+            "padding_override": if bubble.get("_editor_padding_override").is_some() {
+                requested_layout_value(bubble, "padding", "_editor_padding_override")
+            } else {
+                requested_layout_value(bubble, "padding", "_editor_requested_padding")
+            },
+        })
+    }
+
+    fn removed_signature(value: &Value) -> Value {
+        json!({
+            "id": text_field(value.get("id")),
+            "bbox": rect_signature(value.get("bbox").or_else(|| value.get("bubble_bbox"))),
+        })
+    }
+
+    fn stroke_signature(value: &Value) -> Value {
+        let points = value
+            .get("points")
+            .and_then(Value::as_array)
+            .map(|points| {
+                points
+                    .iter()
+                    .map(|point| json!([field(point.get("x")), field(point.get("y")),]))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        json!({
+            "mode": value.get("mode").and_then(Value::as_str).unwrap_or("cover"),
+            "color": value.get("color").and_then(Value::as_str).unwrap_or("#ffffff"),
+            "size": value.get("size").and_then(Value::as_f64).unwrap_or(24.0),
+            "points": points,
+        })
+    }
+
+    let bubbles = page
+        .get("bubbles")
+        .and_then(Value::as_array)
+        .map(|bubbles| bubbles.iter().map(bubble_signature).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let removed_bubbles = page
+        .get("removed_bubbles")
+        .and_then(Value::as_array)
+        .map(|bubbles| bubbles.iter().map(removed_signature).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let correction_strokes = page
+        .get("correction_strokes")
+        .and_then(Value::as_array)
+        .map(|strokes| strokes.iter().map(stroke_signature).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let uses_font = page
+        .get("bubbles")
+        .and_then(Value::as_array)
+        .is_some_and(|bubbles| {
+            bubbles
+                .iter()
+                .any(|bubble| !bubble_preserve_for_render(bubble))
+        });
     json!({
-        "bubbles": page
-            .get("bubbles")
-            .map(without_review_metadata)
-            .unwrap_or_else(|| Value::Array(Vec::new())),
-        "removed_bubbles": page
-            .get("removed_bubbles")
-            .map(without_review_metadata)
-            .unwrap_or_else(|| Value::Array(Vec::new())),
-        "correction_strokes": page
-            .get("correction_strokes")
-            .map(without_review_metadata)
-            .unwrap_or_else(|| Value::Array(Vec::new())),
+        "font_path": if uses_font {
+            requested_page_font_path(page)
+        } else {
+            Value::Null
+        },
+        "bubbles": bubbles,
+        "removed_bubbles": removed_bubbles,
+        "correction_strokes": correction_strokes,
     })
 }
 
@@ -2581,11 +2851,27 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                     };
                     for key in [
                         "translation",
+                        "source_text",
+                        "kind",
+                        "manual",
+                        "preserve_by_default",
+                        "keep_source",
                         "bbox",
                         "bubble_bbox",
                         "text_bbox",
                         "font_size",
+                        "_editor_font_size_override",
                         "padding",
+                        "_editor_padding_override",
+                        "_editor_requested_padding",
+                        "font_path",
+                        "_editor_requested_font_path",
+                        "fallback_font_paths",
+                        "_editor_requested_fallback_font_paths",
+                        "min_font_size",
+                        "max_font_size",
+                        "_editor_requested_min_font_size",
+                        "_editor_requested_max_font_size",
                         "reading_order",
                         "flagged",
                         "problem",
@@ -2593,19 +2879,46 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                         "problem_reason",
                         "needs_review",
                         "text_color",
+                        "preserve_source",
                     ] {
                         if let Some(value) = saved_bubble.get(key) {
                             base_bubble_object.insert(key.to_owned(), value.clone());
                         }
                     }
+                    if !saved_bubble.contains_key("translation") {
+                        // The old typeset request shape used `text` as the
+                        // translation and had no OCR `source_text` or `kind`.
+                        // Only that unambiguous shape gets the compatibility
+                        // normalization; a modern saved bubble missing its
+                        // translation remains visibly dirty.
+                        if saved_bubble.get("source_text").is_none()
+                            && saved_bubble.get("kind").is_none()
+                            && saved_bubble.get("text").and_then(Value::as_str).is_some()
+                        {
+                            base_bubble_object.insert(
+                                "translation".to_owned(),
+                                saved_bubble.get("text").cloned().unwrap_or(Value::Null),
+                            );
+                        } else {
+                            base_bubble_object.insert("translation".to_owned(), Value::Null);
+                        }
+                    }
+                    // A missing or legacy renderer-only font field must not
+                    // leave a current sidecar's private request marker behind
+                    // after an explicit saved edit/removal.
+                    if saved_bubble.get("font_path").is_none_or(Value::is_null) {
+                        base_bubble_object.remove("_editor_requested_font_path");
+                    }
                 }
+                let original_base_len = base_bubbles.len();
                 let base_ids: std::collections::HashSet<String> = base_bubbles
                     .iter()
                     .filter_map(|bubble| {
                         bubble.get("id").and_then(Value::as_str).map(str::to_owned)
                     })
                     .collect();
-                for saved_bubble in saved_bubbles {
+                let original_base_ids = base_ids.clone();
+                for saved_bubble in &saved_bubbles {
                     let Some(id) = saved_bubble.get("id").and_then(Value::as_str) else {
                         continue;
                     };
@@ -2613,9 +2926,46 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                         && !base_ids.contains(id)
                         && saved_bubble.get("bbox").is_some()
                     {
-                        base_bubbles.push(saved_bubble);
+                        base_bubbles.push(saved_bubble.clone());
                     }
                 }
+                // The persisted editor order is part of the render result:
+                // later bubbles paint over earlier ones. Rebuild it by saved
+                // ID, then append reconstructed bubbles that the old snapshot
+                // did not mention.
+                let mut ordered = Vec::with_capacity(base_bubbles.len());
+                let mut consumed_indices = std::collections::HashSet::new();
+                for saved_bubble in &saved_bubbles {
+                    let Some(id) = saved_bubble.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if removed_ids.contains(id) || !original_base_ids.contains(id) {
+                        continue;
+                    }
+                    if let Some((index, bubble)) =
+                        base_bubbles.iter().enumerate().find(|(index, bubble)| {
+                            !consumed_indices.contains(index)
+                                && bubble.get("id").and_then(Value::as_str) == Some(id)
+                        })
+                    {
+                        consumed_indices.insert(index);
+                        ordered.push(bubble.clone());
+                    }
+                }
+                for (index, bubble) in base_bubbles.iter().take(original_base_len).enumerate() {
+                    if !consumed_indices.contains(&index) {
+                        ordered.push(bubble.clone());
+                    }
+                }
+                for saved_bubble in &saved_bubbles {
+                    let Some(id) = saved_bubble.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if !original_base_ids.contains(id) && !removed_ids.contains(id) {
+                        ordered.push(saved_bubble.clone());
+                    }
+                }
+                *base_bubbles = ordered;
             }
         }
         let render_dirty = page_render_signature(base_page) != baseline_signature;
@@ -2800,8 +3150,9 @@ fn synchronize_rendered_bubbles(page: &mut Value) {
         if let Some(bbox) = object.get("bbox").cloned() {
             object.insert("bubble_bbox".to_owned(), bbox);
         }
-        // A successful render has consumed all render-affecting bubble edits;
-        // advisory flags remain separate and are intentionally preserved.
+        // Keep native request markers with the state so a reopened sidecar
+        // can prove that its fitted report values came from the same edit.
+        // Advisory flags remain separate and are intentionally preserved.
         object.insert("render_dirty".to_owned(), Value::Bool(false));
     }
 }
@@ -2949,7 +3300,11 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
     let global_font = state.get("font_path").and_then(Value::as_str);
     let mut fallback_font_paths = Vec::new();
     for bubble in bubbles {
-        if let Some(paths) = bubble.get("fallback_font_paths").and_then(Value::as_array) {
+        let fallback_paths = bubble
+            .get("_editor_requested_fallback_font_paths")
+            .and_then(Value::as_array)
+            .or_else(|| bubble.get("fallback_font_paths").and_then(Value::as_array));
+        if let Some(paths) = fallback_paths {
             fallback_font_paths.extend(paths.iter().filter_map(Value::as_str).map(str::to_owned));
         }
         if let Some(path) = bubble.get("rendered_font_path").and_then(Value::as_str) {
@@ -3056,12 +3411,28 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 "bubble {bubble_index} has an empty translation; use Preserve original / remove translation box"
             );
         }
-        let requested_font_path = bubble
-            .get("font_path")
-            .and_then(Value::as_str)
-            .or_else(|| bubble.get("rendered_font_path").and_then(Value::as_str))
-            .or(global_font)
-            .filter(|path| !path.trim().is_empty());
+        let font_path = bubble.get("font_path").and_then(Value::as_str);
+        let requested_marker = bubble
+            .get("_editor_requested_font_path")
+            .and_then(Value::as_str);
+        let rendered_font_path = bubble.get("rendered_font_path").and_then(Value::as_str);
+        let requested_font_path = match (font_path, requested_marker, rendered_font_path) {
+            (Some(current), Some(_requested), Some(_resolved))
+                if crate::workflow::is_generic_desktop_font(std::path::Path::new(current)) =>
+            {
+                Some(current)
+            }
+            (Some(current), Some(requested), Some(resolved))
+                if current == requested || current == resolved =>
+            {
+                Some(requested)
+            }
+            (Some(current), _, _) => Some(current),
+            (None, _, Some(resolved)) => Some(resolved),
+            (None, _, None) => None,
+        }
+        .or(global_font)
+        .filter(|path| !path.trim().is_empty());
         let (font_path, substitution_reason) = match requested_font_path {
             Some(path) if crate::workflow::is_generic_desktop_font(std::path::Path::new(path)) => (
                 PathBuf::from(&bundled_primary),
@@ -3138,6 +3509,39 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         .parent()
         .unwrap_or(&session.root_dir)
         .join("rendered.png");
+    let mut request_bubbles = serde_json::to_value(&payloads)?;
+    if let Some(requests) = request_bubbles.as_array_mut() {
+        for request in requests {
+            let Some(request_object) = request.as_object_mut() else {
+                continue;
+            };
+            let bubble_id = request_object.get("id").and_then(Value::as_str);
+            let source_bubble = bubbles.iter().find(|bubble| {
+                bubble
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .zip(bubble_id)
+                    .is_some_and(|(left, right)| left == right)
+            });
+            request_object.insert("_editor_render_payload".to_owned(), Value::Bool(true));
+            if let Some(source_bubble) = source_bubble {
+                for key in [
+                    "_editor_requested_font_path",
+                    "_editor_requested_fallback_font_paths",
+                    "_editor_requested_min_font_size",
+                    "_editor_requested_max_font_size",
+                    "_editor_requested_padding",
+                ] {
+                    if let Some(value) = source_bubble.get(key) {
+                        request_object.insert(key.to_owned(), value.clone());
+                    }
+                }
+                if let Some(manual) = source_bubble.get("manual") {
+                    request_object.insert("manual".to_owned(), manual.clone());
+                }
+            }
+        }
+    }
     let mut report = crate::typeset::typeset_page_with_fallbacks(
         &source,
         &payloads,
@@ -3204,12 +3608,22 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         &output,
         &workflow.validate_clean_input(&source)?,
         json!({
-            "request_bubbles": payloads,
+            "request_bubbles": request_bubbles,
             "report": report.clone(),
         }),
         json!({
             "editor_render": true,
-            "correction_strokes": strokes.len(),
+            "global_font_path": state
+                .get("_editor_requested_global_font_path")
+                .or_else(|| state.get("font_path"))
+                .cloned()
+                .unwrap_or(Value::Null),
+            // Keep the actual stroke semantics beside the render artifact so
+            // approval can verify a reopened page without blindly rerendering
+            // every page that ever used the brush. The count remains useful
+            // compatibility metadata for older readers.
+            "correction_strokes": strokes,
+            "correction_stroke_count": strokes.len(),
             "removed_bubbles": removed_bubbles,
         }),
     )?;
@@ -4018,6 +4432,238 @@ mod tests {
             page_render_signature(&clean),
             page_render_signature(&persisted)
         );
+    }
+
+    #[test]
+    fn render_signature_uses_semantic_inputs_and_ignores_report_layout() {
+        let mut saved = json!({
+            "render_dirty": true,
+            "bubbles": [{
+                "id": "bubble-1",
+                "source_text": "OCR source",
+                "kind": "dialogue",
+                "preserve_source": false,
+                "preserve_by_default": false,
+                "text": "Bản dịch",
+                "translation": "Bản dịch",
+                "bbox": {"x1": 10.0, "y1": 12.0, "x2": 90.0, "y2": 70.0},
+                "bubble_bbox": {"x1": 10.0, "y1": 12.0, "x2": 90.0, "y2": 70.0},
+                "text_bbox": {"x1": 14.0, "y1": 16.0, "x2": 86.0, "y2": 66.0},
+                "font_path": "fonts/requested.ttf",
+                "min_font_size": 8.0,
+                "max_font_size": 72.0,
+                "text_color": "white",
+                "shape": "ellipse",
+                "font_size": 18.0,
+                "padding": 4.0
+            }]
+        });
+        let sidecar = json!({
+            "bubbles": [{
+                "id": "bubble-1",
+                "source_text": "OCR source",
+                "kind": "dialogue",
+                "preserve_source": false,
+                "preserve_by_default": false,
+                "text": "Bản dịch",
+                "translation": "Bản dịch",
+                "bbox": {"x1": 10, "y1": 12, "x2": 90, "y2": 70},
+                "bubble_bbox": {"x1": 10, "y1": 12, "x2": 90, "y2": 70},
+                "text_bbox": {"x1": 14, "y1": 16, "x2": 86, "y2": 66},
+                "font_path": "fonts/requested.ttf",
+                "min_font_size": 8,
+                "max_font_size": 72,
+                "text_color": "white",
+                "shape": "ellipse",
+                "font_size": 23.5,
+                "padding": 7.0,
+                "input_bbox": {"x1": 10, "y1": 12, "x2": 90, "y2": 70},
+                "safe_bbox": {"x1": 18, "y1": 20, "x2": 82, "y2": 62},
+                "safe_mask_bbox": {"x1": 19, "y1": 21, "x2": 81, "y2": 61},
+                "lines": ["Bản dịch"],
+                "line_count": 1,
+                "ink_bbox": {"x1": 20, "y1": 22, "x2": 60, "y2": 40},
+                "placement_center": {"x": 50, "y": 41},
+                "resolved_font_path": "fonts/resolved-fallback.ttf",
+                "fallback_font_paths": ["fonts/resolved-fallback.ttf"],
+                "fallback_fonts_used": ["fonts/resolved-fallback.ttf"],
+                "font_runs": [{"font_index": 1, "text": "Bản dịch"}],
+                "sampled_luminance": 38,
+                "resolved_text_color": "white",
+                "render_dirty": false,
+                "needs_review": false
+            }],
+            "removed_bubbles": [],
+            "correction_strokes": []
+        });
+        // The only differences below are fitted/report values and legacy
+        // bookkeeping. They must not make an already rendered page dirty.
+        saved["bubbles"][0]["font_size"] = json!(11.5);
+        saved["bubbles"][0]["padding"] = json!(2.0);
+        saved["bubbles"][0]["rendered_font_path"] = json!("fonts/resolved-fallback.ttf");
+        saved["bubbles"][0]["safe_bbox"] = json!({"x1": 99, "y1": 99, "x2": 100, "y2": 100});
+        saved["bubbles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("translation");
+        // A missing translation is not equivalent to the request's `text`;
+        // treating it as a fallback would hide a lost user edit.
+        assert_ne!(
+            page_render_signature(&saved),
+            page_render_signature(&sidecar)
+        );
+
+        saved["bubbles"][0]["translation"] = json!("Edited");
+        assert_ne!(
+            page_render_signature(&saved),
+            page_render_signature(&sidecar)
+        );
+        saved["bubbles"][0]["translation"] = json!("Bản dịch");
+        saved["bubbles"][0]["_editor_font_size_override"] = json!(12.0);
+        assert_ne!(
+            page_render_signature(&saved),
+            page_render_signature(&sidecar)
+        );
+    }
+
+    #[test]
+    fn render_signature_preserves_bubble_identity_order_and_legacy_override_rule() {
+        let bubble = |id: &str| {
+            json!({
+                "id": id,
+                "translation": "dịch",
+                "source_text": "source",
+                "kind": "dialogue",
+                "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
+            })
+        };
+        let first = json!({"bubbles": [bubble("a"), bubble("b")]});
+        let reordered = json!({"bubbles": [bubble("b"), bubble("a")]});
+        assert_ne!(
+            page_render_signature(&first),
+            page_render_signature(&reordered)
+        );
+
+        let mut missing_translation = first.clone();
+        missing_translation["bubbles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("translation");
+        assert_ne!(
+            page_render_signature(&first),
+            page_render_signature(&missing_translation)
+        );
+
+        let mut legacy_baseline = json!({"bubbles": [bubble("a")]});
+        legacy_baseline["bubbles"][0]["safe_bbox"] = json!({"x1": 0, "y1": 0, "x2": 8, "y2": 8});
+        let mut legacy = legacy_baseline.clone();
+        legacy["bubbles"][0]["font_path"] = json!("fonts/old-resolved.ttf");
+        legacy["bubbles"][0]["rendered_font_path"] = json!("fonts/new-resolved.ttf");
+        legacy["bubbles"][0]["font_size"] = json!(12.0);
+        legacy["bubbles"][0]["padding"] = json!(2.0);
+        legacy["bubbles"][0]["safe_bbox"] = json!({"x1": 0, "y1": 0, "x2": 8, "y2": 8});
+        assert_eq!(
+            page_render_signature(&legacy_baseline),
+            page_render_signature(&legacy)
+        );
+
+        let mut genuine_override = first.clone();
+        genuine_override["bubbles"][0]["font_size"] = json!(12.0);
+        assert_ne!(
+            page_render_signature(&first),
+            page_render_signature(&genuine_override)
+        );
+        let mut font_input = first.clone();
+        font_input["bubbles"][0]["font_path"] = json!("fonts/operator.ttf");
+        assert_ne!(
+            page_render_signature(&first),
+            page_render_signature(&font_input)
+        );
+        let mut global_font = first.clone();
+        global_font["font_path"] = json!("fonts/global.ttf");
+        assert_ne!(
+            page_render_signature(&first),
+            page_render_signature(&global_font)
+        );
+    }
+
+    #[test]
+    fn merge_saved_edits_keeps_saved_bubble_order_then_appends_new_bubbles() {
+        let bbox = json!({"x1": 1, "y1": 1, "x2": 8, "y2": 8});
+        let mut base = normalize_editor_state(json!({
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [
+                    {"id": "a", "bbox": bbox.clone(), "translation": "A"},
+                    {"id": "b", "bbox": bbox.clone(), "translation": "B"},
+                    {"id": "c", "bbox": bbox.clone(), "translation": "C"}
+                ]
+            }]
+        }))
+        .unwrap();
+        let saved = json!({
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [
+                    {"id": "b", "bbox": bbox.clone(), "translation": "B2"},
+                    {"id": "a", "bbox": bbox.clone(), "translation": "A2"},
+                    {"id": "d", "bbox": bbox.clone(), "translation": "D"}
+                ]
+            }]
+        });
+        merge_saved_edits(&mut base, &saved);
+        let ids = base["pages"][0]["bubbles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|bubble| bubble["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["b", "a", "c", "d"]);
+        assert_eq!(base["pages"][0]["bubbles"][0]["translation"], "B2");
+    }
+
+    #[test]
+    fn merge_saved_edits_only_normalizes_known_legacy_translation_shape() {
+        let bbox = json!({"x1": 1, "y1": 1, "x2": 8, "y2": 8});
+        let mut legacy_base = normalize_editor_state(json!({
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{"id": "a", "bbox": bbox.clone(), "translation": "dịch"}]
+            }]
+        }))
+        .unwrap();
+        merge_saved_edits(
+            &mut legacy_base,
+            &json!({
+                "pages": [{
+                    "id": "page-1",
+                    "bubbles": [{"id": "a", "bbox": bbox.clone(), "text": "dịch"}]
+                }]
+            }),
+        );
+        assert_eq!(legacy_base["pages"][0]["render_dirty"], false);
+
+        let mut modern_base = normalize_editor_state(json!({
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{"id": "a", "bbox": bbox.clone(), "translation": "dịch"}]
+            }]
+        }))
+        .unwrap();
+        merge_saved_edits(
+            &mut modern_base,
+            &json!({
+                "pages": [{
+                    "id": "page-1",
+                    "bubbles": [{
+                        "id": "a",
+                        "bbox": bbox.clone(),
+                        "source_text": "ocr"
+                    }]
+                }]
+            }),
+        );
+        assert_eq!(modern_base["pages"][0]["render_dirty"], true);
     }
 
     #[test]

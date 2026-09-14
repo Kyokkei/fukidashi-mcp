@@ -298,10 +298,13 @@ impl EditorState {
         if let Some(obj) = self.value.as_object_mut() {
             match path {
                 Some(p) if !p.trim().is_empty() => {
-                    obj.insert("font_path".to_owned(), serde_json::Value::String(p));
+                    let value = serde_json::Value::String(p);
+                    obj.insert("font_path".to_owned(), value.clone());
+                    obj.insert("_editor_requested_global_font_path".to_owned(), value);
                 }
                 _ => {
                     obj.insert("font_path".to_owned(), serde_json::Value::Null);
+                    obj.remove("_editor_requested_global_font_path");
                 }
             }
         }
@@ -502,8 +505,20 @@ impl EditorState {
         self.bubble_mut(page_index, bubble_index, |bubble| {
             if let Some(obj) = bubble.as_object_mut() {
                 match size {
-                    Some(s) => obj.insert("font_size".to_owned(), serde_json::json!(s)),
-                    None => obj.insert("font_size".to_owned(), serde_json::Value::Null),
+                    Some(s) => {
+                        obj.insert("font_size".to_owned(), serde_json::json!(s));
+                        obj.insert(
+                            "_editor_font_size_override".to_owned(),
+                            serde_json::json!(s),
+                        )
+                    }
+                    None => {
+                        obj.insert("font_size".to_owned(), serde_json::Value::Null);
+                        obj.insert(
+                            "_editor_font_size_override".to_owned(),
+                            serde_json::Value::String("auto".to_owned()),
+                        )
+                    }
                 };
             }
         });
@@ -513,6 +528,10 @@ impl EditorState {
         self.bubble_mut(page_index, bubble_index, |bubble| {
             if let Some(obj) = bubble.as_object_mut() {
                 obj.insert("padding".to_owned(), serde_json::json!(padding));
+                obj.insert(
+                    "_editor_padding_override".to_owned(),
+                    serde_json::json!(padding),
+                );
             }
         });
     }

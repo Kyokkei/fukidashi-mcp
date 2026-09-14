@@ -1989,6 +1989,7 @@ impl Workflow {
             bail!("managed job has no expected pages");
         }
         let mut pages = Vec::with_capacity(sources.len());
+        let mut global_font_path = None;
         for source in sources {
             let entry = manifest
                 .pages
@@ -2007,6 +2008,25 @@ impl Workflow {
                 .ok_or_else(|| anyhow!("rendered page has no render artifact"))?;
             let artifact = self.validate_render_input(rendered_page)?;
             let bubbles = editor_bubbles(&artifact.typeset, &page_key(&source));
+            if global_font_path.is_none() {
+                global_font_path = artifact
+                    .qa
+                    .get("global_font_path")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+            }
+            let removed_bubbles = artifact
+                .qa
+                .get("removed_bubbles")
+                .filter(|value| value.is_array())
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+            let correction_strokes = artifact
+                .qa
+                .get("correction_strokes")
+                .filter(|value| value.is_array())
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
             pages.push(json!({
                 "id": stable_page_id(&source),
                 "image_path": source,
@@ -2016,14 +2036,26 @@ impl Workflow {
                 "rendered_image_path": rendered_page,
                 "state": "rendered",
                 "bubbles": bubbles,
-                "removed_bubbles": [],
+                "removed_bubbles": removed_bubbles,
+                "correction_strokes": correction_strokes,
                 "render_dirty": false,
                 "rendered_state_revision": 0,
             }));
         }
         let mut state = json!({"schema_version": 1, "pages": pages});
+        if let Some(font_path) = global_font_path {
+            state["font_path"] = serde_json::Value::String(font_path.clone());
+            state["_editor_requested_global_font_path"] = serde_json::Value::String(font_path);
+        }
         if let Some(object) = supplied.and_then(serde_json::Value::as_object) {
-            for key in ["title", "source_language", "target_language", "metadata"] {
+            for key in [
+                "title",
+                "source_language",
+                "target_language",
+                "metadata",
+                "font_path",
+                "_editor_requested_global_font_path",
+            ] {
                 if let Some(value) = object.get(key) {
                     state[key] = value.clone();
                 }
@@ -2102,7 +2134,7 @@ impl Workflow {
     ) -> Result<()> {
         let job = canonical_path(job)?;
         let manifest = load_manifest(&job)?;
-        let expected_pages = if manifest.expected_pages.is_empty() {
+        let mut expected_pages = if manifest.expected_pages.is_empty() {
             manifest
                 .pages
                 .values()
@@ -2111,6 +2143,9 @@ impl Workflow {
         } else {
             manifest.expected_pages.clone()
         };
+        if manifest.expected_pages.is_empty() {
+            expected_pages.sort_by(|left, right| natural_cmp(left, right));
+        }
         let page_count = state
             .get("pages")
             .and_then(serde_json::Value::as_array)
@@ -2163,15 +2198,16 @@ impl Workflow {
     /// Return the pages that must be rendered before a managed approval.
     ///
     /// A saved editor flag is only a hint: older project snapshots marked
-    /// every bubble dirty because they persisted the bookkeeping flag that
-    /// the reconstructed sidecar state omitted. Compare the editable page to
-    /// the managed sidecar as well, so those stale flags can reuse a verified
-    /// render while a real edit, missing artifact, or invalid artifact still
-    /// takes the render path.
+    /// every bubble dirty because they persisted renderer bookkeeping that
+    /// the reconstructed sidecar state recomputed differently. Compare the
+    /// canonical render inputs to the managed sidecar, so those stale flags
+    /// and report-only differences can reuse a verified render while a real
+    /// edit, missing artifact, or invalid artifact still takes the render
+    /// path.
     pub fn editor_render_plan(&self, job: &Path, state: &serde_json::Value) -> Result<Vec<usize>> {
         let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
         let manifest = load_manifest(&job)?;
-        let expected_pages = if manifest.expected_pages.is_empty() {
+        let mut expected_pages = if manifest.expected_pages.is_empty() {
             manifest
                 .pages
                 .values()
@@ -2180,6 +2216,9 @@ impl Workflow {
         } else {
             manifest.expected_pages.clone()
         };
+        if manifest.expected_pages.is_empty() {
+            expected_pages.sort_by(|left, right| natural_cmp(left, right));
+        }
         let pages = state
             .get("pages")
             .and_then(serde_json::Value::as_array)
@@ -2228,11 +2267,38 @@ impl Workflow {
             };
 
             let cached_page = serde_json::json!({
+                "font_path": artifact
+                    .qa
+                    .get("global_font_path")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
                 "bubbles": editor_bubbles(&artifact.typeset, &page_key(&source)),
-                "removed_bubbles": [],
-                "correction_strokes": [],
+                "removed_bubbles": artifact
+                    .qa
+                    .get("removed_bubbles")
+                    .filter(|value| value.is_array())
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
+                "correction_strokes": artifact
+                    .qa
+                    .get("correction_strokes")
+                    .filter(|value| value.is_array())
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
             });
-            let content_changed = crate::editor::page_render_signature(state_page)
+            let mut state_page_for_signature = state_page.clone();
+            if let Some(object) = state_page_for_signature.as_object_mut() {
+                if let Some(font_path) = state.get("font_path") {
+                    object.insert("font_path".to_owned(), font_path.clone());
+                }
+                if let Some(font_path) = state.get("_editor_requested_global_font_path") {
+                    object.insert(
+                        "_editor_requested_global_font_path".to_owned(),
+                        font_path.clone(),
+                    );
+                }
+            }
+            let content_changed = crate::editor::page_render_signature(&state_page_for_signature)
                 != crate::editor::page_render_signature(&cached_page);
             let complete = validate_typeset_completeness(&job, &source, &artifact.typeset).is_ok();
             if content_changed || !complete {
@@ -2810,6 +2876,61 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 }
             }
             bubble.insert("id".into(), serde_json::Value::String(bubble_id));
+            let is_editor_render_payload = bubble
+                .get("_editor_render_payload")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let requested_font_path = bubble
+                .get("_editor_requested_font_path")
+                .or_else(|| bubble.get("requested_font_path"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    (!is_editor_render_payload).then(|| {
+                        bubble
+                            .get("font_path")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|path| !path.trim().is_empty())
+                            .map(str::to_owned)
+                    })?
+                });
+            let requested_fallback_font_paths = bubble
+                .get("_editor_requested_fallback_font_paths")
+                .filter(|value| value.is_array())
+                .cloned()
+                .or_else(|| {
+                    (!is_editor_render_payload).then(|| {
+                        bubble
+                            .get("fallback_font_paths")
+                            .filter(|value| value.is_array())
+                            .cloned()
+                    })?
+                });
+            let requested_min_font_size = bubble
+                .get("_editor_requested_min_font_size")
+                .cloned()
+                .or_else(|| {
+                    (!is_editor_render_payload).then(|| bubble.get("min_font_size").cloned())?
+                });
+            let requested_max_font_size = bubble
+                .get("_editor_requested_max_font_size")
+                .cloned()
+                .or_else(|| {
+                    (!is_editor_render_payload).then(|| bubble.get("max_font_size").cloned())?
+                });
+            let requested_padding =
+                bubble
+                    .get("_editor_requested_padding")
+                    .cloned()
+                    .or_else(|| {
+                        (!is_editor_render_payload).then(|| {
+                            bubble
+                                .get("padding")
+                                .filter(|value| !value.is_null())
+                                .cloned()
+                        })?
+                    });
             if let Some(text) = request.get("text") {
                 bubble.insert("translation".into(), text.clone());
             }
@@ -2844,6 +2965,32 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                         serde_json::Value::String(font_path.to_owned()),
                     );
                 }
+            }
+            if let Some(path) = requested_font_path.or_else(|| {
+                bubble
+                    .get("requested_font_path")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|path| !path.trim().is_empty())
+                    .map(str::to_owned)
+            }) {
+                // Keep the requested face beside the resolved request/report
+                // fields so reopening an editor render retains user intent.
+                bubble.insert(
+                    "_editor_requested_font_path".into(),
+                    serde_json::Value::String(path),
+                );
+            }
+            if let Some(paths) = requested_fallback_font_paths {
+                bubble.insert("_editor_requested_fallback_font_paths".into(), paths);
+            }
+            if let Some(min_font_size) = requested_min_font_size {
+                bubble.insert("_editor_requested_min_font_size".into(), min_font_size);
+            }
+            if let Some(max_font_size) = requested_max_font_size {
+                bubble.insert("_editor_requested_max_font_size".into(), max_font_size);
+            }
+            if let Some(padding) = requested_padding {
+                bubble.insert("_editor_requested_padding".into(), padding);
             }
             Some(serde_json::Value::Object(bubble))
         })
@@ -4958,6 +5105,146 @@ mod tests {
                 .editor_render_plan(&registration.job_dir, &state)
                 .unwrap(),
             vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn editor_render_plan_ignores_legacy_report_layout_across_many_pages() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("comic");
+        fs::create_dir_all(&source_dir).unwrap();
+        let names = [
+            "page-10.png",
+            "page-2.png",
+            "page-1.png",
+            "page-3.png",
+            "page-4.png",
+            "page-5.png",
+            "page-6.png",
+            "page-7.png",
+        ];
+        let sources = names
+            .iter()
+            .map(|name| source_dir.join(name))
+            .collect::<Vec<_>>();
+        for source in &sources {
+            let mut image = RgbaImage::from_pixel(16, 16, Rgba([255, 255, 255, 255]));
+            image.put_pixel(3, 3, Rgba([0, 0, 0, 255]));
+            image.save(source).unwrap();
+        }
+
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let registration = workflow.register_analysis(&sources[0], None).unwrap();
+        for source in sources.iter().skip(1) {
+            workflow.register_analysis(source, None).unwrap();
+        }
+        for (index, source) in sources.iter().enumerate() {
+            let cleaned = RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255]));
+            let mut mask = GrayImage::new(16, 16);
+            mask.put_pixel(3, 3, image::Luma([255]));
+            let (cleaned_path, _, _) = workflow
+                .write_clean_artifact(source, &cleaned, &mask, 1, "full")
+                .unwrap();
+            let rendered_path = workflow.page_artifacts_for_source(source).unwrap().4;
+            cleaned.save(&rendered_path).unwrap();
+            let request = json!({
+                "id": format!("bubble-{index}"),
+                "source_text": "OCR source",
+                "kind": "dialogue",
+                "preserve_source": false,
+                "preserve_by_default": false,
+                "bbox": {"x1": 1.0, "y1": 1.0, "x2": 14.0, "y2": 14.0},
+                "text": "Bản dịch",
+                "font_path": "fonts/requested.ttf",
+                "min_font_size": 8.0,
+                "max_font_size": 72.0,
+                "shape": "ellipse"
+            });
+            let report_bubble = json!({
+                "index": 0,
+                "input_bbox": request["bbox"],
+                "bubble_bbox": request["bbox"],
+                "text_bbox": serde_json::Value::Null,
+                "safe_bbox": {"x1": 2.0, "y1": 2.0, "x2": 13.0, "y2": 13.0},
+                "safe_mask_bbox": {"x1": 2.0, "y1": 2.0, "x2": 13.0, "y2": 13.0},
+                "padding": 6.0,
+                "font_size": 23.5,
+                "lines": ["Bản dịch"],
+                "line_count": 1,
+                "placement_center": {"x": 8.0, "y": 8.0},
+                "ink_bbox": {"x1": 4.0, "y1": 4.0, "x2": 10.0, "y2": 10.0},
+                "requested_font_path": "fonts/requested.ttf",
+                "requested_primary_font": "fonts/requested.ttf",
+                "font_path": "fonts/requested.ttf",
+                "resolved_font_path": "fonts/resolved.ttf",
+                "fallback_font_paths": ["fonts/resolved.ttf"],
+                "fallback_fonts_used": ["fonts/resolved.ttf"],
+                "font_runs": [{"font_index": 1, "text": "Bản dịch"}],
+                "resolved_text_color": "black",
+                "sampled_luminance": 220,
+                "shape": "ellipse"
+            });
+            workflow
+                .register_render(
+                    &rendered_path,
+                    &workflow.validate_clean_input(&cleaned_path).unwrap(),
+                    json!({
+                        "request_bubbles": [request],
+                        "report": {"bubbles": [report_bubble]}
+                    }),
+                    json!({
+                        "status": "pass",
+                        "correction_strokes": [{
+                            "mode": "cover",
+                            "size": 4,
+                            "points": [{"x": 2, "y": 2}]
+                        }]
+                    }),
+                )
+                .unwrap();
+        }
+
+        let rendered = workflow.page_artifacts_for_source(&sources[0]).unwrap().4;
+        let mut state = workflow.editor_state(&rendered, None).unwrap();
+        for page in state["pages"].as_array_mut().unwrap() {
+            let bubble = page["bubbles"][0].as_object_mut().unwrap();
+            // Model a legacy project snapshot: fitted values and report
+            // metadata were serialized with different renderer versions.
+            bubble.insert("font_size".into(), json!(11.5));
+            bubble.insert("padding".into(), json!(2.0));
+            bubble.insert("font_path".into(), json!("fonts/legacy-resolved.ttf"));
+            bubble.insert("rendered_font_path".into(), json!("fonts/resolved.ttf"));
+            bubble.insert("min_font_size".into(), json!(11.5));
+            bubble.insert("max_font_size".into(), json!(11.5));
+            bubble.insert(
+                "safe_bbox".into(),
+                json!({"x1": 99, "y1": 99, "x2": 100, "y2": 100}),
+            );
+            page["render_dirty"] = json!(true);
+            page["typeset_warnings"] = json!([{"reason": "legacy-report"}]);
+        }
+        assert!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap()
+                .is_empty()
+        );
+
+        state["pages"][3]["bubbles"][0]["translation"] = json!("One real edit");
+        assert_eq!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap(),
+            vec![3]
+        );
+
+        state["pages"][3]["bubbles"][0]["translation"] = json!("Bản dịch");
+        state["pages"][3]["correction_strokes"][0]["points"][0]["x"] = json!(3);
+        assert_eq!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap(),
+            vec![3]
         );
     }
 }
