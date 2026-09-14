@@ -2085,7 +2085,7 @@ fn removed_bubble_id(value: &Value) -> Option<&str> {
         .or_else(|| value.get("id").and_then(Value::as_str))
 }
 
-fn page_render_signature(page: &Value) -> Value {
+pub(crate) fn page_render_signature(page: &Value) -> Value {
     fn without_review_metadata(value: &Value) -> Value {
         match value {
             Value::Array(values) => Value::Array(
@@ -2102,6 +2102,7 @@ fn page_render_signature(page: &Value) -> Value {
                             key.as_str(),
                             "flagged"
                                 | "problem"
+                                | "render_dirty"
                                 | "needs_review"
                                 | "flag_reason"
                                 | "problem_reason"
@@ -4004,6 +4005,19 @@ mod tests {
         let blockers = review_blockers(&base);
         assert_eq!(blockers.len(), 1);
         assert_eq!(blockers[0]["kind"], "flagged_bubble");
+    }
+
+    #[test]
+    fn render_dirty_bookkeeping_is_not_part_of_the_render_signature() {
+        let clean = json!({
+            "bubbles": [{"id": "bubble-1", "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8}}]
+        });
+        let mut persisted = clean.clone();
+        persisted["bubbles"][0]["render_dirty"] = json!(false);
+        assert_eq!(
+            page_render_signature(&clean),
+            page_render_signature(&persisted)
+        );
     }
 
     #[test]

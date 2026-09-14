@@ -1072,14 +1072,15 @@ fn run_editor_operation(
             })
         }
         EditorOperationKind::Approve => {
-            let dirty_pages = render_dirty_page_indices(&state);
+            let (dirty_pages, reused_pages) = approval_render_plan(&state)?;
+            clear_reused_render_dirty_markers(&mut state.value, &dirty_pages);
             let total = dirty_pages.len().saturating_add(3);
             report_operation(
                 tx,
                 &request.repaint,
                 1,
                 total,
-                "Saving the approval snapshot…",
+                format!("Saving the approval snapshot (reusing {reused_pages} verified pages)…"),
             );
             save_editor_snapshot(
                 &request.job_dir,
@@ -1161,7 +1162,9 @@ fn run_editor_operation(
                 &request.repaint,
                 total,
                 total,
-                "Saving approval and closing the editor…",
+                format!(
+                    "Saving approval and closing the editor (reused {reused_pages} verified pages)…"
+                ),
             );
             save_editor_snapshot(
                 &request.job_dir,
@@ -1177,7 +1180,9 @@ fn run_editor_operation(
                 state: state.value,
                 review: Some(proposed_review),
                 rendered_pages,
-                message: "✓ Approval saved; closing editor".to_owned(),
+                message: format!(
+                    "✓ Approval saved; closing editor (reused {reused_pages} verified pages)"
+                ),
             })
         }
     }
@@ -1211,6 +1216,58 @@ fn render_dirty_page_indices(state: &EditorState) -> Vec<usize> {
     (0..state.page_count())
         .filter(|&index| state.page_has_render_dirty(index))
         .collect()
+}
+
+fn approval_render_plan(state: &EditorState) -> anyhow::Result<(Vec<usize>, usize)> {
+    let managed = state.job_dir.join("job.json").is_file()
+        || state.job_dir.join(".fukidashi-job.json").is_file();
+    let rerender = if managed {
+        let jobs_root = state
+            .job_dir
+            .parent()
+            .unwrap_or(&state.job_dir)
+            .to_path_buf();
+        fukidashi_mcp::workflow::Workflow::new(jobs_root)?
+            .editor_render_plan(&state.job_dir, &state.value)?
+    } else {
+        render_dirty_page_indices(state)
+    };
+    let reused = state.page_count().saturating_sub(rerender.len());
+    Ok((rerender, reused))
+}
+
+fn clear_reused_render_dirty_markers(state: &mut serde_json::Value, rerender: &[usize]) {
+    let Some(pages) = state
+        .get_mut("pages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    let mut needs_render = vec![false; pages.len()];
+    for &index in rerender {
+        if let Some(marker) = needs_render.get_mut(index) {
+            *marker = true;
+        }
+    }
+    for (index, page) in pages.iter_mut().enumerate() {
+        if needs_render[index] {
+            continue;
+        }
+        let Some(object) = page.as_object_mut() else {
+            continue;
+        };
+        object.insert("render_dirty".to_owned(), serde_json::Value::Bool(false));
+        if let Some(bubbles) = object
+            .get_mut("bubbles")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for bubble in bubbles {
+                if let Some(bubble) = bubble.as_object_mut() {
+                    bubble.insert("render_dirty".to_owned(), serde_json::Value::Bool(false));
+                }
+            }
+        }
+    }
 }
 
 fn native_review_feedback(state: &serde_json::Value) -> Vec<serde_json::Value> {

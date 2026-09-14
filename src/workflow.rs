@@ -2160,6 +2160,88 @@ impl Workflow {
         Ok(())
     }
 
+    /// Return the pages that must be rendered before a managed approval.
+    ///
+    /// A saved editor flag is only a hint: older project snapshots marked
+    /// every bubble dirty because they persisted the bookkeeping flag that
+    /// the reconstructed sidecar state omitted. Compare the editable page to
+    /// the managed sidecar as well, so those stale flags can reuse a verified
+    /// render while a real edit, missing artifact, or invalid artifact still
+    /// takes the render path.
+    pub fn editor_render_plan(&self, job: &Path, state: &serde_json::Value) -> Result<Vec<usize>> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let manifest = load_manifest(&job)?;
+        let expected_pages = if manifest.expected_pages.is_empty() {
+            manifest
+                .pages
+                .values()
+                .map(|page| page.source_image.clone())
+                .collect::<Vec<_>>()
+        } else {
+            manifest.expected_pages.clone()
+        };
+        let pages = state
+            .get("pages")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow!("review state must contain pages"))?;
+        if pages.len() != expected_pages.len() {
+            bail!(
+                "review state has {} pages but the managed job requires {}",
+                pages.len(),
+                expected_pages.len()
+            );
+        }
+
+        let mut rerender = Vec::new();
+        for (page_index, source) in expected_pages.into_iter().enumerate() {
+            let state_page = &pages[page_index];
+            let page = manifest
+                .pages
+                .get(&page_key(&source))
+                .ok_or_else(|| anyhow!("expected page is missing from the managed manifest"))?;
+            let Some(rendered) = page.rendered_image.as_ref() else {
+                rerender.push(page_index);
+                continue;
+            };
+
+            let state_rendered_matches = state_page
+                .get("rendered_image_path")
+                .and_then(serde_json::Value::as_str)
+                .map(Path::new)
+                .map(|path| {
+                    let path = if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        job.join(path)
+                    };
+                    paths_same(&path, rendered).unwrap_or(false)
+                })
+                .unwrap_or(false);
+            let artifact = if page.state == "rendered" && state_rendered_matches {
+                self.validate_render_input(rendered).ok()
+            } else {
+                None
+            };
+            let Some(artifact) = artifact else {
+                rerender.push(page_index);
+                continue;
+            };
+
+            let cached_page = serde_json::json!({
+                "bubbles": editor_bubbles(&artifact.typeset, &page_key(&source)),
+                "removed_bubbles": [],
+                "correction_strokes": [],
+            });
+            let content_changed = crate::editor::page_render_signature(state_page)
+                != crate::editor::page_render_signature(&cached_page);
+            let complete = validate_typeset_completeness(&job, &source, &artifact.typeset).is_ok();
+            if content_changed || !complete {
+                rerender.push(page_index);
+            }
+        }
+        Ok(rerender)
+    }
+
     pub fn validate_export_job(&self, project_dir: &Path) -> Result<()> {
         let project_dir = self.require_owned(project_dir, "export project")?;
         let manifest = load_manifest(&project_dir)?;
@@ -4811,5 +4893,71 @@ mod tests {
             .verified_render_for_job(&reopened_job, None)
             .unwrap();
         assert!(selected.is_file());
+    }
+
+    #[test]
+    fn editor_render_plan_reuses_clean_sidecars_and_selects_changed_pages() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("comic");
+        fs::create_dir_all(&source_dir).unwrap();
+        let first_source = source_dir.join("page-01.png");
+        let second_source = source_dir.join("page-02.png");
+        for source in [&first_source, &second_source] {
+            let mut image = RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255]));
+            image.put_pixel(3, 3, Rgba([0, 0, 0, 255]));
+            image.save(source).unwrap();
+        }
+
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let registration = workflow.register_analysis(&first_source, None).unwrap();
+        workflow.register_analysis(&second_source, None).unwrap();
+        for source in [&first_source, &second_source] {
+            let cleaned = RgbImage::from_pixel(8, 8, image::Rgb([255, 255, 255]));
+            let mut mask = GrayImage::new(8, 8);
+            mask.put_pixel(3, 3, image::Luma([255]));
+            let (cleaned_path, _, _) = workflow
+                .write_clean_artifact(source, &cleaned, &mask, 1, "full")
+                .unwrap();
+            let rendered_path = workflow.page_artifacts_for_source(source).unwrap().4;
+            cleaned.save(&rendered_path).unwrap();
+            let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
+            workflow
+                .register_render(&rendered_path, &clean, json!({}), json!({}))
+                .unwrap();
+        }
+
+        let rendered = workflow.page_artifacts_for_source(&first_source).unwrap().4;
+        let mut state = workflow.editor_state(&rendered, None).unwrap();
+        state["pages"][0]["render_dirty"] = json!(true);
+        assert!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap()
+                .is_empty()
+        );
+
+        state["pages"][0]["correction_strokes"] = json!([{
+            "mode": "cover",
+            "size": 4,
+            "points": [{"x": 2, "y": 2}]
+        }]);
+        assert_eq!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap(),
+            vec![0]
+        );
+
+        let second_rendered = workflow
+            .page_artifacts_for_source(&second_source)
+            .unwrap()
+            .4;
+        fs::remove_file(second_rendered).unwrap();
+        assert_eq!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap(),
+            vec![0, 1]
+        );
     }
 }
