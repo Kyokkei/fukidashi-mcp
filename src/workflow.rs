@@ -2048,16 +2048,34 @@ impl Workflow {
             state["_editor_requested_global_font_path"] = serde_json::Value::String(font_path);
         }
         if let Some(object) = supplied.and_then(serde_json::Value::as_object) {
-            for key in [
-                "title",
-                "source_language",
-                "target_language",
-                "metadata",
-                "font_path",
-                "_editor_requested_global_font_path",
-            ] {
+            for key in ["title", "source_language", "target_language", "metadata"] {
                 if let Some(value) = object.get(key) {
                     state[key] = value.clone();
+                }
+            }
+            if let Some(font_path) = object.get("font_path") {
+                state["font_path"] = font_path.clone();
+                if font_path
+                    .as_str()
+                    .is_some_and(|path| !path.trim().is_empty())
+                {
+                    // The public value is the current operator input. Refresh
+                    // the private marker with it so a stale marker cannot
+                    // suppress a global font change.
+                    state["_editor_requested_global_font_path"] = font_path.clone();
+                } else {
+                    state
+                        .as_object_mut()
+                        .expect("editor state object")
+                        .remove("_editor_requested_global_font_path");
+                }
+            } else if let Some(marker) = object.get("_editor_requested_global_font_path") {
+                if state
+                    .get("font_path")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|path| !path.trim().is_empty())
+                {
+                    state["_editor_requested_global_font_path"] = marker.clone();
                 }
             }
         }
@@ -2880,6 +2898,9 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 .get("_editor_render_payload")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
+            let report_bubble = reports.and_then(|items| items.get(index));
+            let report_derived = is_editor_render_payload
+                || report_bubble.is_some_and(crate::editor::bubble_has_renderer_report);
             let requested_font_path = bubble
                 .get("_editor_requested_font_path")
                 .or_else(|| bubble.get("requested_font_path"))
@@ -2887,7 +2908,7 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 .filter(|path| !path.trim().is_empty())
                 .map(str::to_owned)
                 .or_else(|| {
-                    (!is_editor_render_payload).then(|| {
+                    (!report_derived).then(|| {
                         bubble
                             .get("font_path")
                             .and_then(serde_json::Value::as_str)
@@ -2900,7 +2921,7 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 .filter(|value| value.is_array())
                 .cloned()
                 .or_else(|| {
-                    (!is_editor_render_payload).then(|| {
+                    (!report_derived).then(|| {
                         bubble
                             .get("fallback_font_paths")
                             .filter(|value| value.is_array())
@@ -2910,21 +2931,17 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
             let requested_min_font_size = bubble
                 .get("_editor_requested_min_font_size")
                 .cloned()
-                .or_else(|| {
-                    (!is_editor_render_payload).then(|| bubble.get("min_font_size").cloned())?
-                });
+                .or_else(|| (!report_derived).then(|| bubble.get("min_font_size").cloned())?);
             let requested_max_font_size = bubble
                 .get("_editor_requested_max_font_size")
                 .cloned()
-                .or_else(|| {
-                    (!is_editor_render_payload).then(|| bubble.get("max_font_size").cloned())?
-                });
+                .or_else(|| (!report_derived).then(|| bubble.get("max_font_size").cloned())?);
             let requested_padding =
                 bubble
                     .get("_editor_requested_padding")
                     .cloned()
                     .or_else(|| {
-                        (!is_editor_render_payload).then(|| {
+                        (!report_derived).then(|| {
                             bubble
                                 .get("padding")
                                 .filter(|value| !value.is_null())
@@ -4635,6 +4652,32 @@ mod tests {
     }
 
     #[test]
+    fn editor_bubbles_preserve_native_layout_override_markers() {
+        let bubbles = editor_bubbles(
+            &json!({
+                "request_bubbles": [{
+                    "id": "b1",
+                    "bbox": {"x1":1,"y1":1,"x2":8,"y2":8},
+                    "text": "Hello",
+                    "font_size": 18.0,
+                    "padding": 6.0,
+                    "_editor_render_payload": true,
+                    "_editor_font_size_override": 18.0,
+                    "_editor_padding_override": 6.0
+                }],
+                "report": {"bubbles": [{
+                    "input_bbox": {"x1":1,"y1":1,"x2":8,"y2":8},
+                    "font_size": 11.5,
+                    "padding": 2.0
+                }]}
+            }),
+            "page-1",
+        );
+        assert_eq!(bubbles[0]["_editor_font_size_override"], 18.0);
+        assert_eq!(bubbles[0]["_editor_padding_override"], 6.0);
+    }
+
+    #[test]
     fn render_completeness_rejects_missing_or_unchanged_translation() {
         let dir = tempdir().unwrap();
         let jobs = dir.path().join("jobs");
@@ -5075,6 +5118,16 @@ mod tests {
 
         let rendered = workflow.page_artifacts_for_source(&first_source).unwrap().4;
         let mut state = workflow.editor_state(&rendered, None).unwrap();
+        let supplied = json!({
+            "font_path": "fonts/new-global.ttf",
+            "_editor_requested_global_font_path": "fonts/old-global.ttf"
+        });
+        let supplied_state = workflow.editor_state(&rendered, Some(&supplied)).unwrap();
+        assert_eq!(supplied_state["font_path"], "fonts/new-global.ttf");
+        assert_eq!(
+            supplied_state["_editor_requested_global_font_path"],
+            "fonts/new-global.ttf"
+        );
         state["pages"][0]["render_dirty"] = json!(true);
         assert!(
             workflow
