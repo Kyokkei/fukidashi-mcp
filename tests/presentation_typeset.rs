@@ -2,7 +2,9 @@ use fukidashi_mcp::domain::{Rect, TypesetPayload};
 use fukidashi_mcp::typeset::{fit_text, fit_text_with_geometry, typeset_page};
 use image::{GenericImageView, ImageBuffer, Rgba};
 use std::fs;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
+use unicode_segmentation::UnicodeSegmentation;
 
 fn font_fixture() -> Option<(Vec<u8>, fontdue::Font)> {
     let candidates = [
@@ -444,6 +446,62 @@ fn long_vietnamese_text_stays_inside_inset_bubble_geometry() {
         assert!(origin_x + line.ink_right <= result.safe_bbox.x2 + 1.0);
         assert!(line.top >= result.safe_bbox.y1 - 1.0);
         assert!(line.bottom <= result.safe_bbox.y2 + 1.0);
+    }
+}
+
+#[test]
+fn long_afterword_typesetting_is_bounded_and_preserves_hard_newlines() {
+    let Some((bytes, font)) = font_fixture() else {
+        return;
+    };
+    let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+    let paragraph = "Afterword: Cafe\u{301} readers kept every detail, and the quiet ending left room for tomorrow. ";
+    let mut text = String::from("AFTERWORD\n");
+    while text.graphemes(true).count() < 1_800 {
+        text.push_str(paragraph);
+    }
+    assert!(text.graphemes(true).count() >= 1_500);
+    assert!(text.graphemes(true).count() <= 3_000);
+
+    let started = Instant::now();
+    let result = fit_text_with_geometry(
+        &face,
+        &font,
+        &text,
+        Rect {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 1_200.0,
+            y2: 900.0,
+        },
+        None,
+        None,
+        "rectangle",
+        8.0,
+        24.0,
+        None,
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "long afterword took {elapsed:?}; bounded layout regressed"
+    );
+
+    match result {
+        Ok(layout) => {
+            assert_eq!(
+                layout.lines.first().map(|line| line.text.as_str()),
+                Some("AFTERWORD")
+            );
+            assert!(layout.lines.iter().all(|line| !line.text.contains('\n')));
+        }
+        Err(error) => {
+            let message = error.to_string().to_lowercase();
+            assert!(
+                message.contains("overflow") || message.contains("fit"),
+                "long afterword failed without an explicit fit/overflow result: {error}"
+            );
+        }
     }
 }
 

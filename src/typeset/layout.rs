@@ -5,6 +5,13 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::domain::Rect;
 
+const LONG_PROSE_GRAPHEME_THRESHOLD: usize = 512;
+// A half-point range from 0.5px through 512px needs at most eleven binary
+// probes. This keeps even the widest accepted range bounded while preserving
+// the same half-point resolution as the short-text path.
+const LONG_PROSE_MAX_SIZE_PROBES: usize = 11;
+const LONG_PROSE_MAX_WRAP_PROBES: usize = 16;
+
 #[derive(Clone, Debug)]
 pub struct ShapedGlyph {
     pub glyph_id: u32,
@@ -271,6 +278,12 @@ struct Metrics {
 }
 
 type SolveResult = Option<(f32, Vec<(usize, ShapedLine)>)>;
+
+struct LongProseCache {
+    tokens: Vec<String>,
+    legal_breaks: Vec<bool>,
+    advances: Vec<f32>,
+}
 
 struct Shaper<'a> {
     face: &'a Face<'a>,
@@ -945,6 +958,59 @@ where
     if size < floor {
         size = max_font_size;
     }
+    let long_prose = text.graphemes(true).count() > LONG_PROSE_GRAPHEME_THRESHOLD;
+    if long_prose {
+        // The old half-point descent is useful for short dialogue because it
+        // preserves its exact best-fit choice. Long prose gets a bounded
+        // monotonic search: each probe uses the linear greedy wrapper below,
+        // then the final successful size is shaped once per output line.
+        let min_units = (floor * 2.0).ceil() as i32;
+        let max_units = (size * 2.0).floor() as i32;
+        let base_units = min_units + (max_units - min_units) / 2;
+        let base_size = base_units as f32 / 2.0;
+        let base_shaper = factory(base_size)?;
+        let cache = long_prose_cache(&base_shaper, text)?;
+        let mut low = min_units;
+        let mut high = max_units;
+        let mut best = None;
+        let mut probes = 0;
+        while low <= high && probes < LONG_PROSE_MAX_SIZE_PROBES {
+            let units = low + (high - low) / 2;
+            let candidate_size = units as f32 / 2.0;
+            let shaper = factory(candidate_size)?;
+            match fit_long_prose_at_size(
+                &shaper,
+                text,
+                safe_bbox,
+                shape,
+                placement_center,
+                mask.as_ref(),
+                &cache,
+                candidate_size / base_size,
+            )? {
+                Some(lines) => {
+                    best = Some((candidate_size, lines));
+                    low = units + 1;
+                }
+                None => high = units - 1,
+            }
+            probes += 1;
+        }
+        if let Some((font_size, lines)) = best {
+            return Ok(LayoutResult {
+                font_size,
+                lines,
+                safe_bbox,
+                padding,
+                placement_center,
+                safe_mask: mask,
+            });
+        }
+        return Err(crate::error::FukidashiError::TextOverflow(format!(
+            "supplied text does not fit at minimum font size {min_font_size:.1}px"
+        ))
+        .into());
+    }
     while size + 1e-4 >= floor {
         let shaper = factory(size)?;
         if let Some(lines) = fit_at_size(
@@ -1012,6 +1078,19 @@ fn fit_at_size(
     placement_center: (f32, f32),
     mask: Option<&LayoutMask>,
 ) -> Result<Option<Vec<ShapedLine>>> {
+    if text.graphemes(true).count() > LONG_PROSE_GRAPHEME_THRESHOLD {
+        let cache = long_prose_cache(shaper, text)?;
+        return fit_long_prose_at_size(
+            shaper,
+            text,
+            bbox,
+            shape,
+            placement_center,
+            mask,
+            &cache,
+            1.0,
+        );
+    }
     let metrics = shaper.metrics_for_text(text);
     let tokens = UnicodeSegmentation::graphemes(text, true)
         .map(str::to_owned)
@@ -1083,6 +1162,268 @@ fn fit_at_size(
         }
     }
     Ok(None)
+}
+
+fn long_prose_cache(shaper: &impl TextShaper, text: &str) -> Result<LongProseCache> {
+    let (tokens, legal_breaks) = long_prose_break_data(text);
+    let advances = tokens
+        .iter()
+        .map(|token| {
+            if token == "\n" {
+                Ok(0.0)
+            } else {
+                Ok(shaper.shape(token)?.advance_width.max(0.0))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(LongProseCache {
+        tokens,
+        legal_breaks,
+        advances,
+    })
+}
+
+fn long_prose_break_data(text: &str) -> (Vec<String>, Vec<bool>) {
+    let tokens = UnicodeSegmentation::graphemes(text, true)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut offsets = Vec::with_capacity(tokens.len() + 1);
+    offsets.push(0usize);
+    let mut offset = 0usize;
+    for token in &tokens {
+        offset += token.len();
+        offsets.push(offset);
+    }
+    let offset_to_index = offsets
+        .iter()
+        .enumerate()
+        .map(|(index, offset)| (*offset, index))
+        .collect::<HashMap<_, _>>();
+    let mut legal = vec![false; tokens.len() + 1];
+    legal[0] = true;
+    legal[tokens.len()] = true;
+    for (byte, _) in unicode_linebreak::linebreaks(text) {
+        if let Some(&index) = offset_to_index.get(&byte) {
+            legal[index] = true;
+        }
+    }
+    (tokens, legal)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_long_prose_at_size(
+    shaper: &impl TextShaper,
+    text: &str,
+    bbox: Rect,
+    shape: &str,
+    placement_center: (f32, f32),
+    mask: Option<&LayoutMask>,
+    cache: &LongProseCache,
+    advance_scale: f32,
+) -> Result<Option<Vec<ShapedLine>>> {
+    let metrics = shaper.metrics_for_text(text);
+    let line_height = metrics.ascent + metrics.descent + metrics.leading;
+    if !line_height.is_finite() || line_height <= 0.0 {
+        bail!("text metrics have a non-positive line height");
+    }
+    // Shaping advances scale linearly with point size for a fixed font. The
+    // cache is measured once per fit, so every binary-search probe only scans
+    // the grapheme array and shapes its final candidate lines.
+    let advances = cache
+        .advances
+        .iter()
+        .map(|advance| advance * advance_scale)
+        .collect::<Vec<_>>();
+    let tokens = &cache.tokens;
+    let legal = &cache.legal_breaks;
+    let (cx, cy) = placement_center;
+    let (a, b) = (
+        (bbox.x2 - bbox.x1) * 0.5 - 1.0,
+        (bbox.y2 - bbox.y1) * 0.5 - 1.0,
+    );
+    if shape == "ellipse" && (a <= 0.0 || b <= 0.0) {
+        bail!("ellipse radii are non-positive after inset");
+    }
+    let minimum_lines = tokens.iter().filter(|token| token.as_str() == "\n").count() + 1;
+    let maximum_lines = tokens.len().saturating_add(1).min(256);
+    let maximum_by_height = ((2.0 * b + metrics.leading) / line_height).floor().max(0.0) as usize;
+    let maximum_lines = maximum_lines.min(maximum_by_height);
+    if maximum_lines < minimum_lines {
+        return Ok(None);
+    }
+    let center_width = available_width(
+        bbox,
+        cx,
+        cy,
+        a,
+        b,
+        cy - metrics.ascent - 1.0,
+        cy + metrics.descent + 1.0,
+        shape,
+        mask,
+    )?;
+    let total_advance = advances.iter().sum::<f32>();
+    let width_hint = center_width.max(1.0) * 0.85;
+    let estimated_lines = (total_advance / width_hint).ceil() as usize;
+    let mut target_lines = estimated_lines.clamp(minimum_lines, maximum_lines);
+    for _ in 0..LONG_PROSE_MAX_WRAP_PROBES {
+        let Some(ranges) = greedy_line_ranges(
+            &tokens,
+            &legal,
+            &advances,
+            target_lines,
+            metrics,
+            bbox,
+            cx,
+            cy,
+            a,
+            b,
+            shape,
+            mask,
+        )?
+        else {
+            return Ok(None);
+        };
+        let actual_lines = ranges.len();
+        if actual_lines == target_lines {
+            return shape_long_prose_lines(
+                shaper,
+                &tokens,
+                ranges,
+                target_lines,
+                metrics,
+                bbox,
+                cx,
+                cy,
+                a,
+                b,
+                shape,
+                mask,
+            );
+        }
+        if actual_lines > maximum_lines {
+            return Ok(None);
+        }
+        let next_target = actual_lines.clamp(minimum_lines, maximum_lines);
+        if next_target == target_lines {
+            return Ok(None);
+        }
+        target_lines = next_target;
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn greedy_line_ranges(
+    tokens: &[String],
+    legal: &[bool],
+    advances: &[f32],
+    target_lines: usize,
+    metrics: Metrics,
+    bbox: Rect,
+    cx: f32,
+    cy: f32,
+    a: f32,
+    b: f32,
+    shape: &str,
+    mask: Option<&LayoutMask>,
+) -> Result<Option<Vec<(usize, usize)>>> {
+    let block_height = target_lines as f32 * (metrics.ascent + metrics.descent)
+        + target_lines.saturating_sub(1) as f32 * metrics.leading;
+    let first_baseline = cy - block_height * 0.5 + metrics.ascent;
+    let mut ranges = Vec::with_capacity(target_lines);
+    let mut start = 0usize;
+    while start < tokens.len() {
+        let line = ranges.len();
+        if tokens[start] == "\n" {
+            ranges.push((start, start));
+            start += 1;
+            continue;
+        }
+        let baseline =
+            first_baseline + line as f32 * (metrics.ascent + metrics.descent + metrics.leading);
+        let available = available_width(
+            bbox,
+            cx,
+            cy,
+            a,
+            b,
+            baseline - metrics.ascent - 1.0,
+            baseline + metrics.descent + 1.0,
+            shape,
+            mask,
+        )?;
+        let last_end = tokens
+            .iter()
+            .skip(start)
+            .position(|token| token == "\n")
+            .map_or(tokens.len(), |index| start + index);
+        let mut width = 0.0;
+        let mut chosen_end = None;
+        for end in (start + 1)..=last_end {
+            width += advances[end - 1];
+            if !legal[end] && end != last_end {
+                continue;
+            }
+            if width + 2.0 <= available + 1e-3 {
+                chosen_end = Some(end);
+            } else if chosen_end.is_some() {
+                break;
+            }
+        }
+        let Some(end) = chosen_end else {
+            return Ok(None);
+        };
+        ranges.push((start, end));
+        start = if end < tokens.len() && tokens[end] == "\n" {
+            end + 1
+        } else {
+            end
+        };
+    }
+    if tokens.last().is_some_and(|token| token == "\n") {
+        ranges.push((tokens.len(), tokens.len()));
+    }
+    Ok(Some(ranges))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shape_long_prose_lines(
+    shaper: &impl TextShaper,
+    tokens: &[String],
+    ranges: Vec<(usize, usize)>,
+    line_count: usize,
+    metrics: Metrics,
+    bbox: Rect,
+    cx: f32,
+    cy: f32,
+    a: f32,
+    b: f32,
+    shape: &str,
+    mask: Option<&LayoutMask>,
+) -> Result<Option<Vec<ShapedLine>>> {
+    let block_height = line_count as f32 * (metrics.ascent + metrics.descent)
+        + line_count.saturating_sub(1) as f32 * metrics.leading;
+    let first_baseline = cy - block_height * 0.5 + metrics.ascent;
+    let line_step = metrics.ascent + metrics.descent + metrics.leading;
+    let mut lines = Vec::with_capacity(ranges.len());
+    for (line, (start, end)) in ranges.into_iter().enumerate() {
+        let segment = tokens[start..end].concat();
+        let mut shaped = shaper.shape(&segment)?;
+        let baseline = first_baseline + line as f32 * line_step;
+        shaped.baseline = baseline;
+        let top = baseline + shaped.top - 1.0;
+        let bottom = baseline + shaped.bottom + 1.0;
+        let available = available_width(bbox, cx, cy, a, b, top, bottom, shape, mask)?;
+        let ink_width = shaped.ink_right - shaped.ink_left + 2.0;
+        if ink_width > available + 1e-3 {
+            return Ok(None);
+        }
+        shaped.top += baseline;
+        shaped.bottom += baseline;
+        lines.push(shaped);
+    }
+    Ok(Some(lines))
 }
 
 #[allow(clippy::too_many_arguments)]
