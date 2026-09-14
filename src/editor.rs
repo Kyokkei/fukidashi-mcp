@@ -2798,40 +2798,63 @@ fn bubble_has_stable_id(bubble: &Value) -> bool {
     bubble
         .get("id")
         .and_then(Value::as_str)
-        .is_some_and(|id| !id.trim().is_empty())
+        .is_some_and(|id| !id.trim().is_empty() && !id.starts_with("legacy-bubble-"))
+}
+
+fn nonempty_bubble_text<'a>(bubble: &'a Value, key: &str) -> Option<&'a str> {
+    bubble
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn nonempty_bubble_source(bubble: &Value) -> Option<&str> {
+    nonempty_bubble_text(bubble, "source_text")
+        .or_else(|| nonempty_bubble_text(bubble, "source_ocr"))
 }
 
 fn legacy_bubble_match(base: &Value, saved: &Value) -> bool {
     if bubble_has_stable_id(saved) {
         return false;
     }
-    let Some(base_bbox) = base
+    let base_bbox = base
         .get("bbox")
         .or_else(|| base.get("bubble_bbox"))
-        .and_then(|value| serde_json::from_value::<Rect>(value.clone()).ok())
-    else {
-        return false;
-    };
-    let Some(saved_bbox) = saved
+        .and_then(|value| serde_json::from_value::<Rect>(value.clone()).ok());
+    let saved_bbox = saved
         .get("bbox")
         .or_else(|| saved.get("bubble_bbox"))
-        .and_then(|value| serde_json::from_value::<Rect>(value.clone()).ok())
-    else {
-        return false;
-    };
-    if !rects_match(base_bbox, saved_bbox) {
-        return false;
-    }
-    for key in ["source_text", "kind"] {
-        if let (Some(base_value), Some(saved_value)) = (
-            base.get(key).and_then(Value::as_str),
-            saved.get(key).and_then(Value::as_str),
-        ) && base_value != saved_value
-        {
+        .and_then(|value| serde_json::from_value::<Rect>(value.clone()).ok());
+    let geometry_matches = base_bbox
+        .zip(saved_bbox)
+        .is_some_and(|(base, saved)| rects_match(base, saved));
+    let mut source_matches = false;
+    let mut text_matches = false;
+    let mut kind_matches = false;
+    let base_source = nonempty_bubble_source(base);
+    let saved_source = nonempty_bubble_source(saved);
+    if let (Some(base_source), Some(saved_source)) = (base_source, saved_source) {
+        if base_source != saved_source {
             return false;
         }
+        source_matches = true;
     }
-    true
+    let base_kind = nonempty_bubble_text(base, "kind");
+    let saved_kind = nonempty_bubble_text(saved, "kind");
+    if let (Some(base_kind), Some(saved_kind)) = (base_kind, saved_kind) {
+        if base_kind != saved_kind {
+            return false;
+        }
+        kind_matches = true;
+    }
+    let base_translation =
+        nonempty_bubble_text(base, "translation").or_else(|| nonempty_bubble_text(base, "text"));
+    let saved_translation =
+        nonempty_bubble_text(saved, "translation").or_else(|| nonempty_bubble_text(saved, "text"));
+    if let (Some(base_value), Some(saved_value)) = (base_translation, saved_translation) {
+        text_matches = base_value == saved_value;
+    }
+    geometry_matches || source_matches || (kind_matches && text_matches)
 }
 
 fn migrate_legacy_bubble_ids(page: &mut Value, saved_bubbles: &mut [Value], page_index: usize) {
@@ -3390,12 +3413,12 @@ fn editor_requested_font_path(bubble: &Value) -> Option<&str> {
         .get("_editor_requested_font_path")
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty());
-    let reported_requested = bubble
-        .get("requested_font_path")
-        .and_then(Value::as_str)
-        .filter(|path| !path.trim().is_empty());
     let rendered = bubble
         .get("rendered_font_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty());
+    let resolved = bubble
+        .get("resolved_font_path")
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty());
     let Some(current) = current else {
@@ -3411,19 +3434,9 @@ fn editor_requested_font_path(bubble: &Value) -> Option<&str> {
         }
         return Some(current);
     };
-    if bubble_has_renderer_report(bubble)
-        && reported_requested == Some(marker)
-        && current != marker
-        && rendered != Some(current)
-    {
-        // A reconstructed report can carry a stale public `font_path` while
-        // retaining the request echoed by the renderer. Keep that echoed
-        // request until merge_saved_edits has evidence of a later edit.
-        return Some(marker);
-    }
     if current == marker
         || (bubble_has_renderer_report(bubble)
-            && rendered == Some(current)
+            && (rendered == Some(current) || resolved == Some(current))
             && !crate::workflow::is_generic_desktop_font(Path::new(current)))
     {
         Some(marker)
@@ -4876,7 +4889,9 @@ mod tests {
             "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
             "font_path": "fonts/new.ttf",
             "_editor_requested_font_path": "fonts/old.ttf",
+            "requested_font_path": "fonts/old.ttf",
             "rendered_font_path": "fonts/old.ttf",
+            "resolved_font_path": "fonts/old.ttf",
             "input_bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8}
         });
         assert_eq!(editor_requested_font_path(&bubble), Some("fonts/new.ttf"));
@@ -5049,7 +5064,7 @@ mod tests {
                 "pages": [{
                     "id": "page-1",
                     "removed_bubbles": [{
-                        "id": null,
+                        "id": "legacy-bubble-0-0",
                         "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8}
                     }]
                 }]
@@ -5060,6 +5075,48 @@ mod tests {
             base["pages"][0]["removed_bubbles"][0]["id"],
             "page-1-bubble-reconstructed"
         );
+    }
+
+    #[test]
+    fn idless_moved_bubble_matches_unique_stable_semantics() {
+        let mut base = normalize_editor_state(json!({
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{
+                    "id": "page-1-bubble-reconstructed",
+                    "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
+                    "source_text": "source",
+                    "kind": "dialogue",
+                    "translation": "old"
+                }]
+            }]
+        }))
+        .unwrap();
+        merge_saved_edits(
+            &mut base,
+            &json!({
+                "pages": [{
+                    "id": "page-1",
+                    "bubbles": [{
+                        "id": "",
+                        "bbox": {"x1": 21, "y1": 11, "x2": 38, "y2": 28},
+                        "source_text": "source",
+                        "kind": "dialogue",
+                        "translation": "moved"
+                    }]
+                }]
+            }),
+        );
+        assert_eq!(
+            base["pages"][0]["bubbles"][0]["id"],
+            "page-1-bubble-reconstructed"
+        );
+        assert_eq!(
+            base["pages"][0]["bubbles"][0]["bbox"],
+            json!({"x1": 21, "y1": 11, "x2": 38, "y2": 28})
+        );
+        assert_eq!(base["pages"][0]["bubbles"][0]["translation"], "moved");
+        assert_eq!(base["pages"][0]["render_dirty"], true);
     }
 
     #[test]

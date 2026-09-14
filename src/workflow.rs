@@ -5294,6 +5294,10 @@ mod tests {
             bubble.insert("padding".into(), json!(2.0));
             bubble.insert("font_path".into(), json!("fonts/legacy-resolved.ttf"));
             bubble.insert("rendered_font_path".into(), json!("fonts/resolved.ttf"));
+            bubble.insert(
+                "resolved_font_path".into(),
+                json!("fonts/legacy-resolved.ttf"),
+            );
             bubble.insert("min_font_size".into(), json!(11.5));
             bubble.insert("max_font_size".into(), json!(11.5));
             bubble.insert(
