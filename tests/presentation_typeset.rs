@@ -506,6 +506,58 @@ fn long_afterword_typesetting_is_bounded_and_preserves_hard_newlines() {
 }
 
 #[test]
+fn medium_prose_boxes_use_bounded_typesetting() {
+    let Some((bytes, font)) = font_fixture() else {
+        return;
+    };
+    let face = rustybuzz::Face::from_slice(&bytes, 0).unwrap();
+    let paragraph = "Readers kept the measured afterword close, carrying each quiet detail into the next page. ";
+    let mut boxes = Vec::new();
+    for index in 0..3 {
+        let mut text = format!("BOX {index}\n");
+        while text.graphemes(true).count() < 320 {
+            text.push_str(paragraph);
+        }
+        assert!(text.graphemes(true).count() >= 200);
+        assert!(text.graphemes(true).count() <= 400);
+        boxes.push(text);
+    }
+
+    let started = Instant::now();
+    for (index, text) in boxes.iter().enumerate() {
+        let layout = fit_text_with_geometry(
+            &face,
+            &font,
+            text,
+            Rect {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 900.0,
+                y2: 500.0,
+            },
+            None,
+            None,
+            "rectangle",
+            8.0,
+            24.0,
+            None,
+        )
+        .expect("medium prose box should fit");
+        let expected_first_line = format!("BOX {index}");
+        assert_eq!(
+            layout.lines.first().map(|line| line.text.as_str()),
+            Some(expected_first_line.as_str())
+        );
+        assert!(layout.lines.iter().all(|line| !line.text.contains('\n')));
+    }
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "medium prose boxes took {elapsed:?}; recursive layout escaped its work bound"
+    );
+}
+
+#[test]
 fn raster_output_is_png_and_does_not_modify_source() {
     let Some((_bytes, _font)) = font_fixture() else {
         return;

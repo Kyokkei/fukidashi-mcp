@@ -5,7 +5,10 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::domain::Rect;
 
-const LONG_PROSE_GRAPHEME_THRESHOLD: usize = 512;
+// Medium prose boxes can be split below the old 512-grapheme cutoff. Keep
+// ordinary short dialogue on the exact solver while routing paragraph-sized
+// text through the bounded wrapper before recursive work grows sharply.
+const LONG_PROSE_GRAPHEME_THRESHOLD: usize = 128;
 // A half-point range from 0.5px through 512px needs at most eleven binary
 // probes. This keeps even the widest accepted range bounded while preserving
 // the same half-point resolution as the short-text path.
