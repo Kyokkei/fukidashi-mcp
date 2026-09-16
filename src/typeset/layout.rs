@@ -1271,8 +1271,8 @@ fn fit_long_prose_at_size(
     let mut target_lines = estimated_lines.clamp(minimum_lines, maximum_lines);
     for _ in 0..LONG_PROSE_MAX_WRAP_PROBES {
         let Some(ranges) = greedy_line_ranges(
-            &tokens,
-            &legal,
+            tokens,
+            legal,
             &advances,
             target_lines,
             metrics,
@@ -1291,7 +1291,7 @@ fn fit_long_prose_at_size(
         if actual_lines == target_lines {
             return shape_long_prose_lines(
                 shaper,
-                &tokens,
+                tokens,
                 ranges,
                 target_lines,
                 metrics,

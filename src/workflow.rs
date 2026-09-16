@@ -2069,14 +2069,13 @@ impl Workflow {
                         .expect("editor state object")
                         .remove("_editor_requested_global_font_path");
                 }
-            } else if let Some(marker) = object.get("_editor_requested_global_font_path") {
-                if state
+            } else if let Some(marker) = object.get("_editor_requested_global_font_path")
+                && state
                     .get("font_path")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|path| !path.trim().is_empty())
-                {
-                    state["_editor_requested_global_font_path"] = marker.clone();
-                }
+            {
+                state["_editor_requested_global_font_path"] = marker.clone();
             }
         }
         Ok(state)

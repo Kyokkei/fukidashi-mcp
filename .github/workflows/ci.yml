@@ -1,4 +1,4 @@
-﻿name: portability
+name: portability
 
 on:
   push:
@@ -12,11 +12,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Run sccache-action
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Install Linux GUI dependencies
         if: runner.os == 'Linux'
         run: |

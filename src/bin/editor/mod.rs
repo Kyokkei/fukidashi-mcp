@@ -53,13 +53,7 @@ enum OperationEvent {
         total: usize,
         message: String,
     },
-    Succeeded {
-        kind: EditorOperationKind,
-        state: serde_json::Value,
-        review: Option<ReviewState>,
-        rendered_pages: Vec<usize>,
-        message: String,
-    },
+    Succeeded(Box<OperationSuccess>),
     Failed {
         kind: EditorOperationKind,
         error: String,
@@ -470,10 +464,10 @@ impl EditorApp {
     }
 
     fn start_operation(&mut self, kind: EditorOperationKind) {
-        if self.operation.is_some() {
+        if let Some(operation) = self.operation.as_ref() {
             self.error_message = Some(format!(
                 "{} is already running; wait for it to finish before submitting again",
-                self.operation.as_ref().unwrap().kind.label()
+                operation.kind.label()
             ));
             return;
         }
@@ -515,13 +509,7 @@ impl EditorApp {
                 let event = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     run_editor_operation(request, &tx)
                 })) {
-                    Ok(Ok(success)) => OperationEvent::Succeeded {
-                        kind: success.kind,
-                        state: success.state,
-                        review: success.review,
-                        rendered_pages: success.rendered_pages,
-                        message: success.message,
-                    },
+                    Ok(Ok(success)) => OperationEvent::Succeeded(Box::new(success)),
                     Ok(Err(error)) => OperationEvent::Failed {
                         kind,
                         error: format!("{error:#}"),
@@ -561,14 +549,14 @@ impl EditorApp {
                         operation.total = total.max(1);
                         operation.message = message;
                     }
-                    OperationEvent::Succeeded {
-                        kind,
-                        state,
-                        review,
-                        rendered_pages,
-                        message,
-                    } => {
-                        finished = Some(Ok((kind, state, review, rendered_pages, message)));
+                    OperationEvent::Succeeded(success) => {
+                        finished = Some(Ok((
+                            success.kind,
+                            success.state,
+                            success.review,
+                            success.rendered_pages,
+                            success.message,
+                        )));
                         break;
                     }
                     OperationEvent::Failed { kind, error } => {

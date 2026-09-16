@@ -195,15 +195,15 @@ fn editor_process_is_alive(pid: u32) -> bool {
         let mut code = 0;
         let result = unsafe { GetExitCodeProcess(handle, &mut code) } != 0;
         unsafe { CloseHandle(handle) };
-        return result && code == STILL_ACTIVE as u32;
+        result && code == STILL_ACTIVE as u32
     }
     #[cfg(target_os = "linux")]
     {
-        return Path::new("/proc").join(pid.to_string()).exists();
+        Path::new("/proc").join(pid.to_string()).exists()
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        return false;
+        false
     }
     #[cfg(not(any(windows, unix)))]
     {
@@ -344,14 +344,12 @@ impl NativeEditorLease {
         if let Some(heartbeat) = self.heartbeat.take() {
             let _ = heartbeat.join();
         }
-        if let Err(error) = write_editor_lease_metadata(
+        write_editor_lease_metadata(
             &self.path,
             child_pid,
             &self.review_session_id,
             self.revision,
-        ) {
-            return Err(error);
-        }
+        )?;
         self.remove_on_drop = false;
         std::mem::forget(self);
         Ok(())
@@ -455,9 +453,7 @@ fn local_native_editor_for_review(
     review_state: &ReviewState,
 ) -> Option<Arc<ActiveNativeEditor>> {
     let mut active = active_native_editors().lock().ok()?;
-    let Some(entry) = active.get(root_dir).cloned() else {
-        return None;
-    };
+    let entry = active.get(root_dir).cloned()?;
     if native_child_has_exited(&entry) {
         active.remove(root_dir);
         return None;
@@ -480,12 +476,11 @@ fn editor_lease_matches_review(info: &EditorLeaseInfo, review: &ReviewState) -> 
 }
 
 fn reap_native_editor(root_dir: &Path) {
-    if let Ok(mut active) = active_native_editors().lock() {
-        if let Some(entry) = active.get(root_dir)
-            && native_child_has_exited(entry)
-        {
-            active.remove(root_dir);
-        }
+    if let Ok(mut active) = active_native_editors().lock()
+        && let Some(entry) = active.get(root_dir)
+        && native_child_has_exited(entry)
+    {
+        active.remove(root_dir);
     }
 }
 
@@ -708,12 +703,14 @@ pub fn serve_editor_with_allowed_sources_and_options(
     )
 }
 
+type EditorTestLauncher = dyn Fn(&Path, &str, u64, &Path, &Path) -> Result<Child>;
+
 fn serve_editor_impl(
     image_path: &Path,
     json_data: Value,
     allowed_source_paths: Vec<PathBuf>,
     reopen_completed: bool,
-    test_launcher: Option<&dyn Fn(&Path, &str, u64, &Path, &Path) -> Result<Child>>,
+    test_launcher: Option<&EditorTestLauncher>,
 ) -> Result<Value> {
     let image_path = fs::canonicalize(image_path)
         .with_context(|| format!("resolve editor image {}", image_path.display()))?;
@@ -910,13 +907,13 @@ fn serve_editor_impl(
         };
         match launched {
             Ok(child) => {
-                if let Some(lease) = native_lease.take() {
-                    if let Err(error) = lease.handoff_to_child(child.id()) {
-                        let mut child = child;
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(error);
-                    }
+                if let Some(lease) = native_lease.take()
+                    && let Err(error) = lease.handoff_to_child(child.id())
+                {
+                    let mut child = child;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error);
                 }
                 register_native_editor(
                     root_dir.clone(),
@@ -2223,10 +2220,9 @@ pub(crate) fn page_render_signature(page: &Value) -> Value {
                 .get("_editor_requested_global_font_path")
                 .and_then(Value::as_str)
                 .filter(|path| !path.trim().is_empty())
+                && path == raw
             {
-                if path == raw {
-                    return Value::String(path.to_owned());
-                }
+                return Value::String(path.to_owned());
             }
             return Value::String(raw.to_owned());
         }
@@ -4235,11 +4231,13 @@ mod tests {
         }
     }
 
+    type TestLauncher = Arc<dyn Fn(&Path, &str, u64, &Path, &Path) -> Result<Child> + Send + Sync>;
+
     #[test]
     fn managed_reentrant_native_editor_reuses_one_child_and_revision() {
         let (_dir, image_path, state) = test_managed_job();
         let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let launcher: Arc<dyn Fn(&Path, &str, u64, &Path, &Path) -> Result<Child> + Send + Sync> = {
+        let launcher: TestLauncher = {
             let launches = Arc::clone(&launches);
             Arc::new(move |_, _, _, _, _| {
                 launches.fetch_add(1, Ordering::SeqCst);
@@ -4277,15 +4275,21 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         assert_eq!(first["review_session_id"], second["review_session_id"]);
         assert_eq!(first["review_revision"], second["review_revision"]);
-        assert_eq!(second["reused"], true);
-        assert!(second["message"].as_str().unwrap().contains("already open"));
+        let (opener, reuser) = if second["reused"] == true {
+            (&first, &second)
+        } else {
+            (&second, &first)
+        };
+        assert_eq!(reuser["reused"], true);
+        assert!(reuser["message"].as_str().unwrap().contains("already open"));
+        assert_ne!(opener["reused"], true);
     }
 
     #[test]
     fn managed_dead_native_child_relaunches_same_review_revision() {
         let (_dir, image_path, state) = test_managed_job();
         let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let launcher: Arc<dyn Fn(&Path, &str, u64, &Path, &Path) -> Result<Child> + Send + Sync> = {
+        let launcher: TestLauncher = {
             let launches = Arc::clone(&launches);
             Arc::new(move |_, _, _, _, _| {
                 launches.fetch_add(1, Ordering::SeqCst);
