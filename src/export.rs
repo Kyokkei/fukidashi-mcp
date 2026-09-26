@@ -4,11 +4,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::Write;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
-use zip::write::SimpleFileOptions;
-use zip::{CompressionMethod, ZipWriter};
+use zip::CompressionMethod;
 
 const MAX_INPUT_BYTES: u64 = 256 * 1024 * 1024;
 // Managed jobs may contain a complete long-form chapter whose rendered pages
@@ -59,7 +57,7 @@ struct ResolvedPage {
     ext: String,
     page_name: String,
     bubbles: Vec<Bubble>,
-    image: Vec<u8>,
+    source: PathBuf,
 }
 
 /// Export the manifest-listed pages in their explicit order.
@@ -99,28 +97,60 @@ pub fn export_project_to(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| root.join("fukidashi-output"));
     fs::create_dir_all(&output_dir).context("create export directory")?;
-    let (extension, data) = match format {
-        "zip" => ("zip", make_zip(&project, &pages, false)?),
-        "epub" => ("epub", make_epub(&project, &pages)?),
-        "html_monolith" => ("html", make_html(&project, &pages)?),
+    let (extension, epub_layout) = match format {
+        "zip" => ("zip", false),
+        "epub" => ("epub", true),
+        "html_monolith" => ("html", false),
         other => bail!("unsupported export format {other:?}; expected zip, epub, or html_monolith"),
     };
-    if data.len() as u64 > MAX_ARCHIVE_BYTES {
-        bail!("export exceeds {} byte limit", MAX_ARCHIVE_BYTES);
+    if format == "html_monolith" {
+        let data = make_html(&project, &pages)?;
+        if data.len() as u64 > MAX_ARCHIVE_BYTES {
+            bail!("export exceeds {} byte limit", MAX_ARCHIVE_BYTES);
+        }
+        let output = output_dir.join(format!(
+            "fukidashi-{}.{}",
+            Uuid::new_v4().simple(),
+            extension
+        ));
+        let temporary =
+            tempfile::NamedTempFile::new_in(&output_dir).context("create atomic export")?;
+        fs::write(temporary.path(), &data).context("write export")?;
+        temporary
+            .persist(&output)
+            .map_err(|e| anyhow!("promote export: {}", e.error))?;
+        let absolute = fs::canonicalize(&output).unwrap_or(output);
+        return Ok(
+            serde_json::json!({"format": format, "output_path": absolute, "pages": pages.len(), "bytes": data.len()}),
+        );
     }
+    // Stream the archive straight into a temp file in the output directory:
+    // a large book never sits in RAM as a whole-archive `Vec<u8>`. Page
+    // bytes stream one file at a time through the single shared packaging
+    // core in `crate::approval`; only small generated descriptors (manifest,
+    // OPF/nav XHTML) are held in memory.
     let output = output_dir.join(format!(
         "fukidashi-{}.{}",
         Uuid::new_v4().simple(),
         extension
     ));
     let temporary = tempfile::NamedTempFile::new_in(&output_dir).context("create atomic export")?;
-    fs::write(temporary.path(), &data).context("write export")?;
+    write_export_archive(temporary.path(), &project, &pages, epub_layout)?;
+    let bytes = fs::metadata(temporary.path())
+        .context("measure export")?
+        .len();
+    if bytes > MAX_ARCHIVE_BYTES {
+        bail!("export exceeds {} byte limit", MAX_ARCHIVE_BYTES);
+    }
+    if bytes == 0 {
+        bail!("export produced an empty archive");
+    }
     temporary
         .persist(&output)
         .map_err(|e| anyhow!("promote export: {}", e.error))?;
     let absolute = fs::canonicalize(&output).unwrap_or(output);
     Ok(
-        serde_json::json!({"format": format, "output_path": absolute, "pages": pages.len(), "bytes": data.len()}),
+        serde_json::json!({"format": format, "output_path": absolute, "pages": pages.len(), "bytes": bytes}),
     )
 }
 
@@ -187,8 +217,6 @@ fn resolve_pages(root: &Path, pages: Vec<Page>, max_input_bytes: u64) -> Result<
             if total > max_input_bytes {
                 bail!("project assets exceed export input limit");
             }
-            let image = fs::read(&source)
-                .with_context(|| format!("read page image {}", source.display()))?;
             let ext = source
                 .extension()
                 .and_then(|s| s.to_str())
@@ -204,7 +232,7 @@ fn resolve_pages(root: &Path, pages: Vec<Page>, max_input_bytes: u64) -> Result<
                 ext,
                 page_name: format!("page-{index:04}"),
                 bubbles: page.bubbles,
-                image,
+                source,
             })
         })
         .collect()
@@ -244,83 +272,158 @@ fn export_manifest(project: &Project, pages: &[ResolvedPage]) -> Result<Vec<u8>>
     ))?)
 }
 
-fn options(method: CompressionMethod) -> SimpleFileOptions {
-    SimpleFileOptions::default().compression_method(method)
+/// Owned archive entry so generated descriptors (manifest, OPF/nav XHTML)
+/// can sit beside streamed page files in one ordered entry list.
+enum OwnedEntry {
+    File {
+        name: String,
+        method: CompressionMethod,
+        path: PathBuf,
+    },
+    Bytes {
+        name: String,
+        method: CompressionMethod,
+        bytes: Vec<u8>,
+    },
 }
 
-fn make_zip(project: &Project, pages: &[ResolvedPage], epub_layout: bool) -> Result<Vec<u8>> {
-    let mut cursor = std::io::Cursor::new(Vec::new());
-    let mut zip = ZipWriter::new(&mut cursor);
-    if epub_layout {
-        zip.start_file("mimetype", options(CompressionMethod::Stored))?;
-        zip.write_all(b"application/epub+zip")?;
-        zip.start_file(
-            "META-INF/container.xml",
-            options(CompressionMethod::Deflated),
-        )?;
-        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#)?;
-        write_epub_payload(&mut zip, project, pages)?;
-    } else {
-        let manifest = export_manifest(project, pages)?;
-        zip.start_file("project.json", options(CompressionMethod::Deflated))?;
-        zip.write_all(&manifest)?;
-        for page in pages {
-            let name = format!("pages/{}.{}", page.page_name, page.ext);
-            zip.start_file(name, options(CompressionMethod::Deflated))?;
-            zip.write_all(&page.image)?;
-        }
+/// The single ordered entry plan for ZIP and EPUB production packaging.
+/// Natural page order, every expected page exactly once; ZIP concatenation
+/// is never used. Both the file-streaming production path and the in-memory
+/// test helper below build from this one plan.
+fn export_archive_plan(
+    project: &Project,
+    pages: &[ResolvedPage],
+    epub_layout: bool,
+) -> Result<Vec<OwnedEntry>> {
+    if pages.is_empty() {
+        bail!("no cached pages to package");
     }
-    zip.finish()?;
+    if epub_layout {
+        let mut entries = Vec::new();
+        entries.push(OwnedEntry::Bytes {
+            name: "mimetype".to_owned(),
+            method: CompressionMethod::Stored,
+            bytes: b"application/epub+zip".to_vec(),
+        });
+        entries.push(OwnedEntry::Bytes {
+            name: "META-INF/container.xml".to_owned(),
+            method: CompressionMethod::Deflated,
+            bytes: br#"<?xml version="1.0" encoding="UTF-8"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#.to_vec(),
+        });
+        let mut manifest = String::new();
+        let mut spine = String::new();
+        let mut nav = String::new();
+        for (index, page) in pages.iter().enumerate() {
+            let id = format!("p{index:04}");
+            let image_id = format!("img{index:04}");
+            manifest.push_str(&format!("<item id=\"{id}\" href=\"pages/{name}.xhtml\" media-type=\"application/xhtml+xml\"/><item id=\"{image_id}\" href=\"images/{name}.{ext}\" media-type=\"{mime}\"/>", id=xml_attr(&id), name=page.page_name, ext=xml_attr(&page.ext), mime=media_type(&page.ext)));
+            spine.push_str(&format!("<itemref idref=\"{id}\"/>"));
+            nav.push_str(&format!(
+                "<li><a href=\"pages/{name}.xhtml\">Page {}</a></li>",
+                index + 1,
+                name = page.page_name
+            ));
+            entries.push(OwnedEntry::File {
+                name: format!("OEBPS/images/{}.{}", page.page_name, page.ext),
+                method: CompressionMethod::Deflated,
+                path: page.source.clone(),
+            });
+            entries.push(OwnedEntry::Bytes {
+                name: format!("OEBPS/pages/{}.xhtml", page.page_name),
+                method: CompressionMethod::Deflated,
+                bytes: page_xhtml(page, &project.language).into_bytes(),
+            });
+        }
+        let title = xml_escape(project.title.as_deref().unwrap_or("Fukidashi project"));
+        let opf = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:{}</dc:identifier><dc:title>{title}</dc:title><dc:language>{}</dc:language></metadata><manifest>{manifest}<item id="nav" properties="nav" href="nav.xhtml" media-type="application/xhtml+xml"/></manifest><spine>{spine}</spine></package>"#,
+            Uuid::new_v4(),
+            xml_escape(project.language.as_deref().unwrap_or("und"))
+        );
+        entries.push(OwnedEntry::Bytes {
+            name: "OEBPS/content.opf".to_owned(),
+            method: CompressionMethod::Deflated,
+            bytes: opf.into_bytes(),
+        });
+        let nav_xhtml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{title}</title></head><body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><ol>{nav}</ol></nav></body></html>"#
+        );
+        entries.push(OwnedEntry::Bytes {
+            name: "OEBPS/nav.xhtml".to_owned(),
+            method: CompressionMethod::Deflated,
+            bytes: nav_xhtml.into_bytes(),
+        });
+        return Ok(entries);
+    }
+    let mut entries = Vec::new();
+    entries.push(OwnedEntry::Bytes {
+        name: "project.json".to_owned(),
+        method: CompressionMethod::Deflated,
+        bytes: export_manifest(project, pages)?,
+    });
+    for page in pages {
+        entries.push(OwnedEntry::File {
+            name: format!("pages/{}.{}", page.page_name, page.ext),
+            method: CompressionMethod::Deflated,
+            path: page.source.clone(),
+        });
+    }
+    Ok(entries)
+}
+
+fn as_archive_entries(entries: &[OwnedEntry]) -> Vec<crate::approval::ArchiveEntry<'_>> {
+    entries
+        .iter()
+        .map(|entry| match entry {
+            OwnedEntry::File { name, method, path } => crate::approval::ArchiveEntry::File {
+                name: name.clone(),
+                method: *method,
+                path,
+            },
+            OwnedEntry::Bytes {
+                name,
+                method,
+                bytes,
+            } => crate::approval::ArchiveEntry::Bytes {
+                name: name.clone(),
+                method: *method,
+                bytes,
+            },
+        })
+        .collect()
+}
+
+/// Production packaging: stream the single ordered entry plan into a temp
+/// file via the shared `crate::approval` archive core, then fsync. The
+/// caller renames into place; a packaging failure leaves the render
+/// cache/checkpoint intact and publishes no partial archive.
+fn write_export_archive(
+    tmp_path: &Path,
+    project: &Project,
+    pages: &[ResolvedPage],
+    epub_layout: bool,
+) -> Result<()> {
+    let plan = export_archive_plan(project, pages, epub_layout)?;
+    let entries = as_archive_entries(&plan);
+    crate::approval::write_archive_to_path(tmp_path, &entries)
+}
+
+#[cfg(test)]
+fn make_zip(project: &Project, pages: &[ResolvedPage], epub_layout: bool) -> Result<Vec<u8>> {
+    // In-memory helper for tests. Production streams to a file through
+    // `write_export_archive`; both share `export_archive_plan` and the
+    // `crate::approval` writer core.
+    let plan = export_archive_plan(project, pages, epub_layout)?;
+    let entries = as_archive_entries(&plan);
+    let cursor =
+        crate::approval::write_archive_entries(std::io::Cursor::new(Vec::new()), &entries)?;
     Ok(cursor.into_inner())
 }
 
+#[cfg(test)]
 fn make_epub(project: &Project, pages: &[ResolvedPage]) -> Result<Vec<u8>> {
     make_zip(project, pages, true)
-}
-
-fn write_epub_payload(
-    zip: &mut ZipWriter<&mut std::io::Cursor<Vec<u8>>>,
-    project: &Project,
-    pages: &[ResolvedPage],
-) -> Result<()> {
-    let mut manifest = String::new();
-    let mut spine = String::new();
-    let mut nav = String::new();
-    for (index, page) in pages.iter().enumerate() {
-        let id = format!("p{index:04}");
-        let image_id = format!("img{index:04}");
-        manifest.push_str(&format!("<item id=\"{id}\" href=\"pages/{name}.xhtml\" media-type=\"application/xhtml+xml\"/><item id=\"{image_id}\" href=\"images/{name}.{ext}\" media-type=\"{mime}\"/>", id=xml_attr(&id), name=page.page_name, ext=xml_attr(&page.ext), mime=media_type(&page.ext)));
-        spine.push_str(&format!("<itemref idref=\"{id}\"/>"));
-        nav.push_str(&format!(
-            "<li><a href=\"pages/{name}.xhtml\">Page {}</a></li>",
-            index + 1,
-            name = page.page_name
-        ));
-        zip.start_file(
-            format!("OEBPS/images/{}.{}", page.page_name, page.ext),
-            options(CompressionMethod::Deflated),
-        )?;
-        zip.write_all(&page.image)?;
-        zip.start_file(
-            format!("OEBPS/pages/{}.xhtml", page.page_name),
-            options(CompressionMethod::Deflated),
-        )?;
-        zip.write_all(page_xhtml(page, &project.language).as_bytes())?;
-    }
-    let title = xml_escape(project.title.as_deref().unwrap_or("Fukidashi project"));
-    let opf = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="bookid">urn:uuid:{}</dc:identifier><dc:title>{title}</dc:title><dc:language>{}</dc:language></metadata><manifest>{manifest}<item id="nav" properties="nav" href="nav.xhtml" media-type="application/xhtml+xml"/></manifest><spine>{spine}</spine></package>"#,
-        Uuid::new_v4(),
-        xml_escape(project.language.as_deref().unwrap_or("und"))
-    );
-    zip.start_file("OEBPS/content.opf", options(CompressionMethod::Deflated))?;
-    zip.write_all(opf.as_bytes())?;
-    let nav_xhtml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>{title}</title></head><body><nav epub:type="toc" xmlns:epub="http://www.idpf.org/2007/ops"><ol>{nav}</ol></nav></body></html>"#
-    );
-    zip.start_file("OEBPS/nav.xhtml", options(CompressionMethod::Deflated))?;
-    zip.write_all(nav_xhtml.as_bytes())?;
-    Ok(())
 }
 
 fn page_xhtml(page: &ResolvedPage, language: &Option<String>) -> String {
@@ -350,9 +453,11 @@ fn make_html(project: &Project, pages: &[ResolvedPage]) -> Result<Vec<u8>> {
     let mut body = String::new();
     for (index, page) in pages.iter().enumerate() {
         let mime = media_type(&page.ext);
+        let bytes = fs::read(&page.source)
+            .with_context(|| format!("read page image {}", page.source.display()))?;
         let src = format!(
             "data:{mime};base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(&page.image)
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
         );
         body.push_str(&format!("<section data-page=\"{index}\"><img src=\"{src}\" alt=\"Page {}\"><div class=\"dialogue\">", index + 1));
         for bubble in &page.bubbles {
@@ -408,5 +513,80 @@ mod tests {
         fs::remove_file(ad_hoc.path().join("job.json")).unwrap();
         fs::write(ad_hoc.path().join(".fukidashi-job.json"), b"{}").unwrap();
         assert_eq!(max_input_bytes(ad_hoc.path()), MAX_MANAGED_INPUT_BYTES);
+    }
+
+    fn three_page_project(dir: &tempfile::TempDir) -> PathBuf {
+        for index in 0..3 {
+            fs::write(
+                dir.path().join(format!("page-{index}.png")),
+                format!("page-bytes-{index}"),
+            )
+            .unwrap();
+        }
+        let manifest = serde_json::json!({
+            "schema_version": 1,
+            "title": "Order",
+            "pages": (0..3).map(|index| serde_json::json!({
+                "id": format!("p{index}"),
+                "image_path": format!("page-{index}.png"),
+                "bubbles": [],
+            })).collect::<Vec<_>>(),
+        });
+        fs::write(
+            dir.path().join("project.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        dir.path().to_path_buf()
+    }
+
+    fn zip_names(bytes: &[u8]) -> Vec<String> {
+        let cursor = std::io::Cursor::new(bytes);
+        let mut zip = zip::ZipArchive::new(cursor).unwrap();
+        (0..zip.len())
+            .map(|index| zip.by_index(index).unwrap().name().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn file_streamed_export_keeps_natural_order_exactly_once() {
+        let dir = tempdir().unwrap();
+        let root = three_page_project(&dir);
+        let out = tempdir().unwrap();
+        let value = export_project_to(&root, "zip", Some(out.path())).unwrap();
+        assert_eq!(value["pages"], 3);
+        let path = PathBuf::from(value["output_path"].as_str().unwrap());
+        assert!(path.is_file());
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            zip_names(&bytes),
+            vec![
+                "project.json",
+                "pages/page-0000.png",
+                "pages/page-0001.png",
+                "pages/page-0002.png",
+            ]
+        );
+        // The in-memory helper shares the same entry plan and writer core.
+        let manifest_bytes = fs::read(root.join("project.json")).unwrap();
+        let project: Project = serde_json::from_slice(&manifest_bytes).unwrap();
+        let pages = resolve_pages(&root, project.pages.clone(), MAX_INPUT_BYTES).unwrap();
+        let memory = make_zip(&project, &pages, false).unwrap();
+        assert_eq!(zip_names(&memory), zip_names(&bytes));
+        let epub = make_epub(&project, &pages).unwrap();
+        let names = zip_names(&epub);
+        assert!(names.contains(&"OEBPS/images/page-0000.png".to_owned()));
+        assert!(names.contains(&"OEBPS/pages/page-0002.xhtml".to_owned()));
+    }
+
+    #[test]
+    fn export_failure_publishes_no_partial_archive() {
+        let dir = tempdir().unwrap();
+        let root = three_page_project(&dir);
+        fs::remove_file(root.join("page-1.png")).unwrap();
+        let out = tempdir().unwrap();
+        assert!(export_project_to(&root, "zip", Some(out.path())).is_err());
+        let published: Vec<_> = fs::read_dir(out.path()).unwrap().collect();
+        assert!(published.is_empty());
     }
 }

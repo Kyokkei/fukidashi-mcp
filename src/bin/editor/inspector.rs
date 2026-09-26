@@ -15,6 +15,12 @@ impl EditorApp {
                 ui.add_enabled_ui(editing_enabled, |ui| {
                     ui.heading("Inspector");
                     ui.separator();
+                    if let Some(guidance) = &self.error_guidance {
+                        ui.group(|ui| {
+                            ui.colored_label(Color32::from_rgb(255, 190, 90), guidance);
+                        });
+                        ui.separator();
+                    }
 
                     // Variant picker.
                     let mut variant = self.canvas.current_variant;
@@ -88,9 +94,22 @@ impl EditorApp {
 
                     ui.separator();
 
-                    // Bubble inspector or prompt.
-                    let sel = self.canvas.selected;
-                    if let Some((pi, bi)) = sel {
+                    // Missing-dialogue flags and bubble editor.
+                    if self.canvas.draw_issue_mode {
+                        ui.colored_label(
+                            Color32::from_rgb(255, 180, 50),
+                            "Release to mark it, then review and press Send request.",
+                        );
+                        if ui.button("Cancel missing-dialogue flag").clicked() {
+                            self.cancel_missing_dialogue_flag();
+                        }
+                    } else if ui.button("Flag missing dialogue…").clicked() {
+                        self.begin_missing_dialogue_flag();
+                    }
+                    ui.separator();
+                    if let Some(issue_index) = self.canvas.selected_issue {
+                        self.issue_inspector(ui, self.current_page, issue_index);
+                    } else if let Some((pi, bi)) = self.canvas.selected {
                         self.bubble_inspector(ui, pi, bi);
                     } else {
                         ui.label("Click a bubble on the canvas to edit it.");
@@ -99,10 +118,72 @@ impl EditorApp {
                     // Error message at the very bottom.
                     if let Some(err) = &self.error_message {
                         ui.separator();
-                        ui.colored_label(Color32::RED, format!("Error: {err}"));
+                        if self.error_guidance.is_some() {
+                            ui.collapsing("Technical details", |ui| {
+                                ui.colored_label(Color32::RED, err);
+                            });
+                        } else {
+                            ui.colored_label(Color32::RED, format!("Error: {err}"));
+                        }
                     }
                 });
             });
+    }
+
+    fn issue_inspector(&mut self, ui: &mut Ui, page_index: usize, issue_index: usize) {
+        let issue = self.state.as_ref().and_then(|state| {
+            state
+                .page(page_index)
+                .and_then(|page| page.issues.get(issue_index).cloned())
+        });
+        let Some(issue) = issue else {
+            self.canvas.selected_issue = None;
+            return;
+        };
+        if issue.origin != "missing-dialogue-flag" {
+            ui.label(format!("Review issue: {}", issue.issue_type));
+            if !issue.note.is_empty() {
+                ui.label(&issue.note);
+            }
+            return;
+        }
+
+        ui.heading("Missing dialogue");
+        ui.label(&issue.note);
+        ui.label("Drag inside the orange box to move it; drag a white handle to resize. Changes save automatically.");
+        if let Some(source_ocr) = issue.source_ocr.as_deref() {
+            ui.label("Recognized source:");
+            ui.label(source_ocr);
+        } else {
+            ui.label(
+                "Source text will be read from the original page when the request is handled.",
+            );
+        }
+        if let Some(bbox) = &issue.bbox {
+            ui.label(format!(
+                "Marked rectangle: {:.0}, {:.0} to {:.0}, {:.0}",
+                bbox.x1, bbox.y1, bbox.x2, bbox.y2
+            ));
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Redraw rectangle").clicked() {
+                self.begin_missing_dialogue_redraw(issue_index);
+            }
+            if ui.button("Delete flag").clicked() {
+                self.record_history_before_mutation();
+                let removed = self
+                    .state
+                    .as_mut()
+                    .is_some_and(|state| state.remove_issue(page_index, issue_index));
+                if removed {
+                    self.canvas.selected_issue = None;
+                    self.schedule_save();
+                }
+            }
+        });
+        if ui.button("Send request").clicked() {
+            self.request_fixes();
+        }
     }
 
     fn bubble_inspector(&mut self, ui: &mut Ui, page_index: usize, bubble_index: usize) {
@@ -115,6 +196,12 @@ impl EditorApp {
         };
 
         ui.label(format!("Bubble: {}", bubble.id));
+        if bubble.preserve_source {
+            ui.colored_label(
+                Color32::from_rgb(255, 190, 90),
+                "Source text kept / untranslated",
+            );
+        }
         ui.separator();
 
         // Translation.
@@ -143,6 +230,32 @@ impl EditorApp {
                 {
                     self.canvas.selected = None;
                     self.schedule_save();
+                }
+            }
+        });
+
+        // Keep translation QA separate from editing the text: this marker is
+        // persisted on the bubble and sent back through the MCP review loop.
+        ui.horizontal(|ui| {
+            let label = if bubble.retranslate_requested {
+                "Clear re-translation flag"
+            } else {
+                "Flag for re-translation"
+            };
+            if ui.button(label).clicked() {
+                if let Some(state) = self.state.as_mut() {
+                    state.set_bubble_retranslate_requested(
+                        page_index,
+                        bubble_index,
+                        !bubble.retranslate_requested,
+                    );
+                }
+                self.schedule_save();
+            }
+            if bubble.retranslate_requested {
+                ui.colored_label(Color32::from_rgb(255, 180, 50), "Needs new translation");
+                if ui.button("Send request").clicked() {
+                    self.request_fixes();
                 }
             }
         });

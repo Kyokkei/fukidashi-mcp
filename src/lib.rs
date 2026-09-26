@@ -1,4 +1,5 @@
 //! Fukidashi's local, headless comic processing library.
+pub mod approval;
 pub mod config;
 pub mod domain;
 pub mod editor;

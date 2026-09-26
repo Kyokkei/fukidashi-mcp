@@ -114,6 +114,10 @@ pub struct ReviewState {
 #[derive(Debug)]
 struct ReviewChannel {
     state: Mutex<ReviewState>,
+    /// Serializes waiter consumption without holding the state mutex across
+    /// the filesystem write.  The state mutex remains short lived so a
+    /// browser submit cannot be blocked behind fsync.
+    consume_lock: Mutex<()>,
     notify: Notify,
     root_dir: PathBuf,
 }
@@ -795,39 +799,49 @@ fn serve_editor_impl(
             ManagedEditorLease::Acquired(lease) => native_lease = Some(lease),
         }
     }
-    let mut initial_state = normalize_editor_state(json_data)?;
-    if state_path.exists()
-        && let Ok(bytes) = fs::read(&state_path)
-        && let Ok(saved) = serde_json::from_slice::<Value>(&bytes)
-    {
-        merge_saved_edits(&mut initial_state, &saved);
-        let saved_bubbles = bubble_count(&saved);
-        let merged_bubbles = bubble_count(&initial_state);
-        if merged_bubbles < saved_bubbles {
-            bail!(
-                "refusing to overwrite managed project: reconstructed editor state lost {saved_bubbles} saved bubbles"
-            );
+    // Reopen reconstruction reads the persisted project before it may write
+    // the merged snapshot back. Keep this lease scoped to the project
+    // snapshot work. Review reset below acquires the in-process review writer
+    // lock first and then the same render lease; keeping the scopes separate
+    // prevents startup (render -> review) from inverting a waiter
+    // (review -> render).
+    let (initial_state, mut existing_review, relaunch_existing) = {
+        let _startup_render_lock = acquire_editor_render_lock(&root_dir)?;
+        let mut initial_state = normalize_editor_state(json_data)?;
+        if state_path.exists()
+            && let Ok(bytes) = fs::read(&state_path)
+            && let Ok(saved) = serde_json::from_slice::<Value>(&bytes)
+        {
+            merge_saved_edits(&mut initial_state, &saved);
+            let saved_bubbles = bubble_count(&saved);
+            let merged_bubbles = bubble_count(&initial_state);
+            if merged_bubbles < saved_bubbles {
+                bail!(
+                    "refusing to overwrite managed project: reconstructed editor state lost {saved_bubbles} saved bubbles"
+                );
+            }
         }
-    }
-    validate_state_for_session(server_owned_state, &initial_state)?;
-    validate_project_paths_for_root(&root_dir, &initial_state, &allowed_source_paths)?;
-    let mut existing_review = if review_path.exists() {
-        Some(
-            serde_json::from_slice::<ReviewState>(
-                &fs::read(&review_path).context("read existing review state")?,
+        validate_state_for_session(server_owned_state, &initial_state)?;
+        validate_project_paths_for_root(&root_dir, &initial_state, &allowed_source_paths)?;
+        let existing_review = if review_path.exists() {
+            Some(
+                serde_json::from_slice::<ReviewState>(
+                    &fs::read(&review_path).context("read existing review state")?,
+                )
+                .context("parse existing review state")?,
             )
-            .context("parse existing review state")?,
-        )
-    } else {
-        None
+        } else {
+            None
+        };
+        let relaunch_existing = server_owned_state
+            && existing_review.as_ref().is_some_and(|review| {
+                review.status == "awaiting_review" && review.action.is_none()
+            });
+        if !relaunch_existing {
+            atomic_json_save(&state_path, &initial_state)?;
+        }
+        (initial_state, existing_review, relaunch_existing)
     };
-    let relaunch_existing = server_owned_state
-        && existing_review
-            .as_ref()
-            .is_some_and(|review| review.status == "awaiting_review" && review.action.is_none());
-    if !relaunch_existing {
-        atomic_json_save(&state_path, &initial_state)?;
-    }
     let mut reopened_completed_review = false;
     let mut review_state = if let Some(existing) = existing_review.take() {
         // A completed review remains exportable by default. An explicit editor
@@ -876,7 +890,23 @@ fn serve_editor_impl(
         review_state.feedback.clear();
         review_state.approved_pages.clear();
         review_state.consumed = false;
-        save_review(&root_dir, &review_state)?;
+        // Reopen/reset is itself a review write. Serialize it with an
+        // in-process waiter or submit so the channel cannot retain an action
+        // that was superseded on disk.
+        let existing_channel = review_channels()
+            .lock()
+            .map_err(|_| anyhow!("review channel lock poisoned"))?
+            .get(&review_state.review_session_id)
+            .cloned();
+        if let Some(channel) = existing_channel {
+            let _review_lock = channel
+                .consume_lock
+                .lock()
+                .map_err(|_| anyhow!("review writer lock poisoned"))?;
+            save_review(&root_dir, &review_state)?;
+        } else {
+            save_review(&root_dir, &review_state)?;
+        }
     }
     // Prefer one editor surface per review. When the companion native binary
     // is available, it owns the review and writes the same review.json consumed
@@ -941,6 +971,10 @@ fn serve_editor_impl(
             .lock()
             .map_err(|_| anyhow!("review channel lock poisoned"))?;
         if let Some(channel) = channels.get(&review_state.review_session_id) {
+            let _review_lock = channel
+                .consume_lock
+                .lock()
+                .map_err(|_| anyhow!("review writer lock poisoned"))?;
             *channel
                 .state
                 .lock()
@@ -950,6 +984,7 @@ fn serve_editor_impl(
         } else {
             let channel = Arc::new(ReviewChannel {
                 state: Mutex::new(review_state.clone()),
+                consume_lock: Mutex::new(()),
                 notify: Notify::new(),
                 root_dir: root_dir.clone(),
             });
@@ -1017,6 +1052,39 @@ fn is_managed_editor_root(root: &Path) -> bool {
     root.join("job.json").is_file() || root.join(".fukidashi-job.json").is_file()
 }
 
+/// Acquire the job-wide writer lease used by export, editor renders, and all
+/// managed project/review persistence.  Native editor callers use this before
+/// taking their process-local save mutex so the lock order stays render lease
+/// -> local save lock everywhere.
+pub fn acquire_editor_render_lock(root_dir: &Path) -> Result<Option<crate::workflow::RenderLock>> {
+    let root_dir = managed_editor_root(root_dir);
+    if !is_managed_editor_root(&root_dir) {
+        return Ok(None);
+    }
+    let jobs_root = root_dir
+        .parent()
+        .ok_or_else(|| anyhow!("managed editor job has no jobs root"))?;
+    let workflow = crate::workflow::Workflow::new(jobs_root.to_path_buf())?;
+    Ok(Some(workflow.acquire_render_lock(&root_dir)?))
+}
+
+/// Fast UI-thread counterpart to [`acquire_editor_render_lock`]. A busy
+/// export returns an actionable error immediately; background save/render
+/// workers should use the bounded waiting helper above instead.
+pub fn try_acquire_editor_render_lock(
+    root_dir: &Path,
+) -> Result<Option<crate::workflow::RenderLock>> {
+    let root_dir = managed_editor_root(root_dir);
+    if !is_managed_editor_root(&root_dir) {
+        return Ok(None);
+    }
+    let jobs_root = root_dir
+        .parent()
+        .ok_or_else(|| anyhow!("managed editor job has no jobs root"))?;
+    let workflow = crate::workflow::Workflow::new(jobs_root.to_path_buf())?;
+    Ok(Some(workflow.try_acquire_render_lock(&root_dir)?))
+}
+
 fn editor_json_limit(server_owned_state: bool) -> usize {
     if server_owned_state {
         MAX_MANAGED_STATE_JSON
@@ -1026,9 +1094,14 @@ fn editor_json_limit(server_owned_state: bool) -> usize {
 }
 
 fn save_review(root: &Path, state: &ReviewState) -> Result<()> {
+    let _render_lock = acquire_editor_render_lock(root)?;
+    save_review_unlocked(root, state)
+}
+
+fn save_review_unlocked(root: &Path, state: &ReviewState) -> Result<()> {
     let value = serde_json::to_value(state)?;
-    atomic_json_save(&review_file(root), &value)?;
-    atomic_json_save(
+    atomic_json_save_unlocked(&review_file(root), &value)?;
+    atomic_json_save_unlocked(
         &review_audit_file(root),
         &json!({
             "review_session_id": state.review_session_id,
@@ -1037,6 +1110,15 @@ fn save_review(root: &Path, state: &ReviewState) -> Result<()> {
         }),
     )?;
     Ok(())
+}
+
+/// Persist review state without waiting behind an active managed export. The
+/// native editor uses this for operator actions so a busy export is surfaced
+/// immediately and the action remains retryable.
+pub fn try_write_review(root: &Path, state: &ReviewState) -> Result<()> {
+    validate_review_state_minimal(state)?;
+    let _render_lock = try_acquire_editor_render_lock(root)?;
+    save_review_unlocked(root, state)
 }
 
 fn review_page_count(state: &Value) -> usize {
@@ -1070,8 +1152,8 @@ fn validate_review_feedback(session: &Session, state: &Value, item: &Value) -> R
         .get("origin")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("review feedback origin is required"))?;
-    if !matches!(origin, "image-pixels" | "bubble-flag") {
-        bail!("review feedback origin must be image-pixels or bubble-flag");
+    if !matches!(origin, "image-pixels" | "bubble-flag" | "retranslate-flag") {
+        bail!("review feedback origin must be image-pixels, bubble-flag, or retranslate-flag");
     }
     let issue_type = object
         .get("issue_type")
@@ -1202,6 +1284,15 @@ fn validate_revision(request: &Value, current: &ReviewState) -> Result<()> {
 }
 
 fn save_review_draft(session: &Session, request: &Value) -> Result<Value> {
+    // All in-process review writers and waiters share this lock. Keep the
+    // order review state -> render lease so a waiter cannot deadlock a draft
+    // writer that is acquiring the same job lease.
+    let _review_lock = session
+        .review
+        .consume_lock
+        .lock()
+        .map_err(|_| anyhow!("review writer lock poisoned"))?;
+    let _render_lock = try_acquire_editor_render_lock(&session.root_dir)?;
     let mut current = session
         .review
         .state
@@ -1242,7 +1333,7 @@ fn save_review_draft(session: &Session, request: &Value) -> Result<Value> {
     current
         .audit
         .push(json!({"event":"draft_saved","revision":current.revision}));
-    save_review(&session.root_dir, &current)?;
+    save_review_unlocked(&session.root_dir, &current)?;
     *session
         .review
         .state
@@ -1252,6 +1343,11 @@ fn save_review_draft(session: &Session, request: &Value) -> Result<Value> {
 }
 
 fn submit_review(session: &Session, request: &Value) -> Result<Value> {
+    let _review_lock = session
+        .review
+        .consume_lock
+        .lock()
+        .map_err(|_| anyhow!("review writer lock poisoned"))?;
     let mut current = session
         .review
         .state
@@ -1266,7 +1362,22 @@ fn submit_review(session: &Session, request: &Value) -> Result<Value> {
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("review action is required"))?;
+    let _render_lock = try_acquire_editor_render_lock(&session.root_dir)?;
+    let strict_managed_approval = action == "approve_export"
+        && session.server_owned_state
+        && (session.root_dir.join("job.json").is_file()
+            || session.root_dir.join(".fukidashi-job.json").is_file())
+        && session.root_dir.join("pages").is_dir();
+    let _approval_lease = if strict_managed_approval {
+        Some(crate::approval::ApprovalLease::try_acquire(
+            &session.root_dir,
+            current.revision,
+        )?)
+    } else {
+        None
+    };
     let project = load_state(session)?;
+    let mut approval_binding = None;
     match action {
         "request_fixes" => {
             let feedback = request
@@ -1323,6 +1434,17 @@ fn submit_review(session: &Session, request: &Value) -> Result<Value> {
             }
             current.approved_pages = pages;
             current.status = "approved".to_owned();
+            // The managed editor has a server-owned artifact graph and can
+            // materialize the strict checkpoint proof here. Ad-hoc loopback
+            // sessions retain the legacy approval shape because they may only
+            // carry a flat image without a rendered-image association.
+            if strict_managed_approval {
+                approval_binding = Some(build_live_approval_binding(
+                    &session.root_dir,
+                    &project,
+                    &current,
+                )?);
+            }
         }
         _ => bail!("review action must be request_fixes or approve_export"),
     }
@@ -1334,13 +1456,162 @@ fn submit_review(session: &Session, request: &Value) -> Result<Value> {
         "feedback_count": current.feedback.len(),
         "advisory_count": review_blockers(&project).len(),
     }));
-    save_review(&session.root_dir, &current)?;
+    if let Some(binding) = approval_binding {
+        current.audit.push(json!({
+            "event": "approve_export",
+            "review_session_id": current.review_session_id.clone(),
+            "revision": current.revision,
+            "approval": binding,
+        }));
+    }
+    save_review_unlocked(&session.root_dir, &current)?;
     *session
         .review
         .state
         .lock()
         .map_err(|_| anyhow!("review state lock poisoned"))? = current.clone();
     Ok(serde_json::to_value(current)?)
+}
+
+/// Materialize the durable approval evidence for the loopback editor. The
+/// native editor builds the same checkpoint in its worker before it writes the
+/// approval. Keeping the browser path on that same evidence contract ensures
+/// a compact wait response can still be verified from review.json.
+fn build_live_approval_binding(
+    job_dir: &Path,
+    state: &Value,
+    review: &ReviewState,
+) -> Result<Value> {
+    let managed =
+        job_dir.join("job.json").is_file() || job_dir.join(".fukidashi-job.json").is_file();
+    let workflow = if managed {
+        Some(crate::workflow::Workflow::new(
+            job_dir
+                .parent()
+                .ok_or_else(|| anyhow!("approval job has no jobs root"))?
+                .to_path_buf(),
+        )?)
+    } else {
+        None
+    };
+    let pages = state
+        .get("pages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("approval state has no pages"))?;
+    let dirty_plan = if let Some(workflow) = workflow.as_ref() {
+        workflow.editor_render_plan(job_dir, state)?
+    } else {
+        pages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, page)| {
+                let dirty = page
+                    .get("render_dirty")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || page
+                        .get("bubbles")
+                        .and_then(Value::as_array)
+                        .is_some_and(|bubbles| {
+                            bubbles.iter().any(|bubble| {
+                                bubble
+                                    .get("render_dirty")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                            })
+                        });
+                dirty.then_some(index)
+            })
+            .collect()
+    };
+    let job_id = job_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| job_dir.display().to_string());
+    let snapshot = crate::approval::ApprovalSnapshot::freeze(
+        job_id,
+        review.revision,
+        &approval_state_signature(state, Some(job_dir)),
+        dirty_plan,
+    );
+    let (mut checkpoint, effective_plan) =
+        crate::approval::prepare_resume(job_dir, review.revision, &snapshot);
+    crate::approval::save_approval_checkpoint(job_dir, review.revision, &checkpoint)?;
+    for page_index in effective_plan.iter().copied() {
+        let page = pages
+            .get(page_index)
+            .ok_or_else(|| anyhow!("approval page {page_index} is outside the project"))?;
+        let output_path = page
+            .get("rendered_image_path")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .map(|path| {
+                if path.is_absolute() {
+                    path
+                } else {
+                    job_dir.join(path)
+                }
+            })
+            .ok_or_else(|| anyhow!("approval page {page_index} has no rendered image path"))?;
+        let page_id = page
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("page-{page_index}"));
+        let semantic_render_signature = post_render_page_signature(state, page);
+        let (source_sha256, clean_sha256) = if let Some(workflow) = workflow.as_ref() {
+            let artifact = workflow.validate_render_input(&output_path)?;
+            let sidecar_signature = artifact
+                .qa
+                .get("semantic_render_signature")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!("approval page {page_index} render sidecar has no semantic signature")
+                })?;
+            if !crate::approval::semantic_render_signatures_equal(
+                sidecar_signature,
+                &semantic_render_signature,
+            ) {
+                bail!("approval page {page_index} render sidecar does not match current semantics");
+            }
+            let clean_path = page
+                .get("corrected_cleaned_image_path")
+                .or_else(|| page.get("cleaned_image_path"))
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        job_dir.join(path)
+                    }
+                })
+                .ok_or_else(|| anyhow!("approval page {page_index} has no clean artifact"))?;
+            let clean = workflow.validate_clean_input(&clean_path)?;
+            (clean.source_sha256, clean.cleaned_sha256)
+        } else {
+            (String::new(), String::new())
+        };
+        let output_sha256 = crate::approval::sha256_file(&output_path)?;
+        checkpoint.mark_complete(crate::approval::ApprovalPageCheckpoint::new(
+            page_index,
+            page_id,
+            semantic_render_signature,
+            source_sha256,
+            clean_sha256,
+            output_path.display().to_string(),
+            output_sha256,
+        ));
+    }
+    crate::approval::save_approval_checkpoint(job_dir, review.revision, &checkpoint)?;
+    Ok(crate::approval::approval_audit_value(
+        &snapshot,
+        &checkpoint.effective_dirty_plan(&snapshot),
+        &checkpoint.batches,
+        pages.len(),
+        pages.len().saturating_sub(snapshot.dirty_plan.len()),
+    ))
 }
 
 /// Wait for the one browser submission associated with a review revision.
@@ -1375,33 +1646,70 @@ async fn wait_for_review_via_channel(
     tokio::time::timeout(timeout, async {
         loop {
             let notified = channel.notify.notified();
+            // All in-process review writers share this lock, but do not
+            // hold the shared state mutex while save_review performs atomic
+            // writes and fsyncs.  A failed persist therefore leaves the
+            // in-memory action available for a safe retry.
             let result = {
-                let mut state = channel
-                    .state
+                let _review_lock = channel
+                    .consume_lock
                     .lock()
-                    .map_err(|_| anyhow!("review state lock poisoned"))?;
-                if state.revision != revision {
-                    bail!(
-                        "stale review revision {revision}; current revision is {}",
-                        state.revision
-                    );
-                }
-                if state.action.is_some() {
-                    if state.consumed {
-                        bail!("review action for this revision was already consumed");
+                    .map_err(|_| anyhow!("review writer lock poisoned"))?;
+                let candidate = {
+                    let state = channel
+                        .state
+                        .lock()
+                        .map_err(|_| anyhow!("review state lock poisoned"))?;
+                    if state.revision != revision {
+                        bail!(
+                            "stale review revision {revision}; current revision is {}",
+                            state.revision
+                        );
                     }
-                    state.consumed = true;
-                    state.status = "consumed".to_owned();
-                    state
-                        .audit
-                        .push(json!({"event":"waiter_consumed","revision":revision}));
-                    save_review(&channel.root_dir, &state)?;
+                    if state.action.is_some() {
+                        if state.consumed {
+                            bail!("review action for this revision was already consumed");
+                        }
+                        let mut consumed = state.clone();
+                        consumed.consumed = true;
+                        consumed.status = "consumed".to_owned();
+                        consumed
+                            .audit
+                            .push(json!({"event":"waiter_consumed","revision":revision}));
+                        Some(consumed)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(consumed) = candidate {
+                    // Keep the same review-writer -> render-lease order as
+                    // draft and submit. The state mutex itself is not held
+                    // during either lease acquisition or filesystem IO.
+                    let _render_lock = acquire_editor_render_lock(&channel.root_dir)?;
+                    save_review_unlocked(&channel.root_dir, &consumed)?;
+                    {
+                        let mut state = channel
+                            .state
+                            .lock()
+                            .map_err(|_| anyhow!("review state lock poisoned"))?;
+                        // The consume mutex prevents another waiter from
+                        // changing this revision. Keep this guard anyway so a
+                        // future state writer cannot silently overwrite a
+                        // newer action after the disk commit.
+                        if state.revision != revision
+                            || state.review_session_id != consumed.review_session_id
+                            || state.action != consumed.action
+                        {
+                            bail!("review changed while consuming revision {revision}");
+                        }
+                        *state = consumed.clone();
+                    }
                     Some(serde_json::json!({
-                        "review_session_id": state.review_session_id,
-                        "revision": state.revision,
-                        "action": state.action,
-                        "feedback": state.feedback,
-                        "approved_pages": state.approved_pages,
+                        "review_session_id": consumed.review_session_id,
+                        "revision": consumed.revision,
+                        "action": consumed.action,
+                        "feedback": consumed.feedback,
+                        "approved_pages": consumed.approved_pages,
                         "artifact_paths": [channel.root_dir.display().to_string()],
                         "review_path": review_file(&channel.root_dir),
                     }))
@@ -1442,16 +1750,36 @@ async fn wait_for_review_via_file(
                     );
                 }
                 if state.action.is_some() {
-                    let mut consumed = state.clone();
-                    if consumed.consumed {
+                    // The first read is only a readiness check. Acquire the
+                    // cross-process writer lease, reread review.json, and
+                    // compare the revision/action before consuming. Two
+                    // native waiters can otherwise both observe consumed=false
+                    // and publish duplicate consumption records.
+                    let _render_lock = acquire_editor_render_lock(&root_dir)?;
+                    let current = read_review(&root_dir)
+                        .ok_or_else(|| anyhow!("review state disappeared while consuming"))?;
+                    if current.revision != revision {
+                        bail!(
+                            "stale review revision {revision}; current revision is {}",
+                            current.revision
+                        );
+                    }
+                    if current.action.is_none() {
+                        continue;
+                    }
+                    if current.consumed {
                         bail!("review action for this revision was already consumed");
                     }
+                    let mut consumed = current;
                     consumed.consumed = true;
                     consumed.status = "consumed".to_owned();
                     consumed
                         .audit
                         .push(json!({"event":"waiter_consumed","revision":revision}));
-                    let _ = save_review(&root_dir, &consumed);
+                    // Do not report the action as consumed until both review
+                    // files are durably written. A transient disk failure
+                    // leaves the original review available for a retry.
+                    save_review_unlocked(&root_dir, &consumed)?;
                     return Ok(serde_json::json!({
                         "review_session_id": consumed.review_session_id,
                         "revision": consumed.revision,
@@ -1598,6 +1926,35 @@ pub fn render_editor_page(
     state: &Value,
     index: usize,
 ) -> Result<Value> {
+    // Recheck state only after acquiring the cross-process writer lease. The
+    // native worker may otherwise validate an old revision, wait behind an
+    // export, and overwrite the newer project snapshot on writeback.
+    let _render_lock = acquire_editor_render_lock(root_dir)?;
+    let session = editor_render_session(root_dir, image_path, state)?;
+    render_page(&session, state, index)
+}
+
+/// Render while the caller already owns the job render lock (operation-wide
+/// approval lease). No lock is acquired here; see [`render_page_locked`].
+///
+/// The caller MUST hold the workflow render lock for `root_dir` across the
+/// whole operation. Intended for the approval pipeline only.
+pub fn render_editor_page_locked(
+    workflow: &crate::workflow::Workflow,
+    root_dir: &Path,
+    image_path: &Path,
+    state: &Value,
+    index: usize,
+) -> Result<Value> {
+    let session = editor_render_session(root_dir, image_path, state)?;
+    render_page_locked(workflow, &session, state, index)
+}
+
+fn editor_render_session(
+    root_dir: &Path,
+    image_path: &Path,
+    state: &Value,
+) -> Result<Arc<Session>> {
     if !root_dir.exists() {
         bail!(
             "editor job directory does not exist: {}",
@@ -1628,6 +1985,7 @@ pub fn render_editor_page(
                 consumed: false,
                 audit: Vec::new(),
             }),
+            consume_lock: Mutex::new(()),
             notify: Notify::new(),
             root_dir: root_dir.clone(),
         }),
@@ -1639,7 +1997,7 @@ pub fn render_editor_page(
     validate_state_for_session(session.server_owned_state, state)
         .context("invalid editor state")?;
     validate_project_paths(&session, state).context("invalid editor paths")?;
-    render_page(&session, state, index)
+    Ok(session)
 }
 
 /// Reconstruct the native editor's source allowlist from the server-owned
@@ -1659,10 +2017,8 @@ fn trusted_managed_source_paths(root_dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// Locate a `fukidashi-editor` executable to auto-spawn from the MCP server.
 ///
-/// Resolution order (mirrors `which` + sibling-binary detection from the plan):
-/// 1. `fukidashi-editor` / `fukidashi-editor.exe` on `PATH`.
-/// 2. A binary next to the currently running `fukidashi-mcp` executable
-///    (covers `target/release` and installed bundles).
+/// Resolution order prefers a version-matched companion editor beside the
+/// running MCP executable; `PATH` is only a fallback for external installs.
 pub fn find_editor_binary() -> Option<PathBuf> {
     let base = if cfg!(windows) {
         "fukidashi-editor.exe"
@@ -1670,16 +2026,18 @@ pub fn find_editor_binary() -> Option<PathBuf> {
         "fukidashi-editor"
     };
     let test_process = running_under_cargo_test();
-    if let Ok(found) = which::which(base)
-        && !(test_process && is_development_artifact(&found))
-    {
-        return Some(found);
-    }
     let sibling = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|parent| parent.join(base)))
         .filter(|candidate| candidate.is_file());
-    sibling.filter(|candidate| !(test_process && is_development_artifact(candidate)))
+    if let Some(sibling) =
+        sibling.filter(|candidate| !(test_process && is_development_artifact(candidate)))
+    {
+        return Some(sibling);
+    }
+    which::which(base)
+        .ok()
+        .filter(|candidate| !(test_process && is_development_artifact(candidate)))
 }
 
 fn is_development_artifact(path: &Path) -> bool {
@@ -1713,6 +2071,18 @@ pub fn build_corrected_clean_rgb(
         return Ok(base);
     }
     apply_correction_strokes(cleaned, strokes)
+}
+
+fn review_request_status(error: &anyhow::Error) -> u16 {
+    let text = error.to_string();
+    if text.contains("busy: another process owns")
+        || text.contains("timed out waiting for another process")
+        || text.contains("approval already running")
+    {
+        423
+    } else {
+        400
+    }
 }
 
 fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
@@ -1854,6 +2224,20 @@ fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
                 Ok(value) => value,
                 Err(_) => return respond(&mut stream, 400, "text/plain", b"invalid editor state"),
             };
+            // Hold the job lease across the revision check and both project
+            // persistence writes. Export can therefore never validate one
+            // state and package another while the browser save is in flight.
+            let _render_lock = match try_acquire_editor_render_lock(&session.root_dir) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    return respond(
+                        &mut stream,
+                        423,
+                        "text/plain; charset=utf-8",
+                        format!("managed editor is busy; retry: {error}").as_bytes(),
+                    );
+                }
+            };
             let current = match load_state(session) {
                 Ok(state) => state,
                 Err(_) => {
@@ -1928,7 +2312,15 @@ fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
                     "application/json; charset=utf-8",
                     &serde_json::to_vec(&review)?,
                 ),
-                Err(error) => respond(&mut stream, 400, "text/plain", error.to_string().as_bytes()),
+                Err(error) => {
+                    let status = review_request_status(&error);
+                    respond(
+                        &mut stream,
+                        status,
+                        "text/plain; charset=utf-8",
+                        error.to_string().as_bytes(),
+                    )
+                }
             }
         }
         ("POST", "review/submit") => {
@@ -1950,7 +2342,15 @@ fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
                         &serde_json::to_vec(&review)?,
                     )
                 }
-                Err(error) => respond(&mut stream, 400, "text/plain", error.to_string().as_bytes()),
+                Err(error) => {
+                    let status = review_request_status(&error);
+                    respond(
+                        &mut stream,
+                        status,
+                        "text/plain; charset=utf-8",
+                        error.to_string().as_bytes(),
+                    )
+                }
             }
         }
         ("POST", "render") => {
@@ -1968,6 +2368,20 @@ fn handle_connection(mut stream: TcpStream, session: &Session) -> Result<()> {
             let state = match normalize_editor_state(state) {
                 Ok(state) => state,
                 Err(_) => return respond(&mut stream, 400, "text/plain", b"invalid editor state"),
+            };
+            // Acquire before loading/checking state. A render that waits for
+            // export must revalidate against the state that export released,
+            // rather than writing back a stale snapshot afterwards.
+            let _render_lock = match try_acquire_editor_render_lock(&session.root_dir) {
+                Ok(lock) => lock,
+                Err(error) => {
+                    return respond(
+                        &mut stream,
+                        423,
+                        "text/plain; charset=utf-8",
+                        format!("managed editor is busy; retry: {error}").as_bytes(),
+                    );
+                }
             };
             let current = match load_state(session) {
                 Ok(state) => state,
@@ -2108,6 +2522,120 @@ pub(crate) fn bubble_has_renderer_report(bubble: &Value) -> bool {
         .any(|key| bubble.get(*key).is_some())
 }
 
+pub fn editor_global_font_request(state: &Value) -> Option<Option<&str>> {
+    let raw = state.get("font_path");
+    let path = raw
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty());
+    if state
+        .get("_editor_global_font_explicit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Some(path);
+    }
+    let marker = state.get("_editor_requested_global_font_path");
+    let previous = marker
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty());
+    if raw.is_some() && (marker.is_some() && path != previous || marker.is_none() && path.is_some())
+    {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+pub fn editor_page_font_path<'a>(state: &'a Value, page: &'a Value) -> Option<&'a str> {
+    if let Some(request) = editor_global_font_request(state) {
+        return request;
+    }
+    page.get("_editor_cached_global_font_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+}
+
+pub fn editor_page_render_signature(state: &Value, page: &Value) -> Value {
+    let mut page = page.clone();
+    if let Some(request) = editor_global_font_request(state) {
+        page["_editor_global_font_explicit"] = Value::Bool(true);
+        page["font_path"] = request.map(Value::from).unwrap_or(Value::Null);
+    }
+    page_render_signature(&page)
+}
+
+/// Post-render semantic signature: the signature of the page AFTER the
+/// render commit normalizes it (`synchronize_rendered_bubbles` sets
+/// `bubble_bbox = bbox`, which participates in the geometry identity).
+/// Render sidecars record this value as `qa.semantic_render_signature` so
+/// crash-gap recovery can prove a committed artifact corresponds to the
+/// frozen expected inputs instead of blessing any internally valid PNG.
+///
+/// Approval checkpoints and export verification MUST use this (not the raw
+/// pre-render signature) as the frozen expectation.
+pub fn post_render_page_signature(state: &Value, page: &Value) -> String {
+    let mut page = page.clone();
+    if let Some(bubbles) = page.get_mut("bubbles").and_then(Value::as_array_mut) {
+        for bubble in bubbles.iter_mut() {
+            let Some(object) = bubble.as_object_mut() else {
+                continue;
+            };
+            if let Some(bbox) = object.get("bbox").cloned() {
+                object.insert("bubble_bbox".to_owned(), bbox);
+            }
+        }
+    }
+    serde_json::to_string(&editor_page_render_signature(state, &page)).unwrap_or_default()
+}
+
+/// Build the canonical all-page document frozen by approval. The semantic
+/// render signature alone is insufficient for pages that happen to have the
+/// same content: the stable page id, order, source path, and rendered output
+/// association must travel with it so a reorder or swapped artifact changes
+/// the approval identity.
+pub fn approval_state_signature(state: &Value, root: Option<&Path>) -> Value {
+    fn path_identity(value: Option<&Value>, root: Option<&Path>) -> Value {
+        let Some(raw) = value.and_then(Value::as_str) else {
+            return Value::String(String::new());
+        };
+        let path = Path::new(raw);
+        let normalized = root
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path);
+        Value::String(normalized.to_string_lossy().into_owned())
+    }
+    let pages = state
+        .get("pages")
+        .and_then(Value::as_array)
+        .map(|pages| {
+            pages
+                .iter()
+                .enumerate()
+                .map(|(index, page)| {
+                    let page_id = page
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.trim().is_empty())
+                        .unwrap_or("");
+                    let source_path = path_identity(page.get("image_path"), root);
+                    let rendered_path = path_identity(page.get("rendered_image_path"), root);
+                    let semantic =
+                        serde_json::from_str::<Value>(&post_render_page_signature(state, page))
+                            .unwrap_or(Value::Null);
+                    serde_json::json!({
+                        "index": index,
+                        "page_id": page_id,
+                        "source_path": source_path,
+                        "rendered_path": rendered_path,
+                        "semantic": semantic,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(pages)
+}
+
 pub(crate) fn page_render_signature(page: &Value) -> Value {
     fn rect_signature(value: Option<&Value>) -> Value {
         value
@@ -2177,56 +2705,15 @@ pub(crate) fn page_render_signature(page: &Value) -> Value {
     }
 
     fn requested_font_path(bubble: &Value) -> Value {
-        let raw = bubble
-            .get("font_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty());
-        let Some(raw) = raw else {
-            return Value::Null;
-        };
-        if bubble
-            .get("_editor_requested_font_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty())
-            .is_some()
-        {
-            return editor_requested_font_path(bubble)
-                .map(|path| Value::String(path.to_owned()))
-                .unwrap_or(Value::Null);
-        }
-        // An editor-render payload uses the resolved path required by the
-        // typesetter. Without the private request marker it is legacy report
-        // state, so treating it as an operator font edit would dirty every
-        // reopened page after fallback selection changed.
-        if has_renderer_report(bubble) && !crate::workflow::is_generic_desktop_font(Path::new(raw))
-        {
-            return Value::Null;
-        }
-        bubble
-            .get("requested_font_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty())
-            .map(|path| Value::String(path.to_owned()))
-            .unwrap_or_else(|| Value::String(raw.to_owned()))
+        editor_requested_font_path(bubble)
+            .map(Value::from)
+            .unwrap_or(Value::Null)
     }
 
     fn requested_page_font_path(page: &Value) -> Value {
-        let raw = page
-            .get("font_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty());
-        if let Some(raw) = raw {
-            if let Some(path) = page
-                .get("_editor_requested_global_font_path")
-                .and_then(Value::as_str)
-                .filter(|path| !path.trim().is_empty())
-                && path == raw
-            {
-                return Value::String(path.to_owned());
-            }
-            return Value::String(raw.to_owned());
-        }
-        Value::Null
+        editor_page_font_path(page, page)
+            .map(Value::from)
+            .unwrap_or(Value::Null)
     }
 
     fn requested_array(bubble: &Value, key: &str, marker: &str) -> Value {
@@ -2424,9 +2911,9 @@ pub(crate) fn page_render_signature(page: &Value) -> Value {
         .get("bubbles")
         .and_then(Value::as_array)
         .is_some_and(|bubbles| {
-            bubbles
-                .iter()
-                .any(|bubble| !bubble_preserve_for_render(bubble))
+            bubbles.iter().any(|bubble| {
+                !bubble_preserve_for_render(bubble) && editor_requested_font_path(bubble).is_none()
+            })
         });
     json!({
         "font_path": if uses_font {
@@ -2913,38 +3400,44 @@ fn migrate_legacy_bubble_ids(page: &mut Value, saved_bubbles: &mut [Value], page
     }
 }
 
-fn merge_saved_edits(base: &mut Value, saved: &Value) {
+pub(crate) fn merge_saved_edits(base: &mut Value, saved: &Value) {
     if let Some(revision) = saved.get("state_revision").and_then(Value::as_u64) {
         set_state_revision(base, revision);
     }
-    let global_font_changed = saved.get("font_path").is_some_and(|saved_font_path| {
-        let old = base
-            .get("font_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty());
-        let new = saved_font_path
-            .as_str()
-            .filter(|path| !path.trim().is_empty());
-        old != new
-    });
-    if let (Some(base_object), Some(saved_font_path)) =
-        (base.as_object_mut(), saved.get("font_path"))
+    let saved_request = editor_global_font_request(saved);
+    let explicit_saved = saved
+        .get("_editor_global_font_explicit")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let historical_match = !explicit_saved
+        && saved.get("_editor_requested_global_font_path").is_none()
+        && saved_request.flatten().is_some_and(|path| {
+            base.get("pages")
+                .and_then(Value::as_array)
+                .is_some_and(|pages| {
+                    pages.iter().any(|page| {
+                        page.get("_editor_cached_global_font_path")
+                            .and_then(Value::as_str)
+                            == Some(path)
+                    })
+                })
+        });
+    let saved_clear = saved.get("font_path").is_some_and(Value::is_null)
+        && editor_global_font_request(base).is_some();
+    if !historical_match
+        && let Some(request) = saved_request.or_else(|| saved_clear.then_some(None))
+        && let Some(object) = base.as_object_mut()
     {
-        base_object.insert("font_path".to_owned(), saved_font_path.clone());
-        if saved_font_path
-            .as_str()
-            .is_some_and(|path| !path.trim().is_empty())
-        {
-            // The public top-level path is the operator's global request. A
-            // stale private marker must never conceal a changed saved value.
-            base_object.insert(
-                "_editor_requested_global_font_path".to_owned(),
-                saved_font_path.clone(),
-            );
-        } else {
-            base_object.remove("_editor_requested_global_font_path");
-        }
+        let value = request.map(Value::from).unwrap_or(Value::Null);
+        object.insert("font_path".to_owned(), value.clone());
+        object.insert("_editor_global_font_explicit".to_owned(), Value::Bool(true));
+        object.insert("_editor_requested_global_font_path".to_owned(), value);
     }
+    let font_state = json!({
+        "font_path": base.get("font_path"),
+        "_editor_global_font_explicit": base.get("_editor_global_font_explicit"),
+        "_editor_requested_global_font_path": base.get("_editor_requested_global_font_path"),
+    });
     let Some(base_pages) = base.get_mut("pages").and_then(Value::as_array_mut) else {
         return;
     };
@@ -3075,6 +3568,7 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                         "_editor_requested_max_font_size",
                         "reading_order",
                         "flagged",
+                        "retranslate_requested",
                         "problem",
                         "flag_reason",
                         "problem_reason",
@@ -3118,20 +3612,30 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                         .and_then(Value::as_str)
                         .filter(|path| !path.trim().is_empty());
                     if let Some(saved_font_path) = saved_font_path {
-                        let saved_marker = saved_bubble
-                            .get("_editor_requested_font_path")
-                            .and_then(Value::as_str)
-                            .filter(|path| !path.trim().is_empty());
-                        let marker = saved_marker.filter(|_| {
-                            !crate::workflow::is_generic_desktop_font(Path::new(saved_font_path))
-                                && (base_font_path.as_deref() == Some(saved_font_path)
-                                    || base_rendered_font_path.as_deref() == Some(saved_font_path))
-                                && bubble_has_renderer_report(&Value::Object(saved_bubble.clone()))
-                        });
-                        base_bubble_object.insert(
-                            "_editor_requested_font_path".to_owned(),
-                            Value::String(marker.unwrap_or(saved_font_path).to_owned()),
-                        );
+                        if saved_bubble.contains_key("_editor_requested_font_path") {
+                            let requested =
+                                editor_requested_font_path(&Value::Object(saved_bubble.clone()))
+                                    .map(str::to_owned);
+                            base_bubble_object.insert(
+                                "_editor_requested_font_path".to_owned(),
+                                requested.map(Value::from).unwrap_or(Value::Null),
+                            );
+                        } else if bubble_has_renderer_report(&Value::Object(saved_bubble.clone()))
+                            && (base_font_path.as_deref() == Some(saved_font_path)
+                                || base_rendered_font_path.as_deref() == Some(saved_font_path))
+                            && !crate::workflow::is_generic_desktop_font(Path::new(saved_font_path))
+                        {
+                            base_bubble_object.remove("_editor_requested_font_path");
+                        } else if base_font_path.as_deref() != Some(saved_font_path)
+                            && base_rendered_font_path.as_deref() != Some(saved_font_path)
+                        {
+                            base_bubble_object.insert(
+                                "_editor_requested_font_path".to_owned(),
+                                Value::String(saved_font_path.to_owned()),
+                            );
+                        } else {
+                            base_bubble_object.remove("_editor_requested_font_path");
+                        }
                     } else {
                         base_bubble_object.remove("_editor_requested_font_path");
                     }
@@ -3197,16 +3701,8 @@ fn merge_saved_edits(base: &mut Value, saved: &Value) {
                 *base_bubbles = ordered;
             }
         }
-        let uses_font = base_page
-            .get("bubbles")
-            .and_then(Value::as_array)
-            .is_some_and(|bubbles| {
-                bubbles
-                    .iter()
-                    .any(|bubble| !bubble_preserve_for_render(bubble))
-            });
-        let render_dirty = page_render_signature(base_page) != baseline_signature
-            || (global_font_changed && uses_font);
+        let render_dirty =
+            editor_page_render_signature(&font_state, base_page) != baseline_signature;
         if let Some(base_object) = base_page.as_object_mut() {
             base_object.insert("render_dirty".to_owned(), Value::Bool(render_dirty));
         }
@@ -3276,8 +3772,9 @@ fn bubble_preserve_for_render(bubble: &Value) -> bool {
 fn manual_source_repair_regions(
     bubbles: &[Value],
     removed_ids: &std::collections::HashSet<String>,
+    replaced_handoff_ids: &std::collections::BTreeSet<String>,
 ) -> Vec<Rect> {
-    bubbles
+    let mut regions = bubbles
         .iter()
         .filter(|bubble| {
             let id = bubble.get("id").and_then(Value::as_str);
@@ -3306,7 +3803,99 @@ fn manual_source_repair_regions(
                 .and_then(|value| serde_json::from_value::<Rect>(value).ok())
                 .and_then(|rect| rect.validate().ok())
         })
+        .collect::<Vec<_>>();
+    for bubble in bubbles.iter().filter(|bubble| {
+        bubble
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| replaced_handoff_ids.contains(id))
+    }) {
+        let Some(rect) = bubble
+            .get("bbox")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<Rect>(value).ok())
+            .and_then(|rect| rect.validate().ok())
+        else {
+            continue;
+        };
+        if !regions.iter().any(|region| rects_match(*region, rect)) {
+            regions.push(rect);
+        }
+    }
+    regions
+}
+
+/// A translated manual box with the same source text and overlapping geometry
+/// replaces a source-preserved detector bubble. Without this, render cleanup
+/// is undone by the preserve-source restoration pass and the original text is
+/// drawn over the operator's replacement.
+fn manually_replaced_preserved_bubble_ids(
+    bubbles: &[Value],
+    removed_ids: &std::collections::HashSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let manual_replacements = bubbles
+        .iter()
+        .filter(|bubble| {
+            bubble
+                .get("manual")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && !bubble_preserve_for_render(bubble)
+                && bubble
+                    .get("translation")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
+        })
+        .filter_map(|bubble| {
+            let source = bubble
+                .get("source_text")
+                .and_then(Value::as_str)
+                .map(editor_source_text_key)
+                .filter(|text| !text.is_empty())?;
+            let rect = bubble
+                .get("bbox")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Rect>(value).ok())
+                .and_then(|rect| rect.validate().ok())?;
+            Some((source, rect))
+        })
+        .collect::<Vec<_>>();
+    bubbles
+        .iter()
+        .filter_map(|bubble| {
+            let id = bubble.get("id").and_then(Value::as_str)?;
+            if removed_ids.contains(id) || !bubble_preserve_for_render(bubble) {
+                return None;
+            }
+            let source = bubble
+                .get("source_text")
+                .and_then(Value::as_str)
+                .map(editor_source_text_key)
+                .filter(|text| !text.is_empty())?;
+            let rect = bubble
+                .get("bbox")
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Rect>(value).ok())
+                .and_then(|rect| rect.validate().ok())?;
+            manual_replacements
+                .iter()
+                .any(|(replacement_source, replacement_rect)| {
+                    source == *replacement_source && rects_overlap(rect, *replacement_rect)
+                })
+                .then(|| id.to_owned())
+        })
         .collect()
+}
+
+fn editor_source_text_key(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn rects_overlap(left: Rect, right: Rect) -> bool {
+    left.x1 < right.x2 && right.x1 < left.x2 && left.y1 < right.y2 && right.y1 < left.y2
 }
 
 fn rects_match(left: Rect, right: Rect) -> bool {
@@ -3400,7 +3989,7 @@ fn editor_text_bbox(bubble: &Value, bbox: Rect) -> Result<Option<Rect>> {
         .map_err(Into::into)
 }
 
-fn editor_requested_font_path(bubble: &Value) -> Option<&str> {
+pub(crate) fn editor_requested_font_path(bubble: &Value) -> Option<&str> {
     let current = bubble
         .get("font_path")
         .and_then(Value::as_str)
@@ -3423,6 +4012,19 @@ fn editor_requested_font_path(bubble: &Value) -> Option<&str> {
         return None;
     };
     let Some(marker) = marker else {
+        if bubble.get("_editor_requested_font_path").is_some() {
+            let cached = bubble
+                .get("_editor_cached_font_path")
+                .and_then(Value::as_str);
+            return if cached.is_some_and(|cached| cached != current)
+                && rendered != Some(current)
+                && resolved != Some(current)
+            {
+                Some(current)
+            } else {
+                None
+            };
+        }
         if bubble_has_renderer_report(bubble)
             && !crate::workflow::is_generic_desktop_font(Path::new(current))
         {
@@ -3497,14 +4099,27 @@ fn synchronize_rendered_bubbles(page: &mut Value) {
 }
 
 fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> {
-    let cleaned = page_image_path(session, state, index, "cleaned", true)?;
-    let source_image = page_image_path(session, state, index, "source", true)?;
     let jobs_root = session
         .root_dir
         .parent()
         .ok_or_else(|| anyhow!("editor job has no jobs root"))?;
     let workflow = crate::workflow::Workflow::new(jobs_root.to_path_buf())?;
     let _render_lock = workflow.acquire_render_lock(&session.root_dir)?;
+    render_page_locked(&workflow, session, state, index)
+}
+
+/// Render a page while the caller already owns the job render lock (the
+/// operation-wide approval lease). This performs NO lock operations itself,
+/// so per-page renders under an outer lease neither deadlock nor release the
+/// writer exclusion between pages (Blocker 4).
+fn render_page_locked(
+    workflow: &crate::workflow::Workflow,
+    session: &Session,
+    state: &Value,
+    index: usize,
+) -> Result<Value> {
+    let mut cleaned = page_image_path(session, state, index, "cleaned", true)?;
+    let source_image = page_image_path(session, state, index, "source", true)?;
     let mut base_clean = workflow.validate_clean_input(&cleaned)?;
     let page = state
         .get("pages")
@@ -3530,7 +4145,22 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         .filter_map(removed_bubble_id)
         .map(str::to_owned)
         .collect();
-    let manual_regions = manual_source_repair_regions(bubbles, &removed_ids);
+    let mut replaced_handoff_ids = manually_replaced_preserved_bubble_ids(bubbles, &removed_ids);
+    replaced_handoff_ids.extend(
+        bubbles
+            .iter()
+            .filter(|bubble| {
+                bubble
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|id| !removed_ids.contains(id))
+            })
+            .filter_map(|bubble| bubble.get("replaces_handoff_ids").and_then(Value::as_array))
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned),
+    );
+    let manual_regions = manual_source_repair_regions(bubbles, &removed_ids, &replaced_handoff_ids);
     if !manual_regions.is_empty() {
         // A newly added editor bubble may cover prose that the detector missed.
         // Clean those source pixels through the same managed LaMa crop path
@@ -3587,6 +4217,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             "editor-manual",
         )?;
         base_clean = workflow.validate_clean_input(&cleaned_path)?;
+        cleaned = base_clean.cleaned_image.clone();
     }
     let preserved_bubbles = bubbles
         .iter()
@@ -3594,7 +4225,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             bubble
                 .get("id")
                 .and_then(Value::as_str)
-                .is_none_or(|id| !removed_ids.contains(id))
+                .is_none_or(|id| !removed_ids.contains(id) && !replaced_handoff_ids.contains(id))
         })
         .filter(|bubble| bubble_preserve_for_render(bubble))
         .cloned()
@@ -3636,7 +4267,8 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         let derived = workflow.write_derived_clean_artifact(&base_clean, &output, &corrected)?;
         (derived.cleaned_image, Some(output))
     };
-    let global_font = state.get("font_path").and_then(Value::as_str);
+    let explicit_global = editor_global_font_request(state).is_some();
+    let global_font = editor_page_font_path(state, page.unwrap_or(state));
     let mut fallback_font_paths = Vec::new();
     for bubble in bubbles {
         fallback_font_paths.extend(editor_requested_fallback_font_paths(bubble));
@@ -3670,7 +4302,8 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
     let mut payloads = Vec::with_capacity(bubbles.len());
     for (bubble_index, bubble) in bubbles.iter().enumerate() {
         let bubble_id = bubble.get("id").and_then(Value::as_str);
-        if bubble_id.is_some_and(|id| removed_ids.contains(id)) {
+        if bubble_id.is_some_and(|id| removed_ids.contains(id) || replaced_handoff_ids.contains(id))
+        {
             continue;
         }
         let bbox: Rect = serde_json::from_value(
@@ -3713,6 +4346,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
                 padding: editor_requested_padding(bubble),
                 text,
                 font_path: None,
+                requested_font_path: None,
                 min_font_size: None,
                 max_font_size: None,
                 text_color: bubble
@@ -3733,6 +4367,17 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         }
         let requested_font_path = editor_requested_font_path(bubble)
             .or(global_font)
+            .or_else(|| {
+                if explicit_global {
+                    None
+                } else {
+                    bubble
+                        .get("_editor_cached_font_path")
+                        .and_then(Value::as_str)
+                        .filter(|path| !path.trim().is_empty())
+                        .filter(|_| bubble.get("font_path").and_then(Value::as_str).is_some())
+                }
+            })
             .filter(|path| !path.trim().is_empty());
         let (font_path, substitution_reason) = match requested_font_path {
             Some(path) if crate::workflow::is_generic_desktop_font(std::path::Path::new(path)) => (
@@ -3781,6 +4426,7 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             padding: editor_requested_padding(bubble),
             text,
             font_path: Some(font_path.display().to_string()),
+            requested_font_path: editor_requested_font_path(bubble).map(str::to_owned),
             min_font_size: Some(min_font_size),
             max_font_size: Some(max_font_size),
             text_color: bubble
@@ -3814,7 +4460,6 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             request_object.insert("_editor_render_payload".to_owned(), Value::Bool(true));
             if let Some(source_bubble) = source_bubble {
                 for key in [
-                    "_editor_requested_font_path",
                     "_editor_requested_fallback_font_paths",
                     "_editor_font_size_override",
                     "_editor_padding_override",
@@ -3903,11 +4548,21 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
         }),
         json!({
             "editor_render": true,
-            "global_font_path": state
-                .get("_editor_requested_global_font_path")
-                .or_else(|| state.get("font_path"))
-                .cloned()
+            "global_font_path": global_font
+                .map(Value::from)
                 .unwrap_or(Value::Null),
+            "requested_global_font_path": if explicit_global {
+                state.get("font_path").cloned().unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            },
+            // Crash-gap recovery proof: the post-commit semantic signature of
+            // this exact render. A restart promotes the artifact without
+            // rerendering only when this equals the frozen expectation.
+            "semantic_render_signature": post_render_page_signature(
+                state,
+                page.unwrap_or(&Value::Null),
+            ),
             // Keep the actual stroke semantics beside the render artifact so
             // approval can verify a reopened page without blindly rerendering
             // every page that ever used the brush. The count remains useful
@@ -3915,6 +4570,11 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             "correction_strokes": strokes,
             "correction_stroke_count": strokes.len(),
             "removed_bubbles": removed_bubbles,
+            "replaced_handoff_ids": replaced_handoff_ids,
+            "issues": page
+                .and_then(|page| page.get("issues"))
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new())),
         }),
     )?;
     let mut saved_state = state.clone();
@@ -3945,6 +4605,8 @@ fn render_page(session: &Session, state: &Value, index: usize) -> Result<Value> 
             .get("warnings")
             .cloned()
             .unwrap_or_else(|| Value::Array(Vec::new()));
+        page["_editor_cached_global_font_path"] =
+            global_font.map(Value::from).unwrap_or(Value::Null);
     }
     validate_state_for_session(session.server_owned_state, &saved_state)?;
     atomic_json_save(&session.state_path, &saved_state)?;
@@ -4112,6 +4774,7 @@ fn respond(stream: &mut TcpStream, code: u16, content_type: &str, body: &[u8]) -
         403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
+        423 => "Locked",
         _ => "Error",
     };
     write!(
@@ -4174,7 +4837,16 @@ fn validate_state_with_limit(value: &Value, max_json: usize) -> Result<()> {
     visit(value)
 }
 
-fn atomic_json_save(path: &Path, value: &Value) -> Result<()> {
+pub fn atomic_json_save(path: &Path, value: &Value) -> Result<()> {
+    let _render_lock = path
+        .parent()
+        .map(acquire_editor_render_lock)
+        .transpose()?
+        .flatten();
+    atomic_json_save_unlocked(path, value)
+}
+
+fn atomic_json_save_unlocked(path: &Path, value: &Value) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("state path has no parent"))?;
@@ -4232,6 +4904,73 @@ mod tests {
     }
 
     type TestLauncher = Arc<dyn Fn(&Path, &str, u64, &Path, &Path) -> Result<Child> + Send + Sync>;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn review_wait_keeps_action_available_when_consumption_persist_fails() {
+        let dir = tempdir().unwrap();
+        // A directory at the destination makes the atomic review rename fail
+        // after the in-memory candidate has been prepared.
+        fs::create_dir(dir.path().join(REVIEW_FILE)).unwrap();
+        let review = ReviewState {
+            review_session_id: "wait-persist-failure".to_owned(),
+            revision: 3,
+            status: "approved".to_owned(),
+            action: Some("approve_export".to_owned()),
+            feedback: Vec::new(),
+            approved_pages: vec![0],
+            consumed: false,
+            audit: Vec::new(),
+        };
+        let channel = Arc::new(ReviewChannel {
+            state: Mutex::new(review),
+            consume_lock: Mutex::new(()),
+            notify: Notify::new(),
+            root_dir: dir.path().to_path_buf(),
+        });
+
+        let error = wait_for_review_via_channel(channel.clone(), 3, 1)
+            .await
+            .expect_err("failed review persistence must be reported");
+        assert!(!error.to_string().is_empty());
+        assert!(!channel.state.lock().unwrap().consumed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_review_wait_consumes_one_action_under_the_render_lease() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        fs::write(root.join("job.json"), b"{}").unwrap();
+        let session = "file-wait-single-consumer";
+        let review = ReviewState {
+            review_session_id: session.to_owned(),
+            revision: 4,
+            status: "approved".to_owned(),
+            action: Some("approve_export".to_owned()),
+            feedback: Vec::new(),
+            approved_pages: vec![0],
+            consumed: false,
+            audit: Vec::new(),
+        };
+        save_review(&root, &review).unwrap();
+        track_editor_root(&root);
+
+        let first = tokio::spawn(wait_for_review_via_file(session, 4, 2));
+        let second = tokio::spawn(wait_for_review_via_file(session, 4, 2));
+        let (first, second) = tokio::join!(first, second);
+        let results = [first.unwrap(), second.unwrap()];
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+        let persisted = read_review(&root).unwrap();
+        assert!(persisted.consumed);
+        assert_eq!(
+            persisted
+                .audit
+                .iter()
+                .filter(|event| event["event"] == "waiter_consumed")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn managed_reentrant_native_editor_reuses_one_child_and_revision() {
@@ -4355,6 +5094,33 @@ mod tests {
     }
 
     #[test]
+    fn managed_project_writer_waits_for_export_lease_before_persisting() {
+        let (dir, _image_path, _state) = test_managed_job();
+        let holder = acquire_editor_render_lock(dir.path()).unwrap().unwrap();
+        let project_path = dir.path().join("project.json");
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let writer_path = project_path.clone();
+        let writer = thread::spawn(move || {
+            atomic_json_save(&writer_path, &json!({"state_revision": 1}))
+                .expect("managed writer should finish after the lease releases");
+            ready_tx.send(()).unwrap();
+        });
+
+        // The writer is an independent thread in this process, so it must
+        // contend on the same filesystem lease rather than taking the
+        // thread-local reentrant path.
+        assert!(ready_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert!(!project_path.exists());
+        drop(holder);
+        ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("writer did not proceed after export lease release");
+        writer.join().unwrap();
+        let saved: Value = serde_json::from_slice(&fs::read(project_path).unwrap()).unwrap();
+        assert_eq!(saved["state_revision"], 1);
+    }
+
+    #[test]
     fn correction_strokes_cover_and_restore_clean_pixels() {
         let dir = tempdir().unwrap();
         let clean = dir.path().join("clean.png");
@@ -4401,6 +5167,7 @@ mod tests {
                 }),
             ],
             &removed,
+            &std::collections::BTreeSet::new(),
         );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].x1, 2.0);
@@ -4482,6 +5249,19 @@ mod tests {
                 .contains("const renderState=JSON.stringify({page_index:renderPageIndex,state})")
         );
         assert!(EDITOR_HTML.contains("e.status===409"));
+        assert!(EDITOR_HTML.contains("e.status===423"));
+    }
+
+    #[test]
+    fn review_busy_errors_use_locked_response_without_becoming_stale() {
+        assert_eq!(
+            review_request_status(&anyhow!("busy: another process owns render job")),
+            423
+        );
+        assert_eq!(
+            review_request_status(&anyhow!("invalid review feedback")),
+            400
+        );
     }
 
     #[test]
@@ -4733,6 +5513,30 @@ mod tests {
     }
 
     #[test]
+    fn approval_state_signature_binds_page_identity_order_and_paths() {
+        let root = PathBuf::from(r"C:\jobs\book");
+        let first = json!({
+            "pages": [
+                {"id":"same-a", "image_path":r"C:\jobs\book\source\001.png", "rendered_image_path":r"C:\jobs\book\pages\001\rendered.png", "bubbles":[]},
+                {"id":"same-b", "image_path":r"C:\jobs\book\source\002.png", "rendered_image_path":r"C:\jobs\book\pages\002\rendered.png", "bubbles":[]}
+            ]
+        });
+        let mut swapped = first.clone();
+        swapped["pages"] = json!([first["pages"][1].clone(), first["pages"][0].clone()]);
+        let mut output_swapped = first.clone();
+        output_swapped["pages"][0]["rendered_image_path"] =
+            json!(r"C:\jobs\book\pages\002\rendered.png");
+        assert_ne!(
+            approval_state_signature(&first, Some(&root)),
+            approval_state_signature(&swapped, Some(&root))
+        );
+        assert_ne!(
+            approval_state_signature(&first, Some(&root)),
+            approval_state_signature(&output_swapped, Some(&root))
+        );
+    }
+
+    #[test]
     fn render_signature_uses_semantic_inputs_and_ignores_report_layout() {
         let mut saved = json!({
             "render_dirty": true,
@@ -4902,6 +5706,83 @@ mod tests {
         let mut same = bubble.clone();
         same["font_path"] = json!("fonts/old.ttf");
         assert_eq!(editor_requested_font_path(&same), Some("fonts/old.ttf"));
+    }
+
+    #[test]
+    fn render_font_selection_prefers_explicit_bubble_then_global_then_cached() {
+        fn selected_font(
+            state: &serde_json::Value,
+            page: &serde_json::Value,
+            bubble: &serde_json::Value,
+        ) -> Option<String> {
+            let global_font = editor_page_font_path(state, page);
+            crate::editor::editor_requested_font_path(bubble)
+                .or(global_font)
+                .map(str::to_owned)
+        }
+        let inherited = json!({
+            "id": "bubble-1",
+            "translation": "dịch",
+            "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
+            "font_path": "fonts/historical-a.ttf",
+            "rendered_font_path": "fonts/historical-a.ttf",
+            "resolved_font_path": "fonts/historical-a.ttf",
+            "input_bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8}
+        });
+        let explicit = json!({
+            "id": "bubble-2",
+            "translation": "dịch",
+            "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
+            "font_path": "fonts/explicit-x.ttf",
+            "_editor_requested_font_path": "fonts/explicit-x.ttf",
+            "rendered_font_path": "fonts/explicit-x.ttf",
+            "resolved_font_path": "fonts/explicit-x.ttf",
+            "input_bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8}
+        });
+        // Renderer report metadata alone never manufactures bubble intent.
+        assert_eq!(editor_requested_font_path(&inherited), None);
+        assert_eq!(
+            editor_requested_font_path(&explicit),
+            Some("fonts/explicit-x.ttf")
+        );
+        // Historical global A with no operator change: brush-only rerender
+        // keeps using the page-local cached baseline.
+        let state = json!({"font_path": Value::Null});
+        let page = json!({"_editor_cached_global_font_path": "fonts/historical-a.ttf"});
+        assert_eq!(
+            selected_font(&state, &page, &inherited),
+            Some("fonts/historical-a.ttf".to_owned())
+        );
+        assert_eq!(
+            selected_font(&state, &page, &explicit),
+            Some("fonts/explicit-x.ttf".to_owned())
+        );
+        // Operator changes global A -> B: inherited follows, explicit stays.
+        let changed = json!({
+            "font_path": "fonts/global-b.ttf",
+            "_editor_requested_global_font_path": "fonts/global-b.ttf",
+            "_editor_global_font_explicit": true
+        });
+        assert_eq!(
+            selected_font(&changed, &page, &inherited),
+            Some("fonts/global-b.ttf".to_owned())
+        );
+        assert_eq!(
+            selected_font(&changed, &page, &explicit),
+            Some("fonts/explicit-x.ttf".to_owned())
+        );
+        // Explicit clear: inherited falls back to no primary (bundled
+        // default), explicit bubble still wins.
+        let cleared = json!({
+            "font_path": Value::Null,
+            "_editor_requested_global_font_path": Value::Null,
+            "_editor_global_font_explicit": true
+        });
+        assert_eq!(selected_font(&cleared, &page, &inherited), None);
+        assert_eq!(
+            selected_font(&cleared, &page, &explicit),
+            Some("fonts/explicit-x.ttf".to_owned())
+        );
     }
 
     #[test]
@@ -5311,5 +6192,40 @@ mod tests {
         assert!(!is_development_artifact(Path::new(
             "C:/Users/me/AppData/Local/Fukidashi/bin/fukidashi-editor.exe"
         )));
+    }
+
+    #[test]
+    fn font_provenance_scenario_5_explicit_bubble_font_override_survives_save_reopen() {
+        let mut base = json!({
+            "state_revision": 0,
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{
+                    "id": "bubble-1",
+                    "text": "Dialogue",
+                    "font_path": "fonts/cached-global.ttf",
+                    "_editor_requested_font_path": null
+                }]
+            }]
+        });
+        let saved = json!({
+            "pages": [{
+                "id": "page-1",
+                "bubbles": [{
+                    "id": "bubble-1",
+                    "font_path": "fonts/explicit-override.ttf",
+                    "_editor_requested_font_path": "fonts/explicit-override.ttf"
+                }]
+            }]
+        });
+        merge_saved_edits(&mut base, &saved);
+        assert_eq!(
+            base["pages"][0]["bubbles"][0]["_editor_requested_font_path"],
+            json!("fonts/explicit-override.ttf")
+        );
+        assert_eq!(
+            base["pages"][0]["bubbles"][0]["font_path"],
+            json!("fonts/explicit-override.ttf")
+        );
     }
 }

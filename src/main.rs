@@ -28,13 +28,13 @@ struct Cli {
 }
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Install the native MCP engine and configure detected clients.
+    /// Install the native MCP engine and configure every supported client.
     #[command(alias = "setup")]
     Install {
-        /// One or more clients to configure. Omit to auto-detect.
+        /// One or more clients to configure. Omit to configure every supported client.
         #[arg(long, value_enum, value_delimiter = ',')]
         client: Vec<Client>,
-        /// Configure every supported client, even when it is not detected.
+        /// Configure every supported client explicitly (the default behavior).
         #[arg(long)]
         all: bool,
     },

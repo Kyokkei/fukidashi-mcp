@@ -146,7 +146,7 @@ Prefer a completely offline pipeline with zero network requests? Wire **local LL
    * **No Administrator rights required** (`PrivilegesRequired=lowest`).
    * Choose any drive (`D:\`, `E:\`) to keep your `C:\` drive clean.
    * Hit **Next ➔ Next ➔ Finish**.
-3. The installer provisions all pre-trained ONNX models (~470MB) and automatically wires Fukidashi into detected AI clients.
+3. The installer provisions all pre-trained ONNX models (~470MB) and automatically wires Fukidashi into every supported AI client.
 
 ### 🐧 Linux & macOS (From Source)
 
@@ -156,8 +156,8 @@ git clone https://github.com/Kyokkei/fukidashi-mcp.git
 cd fukidashi-mcp
 cargo build --release --features editor
 
-# 2. Auto-wire into all detected AI clients
-./target/release/fukidashi-mcp install --all
+# 2. Auto-wire into every supported AI client
+./target/release/fukidashi-mcp install
 ```
 
 ---
@@ -174,7 +174,101 @@ Fukidashi provides native auto-wiring across all major developer and consumer AI
 | **Claude Desktop** | Native Desktop App | ✅ `%APPDATA%\Claude\claude_desktop_config.json` |
 | **Cursor** | AI Code Editor | ✅ `~/.cursor/mcp.json` |
 | **VS Code** | Copilot / MCP Extension | ✅ `Code/User/mcp.json` |
+| **Cline** | IDE Extension / CLI | ✅ `%USERPROFILE%\.cline\data\settings\cline_mcp_settings.json` |
+| **OpenCode** | Terminal Agent / TUI | ✅ `%USERPROFILE%\.config\opencode\opencode.json` (or existing `.jsonc`) |
 | **Grok Build** | API / Custom Harness | ✅ Native MCP v3.2.0 protocol endpoint |
+
+---
+
+## Cline and OpenCode on Windows
+
+The installer registers Fukidashi as a local STDIO server. A standard install
+with no `--client` flag configures every supported client and creates missing
+user config directories/files. Use `--client` to limit a run, or `--all` as an
+explicit equivalent of the default. From a release directory, configure only
+Cline and OpenCode with:
+
+```powershell
+.\fukidashi-mcp.exe install --client cline,opencode
+```
+
+The command merges the `fukidashi` entry into each existing config, creates a
+missing parent directory when needed, and keeps a backup under
+`%LOCALAPPDATA%\Fukidashi\backups`. A conflicting entry with the same name is
+left untouched and reported as an error so it cannot be silently replaced.
+
+Cline's current shared config is
+`%USERPROFILE%\.cline\data\settings\cline_mcp_settings.json` for the IDE
+extension, CLI, and SDK. It uses `mcpServers.fukidashi.command` as a string with
+a separate `args` array. Open **MCP Servers → Configure → Configure MCP
+Servers** in the Cline panel to open the active file. Cline's MCP overview page
+also mentions `%USERPROFILE%\.cline\mcp.json` for the CLI; the canonical config
+page and current resolver use the shared `data\settings` path, which is the
+path Fukidashi configures. `CLINE_MCP_SETTINGS_PATH` and `CLINE_DATA_DIR` are
+honored when set:
+
+```json
+{
+  "mcpServers": {
+    "fukidashi": {
+      "command": "C:\\Users\\YOU\\AppData\\Local\\Fukidashi\\bin\\fukidashi-mcp.exe",
+      "args": []
+    }
+  }
+}
+```
+
+OpenCode's documented global config is
+`%USERPROFILE%\.config\opencode\opencode.json`; it also accepts
+`opencode.jsonc`. Fukidashi writes OpenCode's V1-compatible direct
+`mcp.fukidashi` entry. OpenCode's migration guide documents this form as
+supported by both V1 and V2, and the numeric per-server timeout is honored by
+the installed 1.x desktop runtime:
+
+```jsonc
+{
+  "mcp": {
+    "fukidashi": {
+      "type": "local",
+      "command": ["C:\\Users\\YOU\\AppData\\Local\\Fukidashi\\bin\\fukidashi-mcp.exe"],
+      "timeout": 600000
+    }
+  }
+}
+```
+
+The native V2 form is `mcp.servers.<name>` with a nested timeout object, but
+OpenCode 1.18.x logs that nested timeout as unsupported. The installer removes
+only an older Fukidashi entry under `mcp.servers` and preserves other servers.
+
+The patcher reads JSON and JSONC (comments, trailing commas, and UTF-8 BOM),
+then writes valid JSON after a successful merge. Existing content is backed up
+before replacement. Fukidashi already speaks MCP over STDIO, so no HTTP port or
+extra environment variables are required. The execution timeout gives CPU-only
+OCR, cleaning, and typesetting enough time to return the structured page
+response; if an older client still times out, wait for the server job to finish
+and resume with its returned `job_id` rather than resubmitting the same token.
+Verify either client with
+`fukidashi-mcp status`, then restart the client and check that the Fukidashi
+tools appear. See the [Cline MCP guide](https://github.com/cline/cline/blob/main/docs/mcp/mcp-overview.mdx),
+[OpenCode MCP guide](https://opencode.ai/v2/docs/mcp-servers), and
+[OpenCode config locations](https://dev.opencode.ai/docs/config/) for the
+client-side schema and precedence rules. Cline's [configuration locations
+guide](https://github.com/cline/cline/blob/main/docs/getting-started/config.mdx)
+documents the shared `data\settings` file used by current IDE and CLI builds.
+
+Strict translation errors are returned as JSON with the human-readable
+`error`, plus `stage`, `code`, and a `diagnostic` object when cleaning rejects
+an unsafe handoff. The diagnostic identifies the detector line, confidence,
+bounding box, overlapping translation item, and `next_step`; this lets
+OpenCode display the actionable cause instead of reducing it to `inference
+failed`.
+
+When resuming a checkpoint created by an older Fukidashi version, the server
+reconciles detector lines before issuing a work token. Any line absent from the
+translation handoff is added as `keep_source=true` with an
+`auto_preserved_unrepresented_text` warning and an audit entry, so an omitted
+client field cannot trigger a destructive-clean retry loop.
 
 ---
 
@@ -185,8 +279,11 @@ When chapter processing completes, Fukidashi triggers the native **Fukidashi Edi
 * **Zero Web Overhead**: Built with pure Rust (`egui`/`eframe`) — no Chromium, no Electron, zero browser tabs.
 * **Side-by-Side Comparison**: Instant toggle between **Source**, **Cleaned**, and **Rendered** views.
 * **Live Bubble Tweaker**: Double-click any speech bubble to edit text, resize fonts, or re-center bounding boxes.
-* **Canvas Inpainting Brush**: Touch up residual artifacts or redraw text masks directly on the canvas.
-* **One-Click Export**: Approve and export your chapter directly to a standardized CBZ archive or high-res image folder.
+* **Canvas Editing Tools**: Draw or resize bubbles, add text, and use the cover, restore, and eyedropper tools with zoomable, pannable canvas navigation.
+* **Fast Chapter Review**: Virtualized page thumbnails, direct page-number navigation, dirty-page markers, and page-level cached rendering keep large chapters responsive.
+* **Undo, Redo & Autosave**: Review edits persist automatically; use `Ctrl+Z` / `Ctrl+Y` to step through changes and `Ctrl+S` to save and render.
+* **Translator Feedback**: Flag missing dialogue or request fixes from the editor, then return that review feedback to the translation agent.
+* **Approve & Export**: Approve the reviewed chapter; the MCP export supports ZIP, EPUB, or standalone HTML (`html_monolith`).
 
 ---
 
@@ -245,3 +342,4 @@ models/
   * *Patrick Hand* — SIL Open Font License 1.1 (Full Vietnamese diacritics coverage).
   * *Comic Neue* — SIL Open Font License 1.1.
   * *Noto Sans Symbols 2* — SIL Open Font License 1.1 (Unicode symbol/emoji fallback).
+  * Chinese, Korean, and Japanese glyphs use configured or installed system CJK fonts when available.

@@ -13,6 +13,7 @@ use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::domain::TypesetPayload;
 use crate::workflow::CleanArtifact;
@@ -148,16 +149,17 @@ pub fn typeset_page_with_fallbacks(
             .collect::<Vec<_>>();
         let min = payload.min_font_size.unwrap_or(8.0);
         let max = payload.max_font_size.unwrap_or(72.0);
-        let shape = payload.shape.as_deref().unwrap_or("ellipse");
+        let mut shape = payload.shape.as_deref().unwrap_or("ellipse");
         let balloon_area = balloon_areas[index];
-        let balloon_mask = infer_balloon_mask_owned(
+        let inferred_balloon_mask = infer_balloon_mask_owned(
             &mask_source,
             balloon_area,
             payload.text_bbox,
             &balloon_areas,
             index,
-        )
-        .or_else(|| {
+        );
+        let used_inferred_balloon_mask = inferred_balloon_mask.is_some();
+        let balloon_mask = inferred_balloon_mask.or_else(|| {
             // A dark or heavily occluded balloon may not yield a reliable
             // connected component.  If its detector rectangle overlaps a
             // neighbor, keep ownership explicit with the requested shape so
@@ -178,7 +180,8 @@ pub fn typeset_page_with_fallbacks(
                 None
             }
         });
-        let layout = match fit_text_with_font_candidates_masked(
+        let mut layout_mask_fallback_used = false;
+        let masked_layout = fit_text_with_font_candidates_masked(
             &candidates,
             &payload.text,
             rect,
@@ -188,9 +191,138 @@ pub fn typeset_page_with_fallbacks(
             min,
             max,
             payload.padding,
-            balloon_mask,
-        ) {
+            balloon_mask.clone(),
+        );
+        let mut layout_result = match masked_layout {
+            Err(mask_error) if is_text_overflow(&mask_error) && balloon_mask.is_some() => {
+                // The detected contour is a useful placement constraint, but
+                // cleaned pages can leave holes or disconnected patches in a
+                // balloon. If that inferred mask rejects the text, retry
+                // against the operator's explicit bubble geometry before
+                // reporting overflow. This still constrains the text to the
+                // editable rectangle/ellipse, and genuine geometry overflow
+                // remains an error.
+                match fit_text_with_font_candidates(
+                    &candidates,
+                    &payload.text,
+                    rect,
+                    payload.bubble_bbox,
+                    payload.text_bbox,
+                    shape,
+                    min,
+                    max,
+                    payload.padding,
+                ) {
+                    Ok(layout) => {
+                        layout_mask_fallback_used = true;
+                        Ok(layout)
+                    }
+                    Err(geometry_error) if is_text_overflow(&geometry_error) => Err(mask_error),
+                    Err(geometry_error) => Err(geometry_error),
+                }
+            }
+            result => result,
+        };
+        // A thresholded pixel mask can be much smaller than its detected
+        // balloon when cleanup leaves faint lettering or a colored/graded
+        // fill. Compare text occupancy with the detector geometry so a
+        // fragment does not make an undersized fit look full. Adopt the
+        // smooth geometry only when it materially raises the font size; the
+        // synthetic mask still enforces shape and overlap ownership during
+        // both fitting and rasterization.
+        let constrained_font_size = layout_result
+            .as_ref()
+            .ok()
+            .filter(|layout| {
+                used_inferred_balloon_mask
+                    && !layout_mask_fallback_used
+                    && layout_underfills_geometry(layout, balloon_area)
+            })
+            .map(|layout| layout.font_size);
+        if let Some(constrained_font_size) = constrained_font_size
+            && let Some(geometry_mask) =
+                synthetic_balloon_mask(&mask_source, balloon_area, shape, &balloon_areas, index)
+        {
+            match fit_text_with_font_candidates_masked(
+                &candidates,
+                &payload.text,
+                rect,
+                payload.bubble_bbox,
+                payload.text_bbox,
+                shape,
+                min,
+                max,
+                payload.padding,
+                Some(geometry_mask),
+            ) {
+                Ok(geometry_layout)
+                    if geometry_layout.font_size
+                        >= constrained_font_size + (constrained_font_size * 0.2).max(2.0) =>
+                {
+                    layout_result = Ok(geometry_layout);
+                    layout_mask_fallback_used = true;
+                }
+                Ok(_) => {}
+                Err(error) if is_text_overflow(&error) => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("fit geometry fallback for bubble {index}"));
+                }
+            }
+        }
+        let layout = match layout_result {
             Ok(layout) => layout,
+            Err(error)
+                if is_text_overflow(&error)
+                    && is_compact_label(&payload.text, rect)
+                    && payload.shape.is_none()
+                    && payload.padding.is_none()
+                    && payload.min_font_size.map_or(true, |size| size <= 8.0) =>
+            {
+                match layout::fit_text_with_font_candidates_compact(
+                    &candidates,
+                    &payload.text,
+                    rect,
+                    8.0,
+                    max,
+                ) {
+                    Ok(layout) => {
+                        shape = "rectangle";
+                        layout
+                    }
+                    Err(compact_error) if is_text_overflow(&compact_error) => {
+                        let warning = json!({
+                            "page": serde_json::Value::Null,
+                            "bubble_index": index,
+                            "bubble_id": payload.id,
+                            "issue_type": "typeset_warning",
+                            "reason": "text_overflow",
+                            "message": error.to_string(),
+                        });
+                        warnings.push(warning.clone());
+                        reports.push(json!({
+                            "index": index,
+                            "id": payload.id,
+                            "input_bbox": rect,
+                            "bubble_bbox": payload.bubble_bbox,
+                            "text_bbox": payload.text_bbox,
+                            "text": payload.text,
+                            "text_color": payload.text_color,
+                            "requested_text_color": payload.text_color,
+                            "resolved_text_color": serde_json::Value::Null,
+                            "sampled_luminance": serde_json::Value::Null,
+                            "skipped": true,
+                            "skip_reason": "text_overflow",
+                            "warning": warning,
+                        }));
+                        continue;
+                    }
+                    Err(compact_error) => {
+                        return Err(compact_error)
+                            .with_context(|| format!("fit compact label for bubble {index}"));
+                    }
+                }
+            }
             Err(error) if is_text_overflow(&error) => {
                 let warning = json!({
                     "page": serde_json::Value::Null,
@@ -266,6 +398,7 @@ pub fn typeset_page_with_fallbacks(
             "safe_bbox": layout.safe_bbox,
             "safe_mask_bbox": layout.safe_mask.as_ref().and_then(LayoutMask::bounds),
             "mask_used": layout.safe_mask.is_some(),
+            "layout_mask_fallback": layout_mask_fallback_used,
             "padding": layout.padding,
             "placement_center": layout.placement_center,
             "font_size": layout.font_size,
@@ -640,6 +773,8 @@ fn load_font_assets(
             .into_iter()
             .map(|path| path.display().to_string()),
     );
+    paths.dedup();
+    let required_path_count = paths.len();
     let common_names = [
         "segoeui.ttf",
         "arial.ttf",
@@ -647,6 +782,26 @@ fn load_font_assets(
         "seguisym.ttf",
         "DejaVuSans.ttf",
         "NotoSans-Regular.ttf",
+        // Windows CJK faces (TrueType collections are read at face index 0).
+        "msyh.ttc",
+        "simsun.ttc",
+        "mingliu.ttc",
+        "msjh.ttc",
+        "malgun.ttf",
+        "msgothic.ttc",
+        "meiryo.ttc",
+        // Common Linux/macOS and Noto/Source Han installations.
+        "NotoSansCJK-Regular.ttc",
+        "NotoSansCJKsc-Regular.otf",
+        "NotoSansCJKtc-Regular.otf",
+        "NotoSansCJKkr-Regular.otf",
+        "NotoSansCJKjp-Regular.otf",
+        "SourceHanSansSC-Regular.otf",
+        "SourceHanSansTC-Regular.otf",
+        "SourceHanSansKR-Regular.otf",
+        "SourceHanSansJP-Regular.otf",
+        "PingFang.ttc",
+        "AppleSDGothicNeo.ttc",
     ];
     for directory in crate::workflow::font_search_dirs() {
         for name in common_names {
@@ -655,14 +810,45 @@ fn load_font_assets(
     }
     paths.dedup();
 
+    let clusters = UnicodeSegmentation::graphemes(payload.text.as_str(), true)
+        .filter(|cluster| cluster.chars().any(requires_font_glyph))
+        .collect::<Vec<_>>();
     let mut assets = Vec::with_capacity(paths.len());
     for (candidate_index, path) in paths.into_iter().enumerate() {
+        if candidate_index >= required_path_count
+            && clusters.iter().all(|cluster| {
+                assets
+                    .iter()
+                    .any(|asset| font_covers_cluster(asset, cluster))
+            })
+        {
+            break;
+        }
         let Ok(bytes) = fs::read(&path) else {
             if candidate_index == 0 {
                 return Err(anyhow!("read font for bubble {bubble_index}: {path}"));
             }
             continue;
         };
+        let face = rustybuzz::Face::from_slice(&bytes, 0);
+        let Some(face) = face else {
+            if candidate_index == 0 {
+                return Err(anyhow!(
+                    "unable to parse font {path} for bubble {bubble_index}"
+                ));
+            }
+            continue;
+        };
+        if candidate_index >= required_path_count
+            && !clusters.iter().any(|cluster| {
+                !assets
+                    .iter()
+                    .any(|asset| font_covers_cluster(asset, cluster))
+                    && face_covers_cluster(&face, cluster)
+            })
+        {
+            continue;
+        }
         let font =
             match fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default()) {
                 Ok(font) => font,
@@ -675,14 +861,6 @@ fn load_font_assets(
                     continue;
                 }
             };
-        if rustybuzz::Face::from_slice(&bytes, 0).is_none() {
-            if candidate_index == 0 {
-                return Err(anyhow!(
-                    "unable to parse font {path} for bubble {bubble_index}"
-                ));
-            }
-            continue;
-        }
         assets.push(FontAsset { path, bytes, font });
     }
     if assets.is_empty() {
@@ -691,6 +869,29 @@ fn load_font_assets(
         ));
     }
     Ok(assets)
+}
+
+fn requires_font_glyph(character: char) -> bool {
+    !character.is_control()
+        && !matches!(
+            character,
+            '\u{200C}' | '\u{200D}' | '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}'
+        )
+}
+
+fn face_covers_cluster(face: &rustybuzz::Face<'_>, cluster: &str) -> bool {
+    cluster
+        .chars()
+        .filter(|character| requires_font_glyph(*character))
+        .all(|character| {
+            face.glyph_index(character)
+                .is_some_and(|glyph| glyph.0 != 0)
+        })
+}
+
+fn font_covers_cluster(font: &FontAsset, cluster: &str) -> bool {
+    rustybuzz::Face::from_slice(&font.bytes, 0)
+        .is_some_and(|face| face_covers_cluster(&face, cluster))
 }
 
 /// Deterministic checks that run after rasterization and before the artifact is
@@ -796,6 +997,30 @@ fn layout_ink_bbox(layout: &crate::typeset::LayoutResult) -> Option<crate::domai
         .then_some(crate::domain::Rect { x1, y1, x2, y2 })
 }
 
+fn layout_underfills_geometry(
+    layout: &crate::typeset::LayoutResult,
+    balloon_area: crate::domain::Rect,
+) -> bool {
+    let Some(ink) = layout_ink_bbox(layout) else {
+        return false;
+    };
+    // Compare occupancy with the operator's full bubble geometry, not the
+    // inferred pixel-mask bounds. Cleanup can leave faint source glyphs that
+    // fragment a balloon mask; measuring against that fragment makes a tiny
+    // fit look falsely full and prevents the geometry fallback from running.
+    let safe_width = balloon_area.x2 - balloon_area.x1 - 2.0 * layout.padding;
+    let safe_height = balloon_area.y2 - balloon_area.y1 - 2.0 * layout.padding;
+    if safe_width <= 0.0 || safe_height <= 0.0 {
+        return false;
+    }
+    let width_fill = ((ink.x2 - ink.x1) / safe_width).clamp(0.0, 1.0);
+    let height_fill = ((ink.y2 - ink.y1) / safe_height).clamp(0.0, 1.0);
+    let area_fill = width_fill * height_fill;
+    (width_fill >= 0.75 && height_fill <= 0.45)
+        || (height_fill >= 0.75 && width_fill <= 0.45)
+        || area_fill <= 0.18
+}
+
 fn raster_layout(
     image: &mut image::RgbaImage,
     fonts: &[FontCandidate<'_>],
@@ -871,6 +1096,22 @@ fn is_text_overflow(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<crate::error::FukidashiError>()
         .is_some_and(|error| matches!(error, crate::error::FukidashiError::TextOverflow(_)))
+}
+
+/// Compact nameplates have little vertical room, so retry only short labels
+/// in shallow, wide detector rectangles. The retry is constrained to `bbox`
+/// by the rectangle solver and does not depend on inferred balloon pixels.
+fn is_compact_label(text: &str, bbox: crate::domain::Rect) -> bool {
+    let width = bbox.x2 - bbox.x1;
+    let height = bbox.y2 - bbox.y1;
+    let char_count = text.chars().count();
+    width.is_finite()
+        && height.is_finite()
+        && height > 0.0
+        && width / height >= 2.5
+        && height <= 40.0
+        && (1..=24).contains(&char_count)
+        && text.lines().count() == 1
 }
 
 /// Auto ink samples an adaptive central window around the layout anchor from
@@ -1184,6 +1425,7 @@ mod tests {
             padding: None,
             text: text.into(),
             font_path: Some(primary.display().to_string()),
+            requested_font_path: None,
             min_font_size: Some(8.0),
             max_font_size: Some(28.0),
             text_color: None,
@@ -1345,6 +1587,7 @@ mod tests {
             padding: Some(4.0),
             text: "Mask text".into(),
             font_path: Some(font_path.display().to_string()),
+            requested_font_path: None,
             min_font_size: Some(8.0),
             max_font_size: Some(18.0),
             text_color: None,
@@ -1390,6 +1633,7 @@ mod tests {
             padding: Some(4.0),
             text: text.to_owned(),
             font_path: Some(font_path),
+            requested_font_path: None,
             min_font_size: Some(8.0),
             max_font_size: Some(72.0),
             text_color: None,

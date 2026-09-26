@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+
+use anyhow::Context;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -21,13 +23,17 @@ use crate::{
     domain::{Rect, TypesetPayload},
     error::FukidashiError,
     ingress::{PullChapterRequest, SearchMangaRequest},
-    workflow::{PendingPage, ScopeSpec, Workflow, emit_page_progress, page_progress_json},
+    workflow::{
+        PendingPage, ScopeSpec, Workflow, emit_page_progress, format_page_progress,
+        page_progress_json,
+    },
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AnalyzeRequest {
     pub image_path: String,
     pub ocr_mode: Option<String>,
+    #[schemars(schema_with = "source_language_schema")]
     pub source_language: Option<String>,
     pub target_language: Option<String>,
     /// Optional vision-model corrections keyed by the stable OCR region id.
@@ -44,10 +50,13 @@ pub struct AnalyzeRequest {
     /// natural filename ordering; include_paths supports a non-contiguous
     /// bounded fixture.
     #[serde(default)]
+    #[schemars(
+        description = "Object with start_page/end_page or include_paths. A JSON-encoded object string is accepted for clients that incorrectly stringify nested arguments."
+    )]
     pub scope: Option<AnalyzeScope>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct AnalyzeScope {
     #[serde(default)]
     pub start_page: Option<usize>,
@@ -55,6 +64,48 @@ pub struct AnalyzeScope {
     pub end_page: Option<usize>,
     #[serde(default)]
     pub include_paths: Option<Vec<String>>,
+}
+
+impl<'de> Deserialize<'de> for AnalyzeScope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Wire {
+            #[serde(default)]
+            start_page: Option<usize>,
+            #[serde(default)]
+            end_page: Option<usize>,
+            #[serde(default)]
+            include_paths: Option<Vec<String>>,
+        }
+
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let wire: Wire = match value {
+            serde_json::Value::Object(_) => {
+                serde_json::from_value(value).map_err(serde::de::Error::custom)?
+            }
+            serde_json::Value::String(encoded) => {
+                serde_json::from_str(&encoded).map_err(|error| {
+                    serde::de::Error::custom(format!(
+                        "scope must be an object or a JSON-encoded object: {error}"
+                    ))
+                })?
+            }
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "scope must be an object or a JSON-encoded object, got {}",
+                    other
+                )));
+            }
+        };
+        Ok(Self {
+            start_page: wire.start_page,
+            end_page: wire.end_page,
+            include_paths: wire.include_paths,
+        })
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CleanRequest {
@@ -83,8 +134,9 @@ pub struct TypesetRequest {
     pub bubbles: Vec<TypesetPayload>,
     /// Defaults used only when the corresponding bubble field is absent.
     /// Use the bundled Comic Neue or Patrick Hand faces for comic text;
-    /// generic Windows UI faces such as Arial, Calibri, and Segoe UI are
-    /// substituted when supplied as a primary.
+    /// installed/configured CJK faces provide Chinese, Korean, and Japanese
+    /// glyph coverage when available. Generic Windows UI faces such as Arial,
+    /// Calibri, and Segoe UI are substituted when supplied as a primary.
     #[serde(default)]
     pub font_path: Option<String>,
     #[serde(default)]
@@ -159,6 +211,14 @@ impl<'de> Deserialize<'de> for EditorRequest {
 
 fn json_object_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({"type": "object"})
+}
+
+fn source_language_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["auto", "ja", "zh", "ko", "en", "latin"],
+        "description": "OCR source route. Use auto for mixed pages; pipe-delimited values such as en|latin are legacy aliases normalized to auto."
+    })
 }
 
 fn reopen_completed_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -254,15 +314,52 @@ pub struct TranslationStartRequest {
     #[serde(default)]
     pub ocr_mode: Option<String>,
     #[serde(default)]
+    #[schemars(schema_with = "source_language_schema")]
     pub source_language: Option<String>,
     #[serde(default)]
     pub target_language: Option<String>,
     #[serde(default)]
+    #[schemars(
+        description = "Object with start_page/end_page or include_paths. A JSON-encoded object string is accepted for clients that incorrectly stringify nested arguments."
+    )]
     pub scope: Option<AnalyzeScope>,
     /// `preserve` keeps structurally unmatched text out of clean/typeset;
     /// `replace` opts into translating and replacing it. Defaults to preserve.
     #[serde(default)]
     pub sfx_mode: Option<String>,
+    /// Cover/title pages are preserved by default. Set true to translate a
+    /// cover explicitly after reviewing its detected regions.
+    #[serde(default)]
+    pub translate_cover: bool,
+}
+
+/// Analyze an entire managed page inventory once and persist a compact routing
+/// cache.  Translation and rendering remain page-serial; this call removes
+/// the repeated start/analyze round trip and keeps one hot OCR session for the
+/// bounded preflight job.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct TranslationPreflightRequest {
+    #[serde(default)]
+    pub image_path: Option<String>,
+    #[serde(default)]
+    pub job_path: Option<String>,
+    #[serde(default)]
+    pub job_id: Option<String>,
+    #[serde(default)]
+    pub ocr_mode: Option<String>,
+    #[serde(default)]
+    #[schemars(schema_with = "source_language_schema")]
+    pub source_language: Option<String>,
+    #[serde(default)]
+    pub target_language: Option<String>,
+    #[serde(default)]
+    pub scope: Option<AnalyzeScope>,
+    #[serde(default)]
+    pub sfx_mode: Option<String>,
+    /// Cover/title pages are preserved by default. Set true to route page 1
+    /// through OCR and translation explicitly.
+    #[serde(default)]
+    pub translate_cover: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -287,6 +384,9 @@ pub struct PutLoreRequest {
 /// so a weak OCR result cannot make a client abandon the page.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TranslationSubmission {
+    #[schemars(
+        description = "Stable ID from translation_items.required_translation_ids. Submit exactly one decision for every required ID; preserved_items are already explicit source-preservation decisions and are not submitted."
+    )]
     pub id: String,
     /// The translated text, preserved byte-for-byte apart from JSON decoding.
     /// `text` is accepted as a compatibility alias for simple clients.
@@ -302,6 +402,326 @@ pub struct TranslationSubmission {
 pub struct TranslationSubmitRequest {
     pub work_token: String,
     pub translations: Vec<TranslationSubmission>,
+}
+
+/// One exact reviewed bubble that the user marked for a fresh translation.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RetranslationSubmitRequest {
+    /// Exact managed job ID returned by the translation workflow.
+    pub job_id: String,
+    /// Zero-based page index from review feedback.
+    pub page: usize,
+    /// Existing bubble selected for retranslation. Omit for a flagged missing region.
+    #[serde(default)]
+    pub bubble_id: Option<String>,
+    /// Required with a missing-dialogue flag; copied exactly from its feedback.
+    #[serde(default, alias = "region", alias = "bounds", alias = "rect")]
+    pub bbox: Option<serde_json::Value>,
+    /// Coordinate fallback for clients that flatten the bbox object.
+    #[serde(default)]
+    pub x1: Option<f32>,
+    #[serde(default)]
+    pub y1: Option<f32>,
+    #[serde(default)]
+    pub x2: Option<f32>,
+    #[serde(default)]
+    pub y2: Option<f32>,
+    /// OCR returned by fukidashi_retranslation_source for a missing region.
+    #[serde(default)]
+    pub source_ocr: Option<String>,
+    /// Agent-corrected source text when OCR was empty or inaccurate.
+    #[serde(default)]
+    pub source_text: Option<String>,
+    /// Value returned as current_translation in the retranslate feedback.
+    #[serde(default)]
+    pub expected_current_translation: Option<String>,
+    /// Optional editor state revision observed with the feedback.
+    #[serde(default)]
+    pub state_revision: Option<u64>,
+    /// Format requested for the eventual reviewed export. Defaults to zip.
+    #[serde(default)]
+    pub format: Option<String>,
+    /// Fresh translation supplied by the calling agent.
+    pub translation: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RetranslationSourceRequest {
+    pub job_id: String,
+    /// Zero-based page index from review feedback.
+    #[serde(alias = "page_index")]
+    pub page: usize,
+    /// Region in source pixels as {x1,y1,x2,y2}; accepts an array or flat coordinates too.
+    #[serde(default, alias = "region", alias = "bounds", alias = "rect")]
+    pub bbox: Option<serde_json::Value>,
+    /// Coordinate fallback for clients that flatten the bbox object.
+    #[serde(default)]
+    pub x1: Option<f32>,
+    #[serde(default)]
+    pub y1: Option<f32>,
+    #[serde(default)]
+    pub x2: Option<f32>,
+    #[serde(default)]
+    pub y2: Option<f32>,
+}
+
+fn parse_retranslation_bbox(
+    bbox: Option<&serde_json::Value>,
+    x1: Option<f32>,
+    y1: Option<f32>,
+    x2: Option<f32>,
+    y2: Option<f32>,
+) -> anyhow::Result<Rect> {
+    let rect = if let Some(value) = bbox {
+        let value = if let Some(encoded) = value.as_str() {
+            serde_json::from_str::<serde_json::Value>(encoded)
+                .map_err(|error| anyhow::anyhow!("bbox string is not JSON: {error}"))?
+        } else {
+            value.clone()
+        };
+        match &value {
+            serde_json::Value::Array(values) if values.len() == 4 => Rect {
+                x1: values[0]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("bbox[0] must be numeric"))?
+                    as f32,
+                y1: values[1]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("bbox[1] must be numeric"))?
+                    as f32,
+                x2: values[2]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("bbox[2] must be numeric"))?
+                    as f32,
+                y2: values[3]
+                    .as_f64()
+                    .ok_or_else(|| anyhow::anyhow!("bbox[3] must be numeric"))?
+                    as f32,
+            },
+            serde_json::Value::Object(object) => {
+                if let Ok(rect) = serde_json::from_value::<Rect>(value.clone()) {
+                    rect
+                } else if let (Some(x), Some(y), Some(width), Some(height)) = (
+                    object.get("x").and_then(serde_json::Value::as_f64),
+                    object.get("y").and_then(serde_json::Value::as_f64),
+                    object
+                        .get("width")
+                        .or_else(|| object.get("w"))
+                        .and_then(serde_json::Value::as_f64),
+                    object
+                        .get("height")
+                        .or_else(|| object.get("h"))
+                        .and_then(serde_json::Value::as_f64),
+                ) {
+                    Rect {
+                        x1: x as f32,
+                        y1: y as f32,
+                        x2: (x + width) as f32,
+                        y2: (y + height) as f32,
+                    }
+                } else {
+                    anyhow::bail!(
+                        "bbox must be {{x1,y1,x2,y2}}, [x1,y1,x2,y2], or {{x,y,width,height}}"
+                    )
+                }
+            }
+            _ => anyhow::bail!(
+                "bbox must be {{x1,y1,x2,y2}}, [x1,y1,x2,y2], or {{x,y,width,height}}"
+            ),
+        }
+    } else {
+        Rect {
+            x1: x1.ok_or_else(|| anyhow::anyhow!("bbox missing; supply bbox or x1,y1,x2,y2"))?,
+            y1: y1.ok_or_else(|| anyhow::anyhow!("bbox missing; supply bbox or x1,y1,x2,y2"))?,
+            x2: x2.ok_or_else(|| anyhow::anyhow!("bbox missing; supply bbox or x1,y1,x2,y2"))?,
+            y2: y2.ok_or_else(|| anyhow::anyhow!("bbox missing; supply bbox or x1,y1,x2,y2"))?,
+        }
+    };
+    rect.validate()
+        .map_err(|error| anyhow::anyhow!("invalid bbox: {error}"))
+}
+
+fn rects_close(left: Rect, right: Rect) -> bool {
+    const EPSILON: f32 = 0.001;
+    (left.x1 - right.x1).abs() <= EPSILON
+        && (left.y1 - right.y1).abs() <= EPSILON
+        && (left.x2 - right.x2).abs() <= EPSILON
+        && (left.y2 - right.y2).abs() <= EPSILON
+}
+
+fn best_overlapping_empty_bubble(page: &serde_json::Value, region: Rect) -> Option<String> {
+    let region_area = (region.x2 - region.x1) * (region.y2 - region.y1);
+    if region_area <= 0.0 {
+        return None;
+    }
+    page.get("bubbles")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .filter_map(|bubble| {
+            let translation = bubble
+                .get("translation")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !translation.trim().is_empty() {
+                return None;
+            }
+            let rect = bubble
+                .get("bbox")
+                .or_else(|| bubble.get("bubble_bbox"))
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Rect>(value).ok())?
+                .validate()
+                .ok()?;
+            let intersection = (region.x2.min(rect.x2) - region.x1.max(rect.x1)).max(0.0)
+                * (region.y2.min(rect.y2) - region.y1.max(rect.y1)).max(0.0);
+            let region_coverage = intersection / region_area;
+            (region_coverage >= 0.25)
+                .then(|| Some((region_coverage, bubble.get("id")?.as_str()?.to_owned())))
+                .flatten()
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, id)| id)
+}
+
+fn best_overlapping_orphaned_handoff_item(
+    workflow: &Workflow,
+    source: &Path,
+    page: &serde_json::Value,
+    region: Rect,
+) -> anyhow::Result<Option<String>> {
+    let region_area = (region.x2 - region.x1) * (region.y2 - region.y1);
+    if region_area <= 0.0 {
+        return Ok(None);
+    }
+    let (analysis_path, _, _, _, _) = workflow.page_artifacts_for_source(source)?;
+    if !analysis_path.is_file() {
+        return Ok(None);
+    }
+    let analysis: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&analysis_path).context("read analysis for missing-dialogue replacement")?,
+    )
+    .context("parse analysis for missing-dialogue replacement")?;
+    let bubbles = page
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten();
+    let active_ids = bubbles
+        .clone()
+        .filter_map(|bubble| bubble.get("id").and_then(serde_json::Value::as_str))
+        .collect::<BTreeSet<_>>();
+    let removed_ids = page
+        .get("removed_bubbles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|removed| {
+            removed
+                .as_str()
+                .or_else(|| removed.get("id").and_then(serde_json::Value::as_str))
+        })
+        .collect::<BTreeSet<_>>();
+    let items = analysis
+        .get("translation_handoff")
+        .and_then(|handoff| handoff.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten();
+    Ok(items
+        .filter_map(|item| {
+            let id = item.get("id").and_then(serde_json::Value::as_str)?;
+            if active_ids.contains(id) || removed_ids.contains(id) {
+                return None;
+            }
+            let bbox = item
+                .get("bbox")
+                .or_else(|| item.get("bubble_bbox"))
+                .cloned()
+                .and_then(|value| serde_json::from_value::<Rect>(value).ok())?
+                .validate()
+                .ok()?;
+            let intersection = (region.x2.min(bbox.x2) - region.x1.max(bbox.x1)).max(0.0)
+                * (region.y2.min(bbox.y2) - region.y1.max(bbox.y1)).max(0.0);
+            let region_coverage = intersection / region_area;
+            (region_coverage >= 0.25).then(|| (region_coverage, id.to_owned()))
+        })
+        .max_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, id)| id))
+}
+
+struct ManagedFileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+fn snapshot_managed_files(
+    workflow: &Workflow,
+    job: &Path,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> anyhow::Result<Vec<ManagedFileSnapshot>> {
+    let mut snapshots = Vec::new();
+    for path in paths {
+        let (path, contents) = if path.exists() {
+            let path = workflow.require_owned(&path, "retranslation transaction artifact")?;
+            let contents = std::fs::read(&path)?;
+            (path, Some(contents))
+        } else {
+            let mut existing_parent = path
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("transaction artifact has no parent"))?;
+            while !existing_parent.exists() {
+                existing_parent = existing_parent.parent().ok_or_else(|| {
+                    anyhow::anyhow!("transaction artifact has no existing parent")
+                })?;
+            }
+            let canonical_parent =
+                workflow.require_owned(existing_parent, "retranslation artifact directory")?;
+            if !canonical_parent.starts_with(job) {
+                anyhow::bail!("retranslation transaction artifact escaped the managed job");
+            }
+            let suffix = path
+                .strip_prefix(existing_parent)
+                .map_err(|_| anyhow::anyhow!("transaction artifact escaped its existing parent"))?;
+            let path = canonical_parent.join(suffix);
+            if !path.starts_with(job) {
+                anyhow::bail!("retranslation transaction artifact escaped the managed job");
+            }
+            (path, None)
+        };
+        if snapshots
+            .iter()
+            .any(|snapshot: &ManagedFileSnapshot| snapshot.path == path)
+        {
+            continue;
+        }
+        snapshots.push(ManagedFileSnapshot { path, contents });
+    }
+    Ok(snapshots)
+}
+
+fn restore_managed_files(snapshots: &[ManagedFileSnapshot]) -> anyhow::Result<()> {
+    for snapshot in snapshots {
+        match snapshot.contents.as_deref() {
+            Some(contents) => {
+                let parent = snapshot
+                    .path
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("transaction artifact has no parent"))?;
+                let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+                std::io::Write::write_all(temporary.as_file_mut(), contents)?;
+                temporary.as_file().sync_all()?;
+                temporary.persist(&snapshot.path).map_err(|error| {
+                    anyhow::anyhow!("restore {}: {}", snapshot.path.display(), error.error)
+                })?;
+            }
+            None => match std::fs::remove_file(&snapshot.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            },
+        }
+    }
+    Ok(())
 }
 
 fn default_review_timeout() -> u64 {
@@ -394,6 +814,24 @@ fn json_result<T: Serialize>(value: &T, is_error: bool) -> CallToolResult {
     } else {
         CallToolResult::success(vec![ContentBlock::text(text)])
     }
+}
+
+fn add_error_diagnostic(value: &mut serde_json::Value, error: &FukidashiError) {
+    let FukidashiError::Diagnostic { details, .. } = error else {
+        return;
+    };
+    value["diagnostic"] = details.clone();
+    for key in ["stage", "code", "next_step"] {
+        if let Some(detail) = details.get(key) {
+            value[key] = detail.clone();
+        }
+    }
+}
+
+fn error_json(error: &FukidashiError) -> serde_json::Value {
+    let mut value = serde_json::json!({"error": error.to_string()});
+    add_error_diagnostic(&mut value, error);
+    value
 }
 
 fn attach_page_progress(
@@ -499,6 +937,479 @@ fn compact_analysis(
         "checkpoint_path": checkpoint_path,
         "sessions_recycled": recycled,
         "next_step": "translate translation_items, then call fukidashi_clean_page and fukidashi_typeset",
+    })
+}
+
+fn preflight_page_kind(analysis: &serde_json::Value) -> &'static str {
+    if let Some(kind) = analysis
+        .get("preflight_page_kind")
+        .and_then(serde_json::Value::as_str)
+    {
+        return match kind {
+            "bubble" => "bubble",
+            "prose" => "prose",
+            "mixed" => "mixed",
+            _ => "skip",
+        };
+    }
+    let bubbles = analysis
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let unmatched = analysis
+        .get("unmatched_text")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    let prose_groups = analysis
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|region| {
+            region.get("recognizer").and_then(serde_json::Value::as_str) == Some("prose-group")
+        });
+    let meaningful_chars = analysis
+        .get("translation_handoff")
+        .and_then(|handoff| handoff.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("source_text").and_then(serde_json::Value::as_str))
+        .map(|text| text.chars().filter(|ch| !ch.is_whitespace()).count())
+        .sum::<usize>();
+    if prose_groups && bubbles > 0 {
+        if unmatched > 0 { "mixed" } else { "prose" }
+    } else if bubbles > 0 {
+        "bubble"
+    } else if unmatched > 0
+        && meaningful_chars >= 28
+        && analysis
+            .get("text_lines")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|line| {
+                line.get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|text| {
+                        text.chars().any(|ch| {
+                            matches!(
+                                ch,
+                                '\u{3040}'..='\u{30ff}'
+                                    | '\u{3400}'..='\u{4dbf}'
+                                    | '\u{4e00}'..='\u{9fff}'
+                            )
+                        }) || text.chars().filter(|ch| ".!?。！？".contains(*ch)).count() > 0
+                    })
+            })
+    {
+        "prose"
+    } else {
+        "skip"
+    }
+}
+
+fn cover_like_analysis(page_number: usize, analysis: &serde_json::Value) -> bool {
+    if page_number != 1 {
+        return false;
+    }
+    let Some(bubbles) = analysis
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return false;
+    };
+    if bubbles.is_empty()
+        || bubbles.iter().any(|bubble| {
+            bubble
+                .get("detector_label")
+                .and_then(serde_json::Value::as_u64)
+                == Some(0)
+        })
+    {
+        return false;
+    }
+    let text = analysis
+        .get("translation_handoff")
+        .and_then(|handoff| handoff.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("source_text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>();
+    let compact = text.join(" ").to_ascii_lowercase();
+    let chars = compact.chars().filter(|ch| !ch.is_whitespace()).count();
+    let cover_signal = [
+        "welcome",
+        "ようこそ",
+        "r18",
+        "dojin",
+        "成人向け",
+        "18歳未満",
+        "for adult only",
+    ]
+    .iter()
+    .any(|needle| compact.contains(needle));
+    cover_signal && chars <= 180 && text.len() <= 5
+}
+
+fn synthetic_skip_analysis(
+    source_language: Option<&str>,
+    target_language: Option<&str>,
+    config: &Config,
+    cover: bool,
+) -> serde_json::Value {
+    let target = target_language
+        .map(str::to_owned)
+        .unwrap_or_else(|| config.configured_target_language());
+    serde_json::json!({
+        "source_language": source_language.unwrap_or("auto"),
+        "target_language": target,
+        "bubbles": [],
+        "text_lines": [],
+        "unmatched_text": [],
+        "translation_handoff": {"target_language": target, "status":"pending", "items":[]},
+        "preflight_page_kind": "skip",
+        "preflight_cover": cover,
+    })
+}
+
+fn preflight_page_manifest(
+    page_number: usize,
+    source: &std::path::Path,
+    source_sha256: &str,
+    analysis: &serde_json::Value,
+    cached: bool,
+) -> serde_json::Value {
+    let classification = preflight_page_kind(analysis);
+    let items = analysis
+        .get("translation_handoff")
+        .and_then(|handoff| handoff.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let required = items
+        .iter()
+        .filter(|item| {
+            !item
+                .get("preserve_by_default")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    let preserved = items.len().saturating_sub(required);
+    let bubble_count = analysis
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .filter(|count| *count > 0)
+        .or_else(|| {
+            analysis
+                .get("thumbnail_bubble_count")
+                .and_then(serde_json::Value::as_u64)
+                .map(|count| count as usize)
+        })
+        .unwrap_or(0);
+    let text_line_count = analysis
+        .get("text_lines")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .filter(|count| *count > 0)
+        .or_else(|| {
+            analysis
+                .get("thumbnail_line_count")
+                .and_then(serde_json::Value::as_u64)
+                .map(|count| count as usize)
+        })
+        .unwrap_or(0);
+    serde_json::json!({
+        "page_number": page_number,
+        "source_image": source,
+        "source_sha256": source_sha256,
+        "classification": classification,
+        "analysis_pending": classification == "bubble" && !cached,
+        "cached_analysis": cached,
+        "cache_hit": false,
+        "cache_source": if cached { "within_job_analysis" } else { "none" },
+        "pass_through": classification == "skip",
+        "skip": classification == "skip",
+        "bubble_count": bubble_count,
+        "text_line_count": text_line_count,
+        "unmatched_text_count": analysis.get("unmatched_text").and_then(serde_json::Value::as_array).map(Vec::len).unwrap_or(0),
+        "required_translation_count": required,
+        "preserved_count": preserved,
+    })
+}
+
+fn preflight_page_reused(page: &serde_json::Value) -> bool {
+    page.get("cache_hit")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || page
+            .get("cached_analysis")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn preflight_cache_telemetry(pages: &[serde_json::Value], total_pages: usize) -> serde_json::Value {
+    let reused_cached_pages = pages
+        .iter()
+        .filter(|page| preflight_page_reused(page))
+        .count();
+    let newly_processed_pages = pages.len().saturating_sub(reused_cached_pages);
+    let pass_through_pages = pages
+        .iter()
+        .filter(|page| {
+            page.get("classification")
+                .and_then(serde_json::Value::as_str)
+                == Some("skip")
+                || page
+                    .get("pass_through")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .count();
+    serde_json::json!({
+        "reused_cached_pages": reused_cached_pages,
+        "newly_processed_pages": newly_processed_pages,
+        "total_pages": total_pages,
+        "within_job_cached_pages": reused_cached_pages,
+        "cross_job_cached_pages": 0,
+        "cross_job_cache_available": false,
+        "cache_scope": "within_job_only",
+        "pass_through_pages": pass_through_pages,
+        "skip_pages": pass_through_pages,
+        "message": format!(
+            "Reused cached pages: {reused_cached_pages}/{total_pages}; newly processed: {newly_processed_pages}/{total_pages}"
+        ),
+    })
+}
+
+fn attach_preflight_cache_telemetry(
+    value: &mut serde_json::Value,
+    pages: &[serde_json::Value],
+    total_pages: usize,
+) {
+    let telemetry = preflight_cache_telemetry(pages, total_pages);
+    value["cache_telemetry"] = telemetry.clone();
+    for key in [
+        "reused_cached_pages",
+        "newly_processed_pages",
+        "total_pages",
+        "within_job_cached_pages",
+        "cross_job_cached_pages",
+        "cross_job_cache_available",
+        "cache_scope",
+        "pass_through_pages",
+        "skip_pages",
+    ] {
+        if let Some(field) = telemetry.get(key) {
+            value[key] = field.clone();
+            if let Some(progress) = value.get_mut("progress") {
+                progress[key] = field.clone();
+            }
+        }
+    }
+    if let Some(message) = telemetry.get("message") {
+        value["cache_message"] = message.clone();
+        if let Some(progress) = value.get_mut("progress") {
+            progress["cache_message"] = message.clone();
+        }
+    }
+}
+
+fn emit_preflight_progress(
+    current_page: usize,
+    total_pages: usize,
+    stage: &str,
+    pages: &[serde_json::Value],
+) {
+    let telemetry = preflight_cache_telemetry(pages, total_pages);
+    let reused = telemetry["reused_cached_pages"].as_u64().unwrap_or(0);
+    let newly = telemetry["newly_processed_pages"].as_u64().unwrap_or(0);
+    let message = telemetry["message"].as_str().unwrap_or_default();
+    let line = format!(
+        "{}; {message}",
+        format_page_progress(current_page, total_pages, stage)
+    );
+    eprintln!("{line}");
+    tracing::info!(
+        target: "fukidashi.progress",
+        current_page,
+        total_pages,
+        stage,
+        reused_cached_pages = reused,
+        newly_processed_pages = newly,
+        within_job_cached_pages = reused,
+        cross_job_cached_pages = 0u64,
+        pass_through_pages = telemetry["pass_through_pages"].as_u64().unwrap_or(0),
+        "{line}"
+    );
+}
+
+fn validate_prose_source_coverage(
+    analysis: &serde_json::Value,
+    source_image: &Path,
+    plan: &StrictSubmissionPlan,
+) -> Result<(), FukidashiError> {
+    let (width, height) = image::image_dimensions(source_image).map_err(|error| {
+        FukidashiError::InvalidInput(format!(
+            "unable to validate prose coverage for {}: {error}",
+            source_image.display()
+        ))
+    })?;
+    let page_area = (width as f32 * height as f32).max(1.0);
+    let Some(bubbles) = analysis
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    let items = analysis
+        .get("translation_handoff")
+        .and_then(|handoff| handoff.get("items"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let keep_ids = plan
+        .selected
+        .iter()
+        .filter(|selection| selection.keep_source)
+        .map(|selection| selection.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for bubble in bubbles {
+        if bubble.get("recognizer").and_then(serde_json::Value::as_str) != Some("prose-group") {
+            continue;
+        }
+        let Some(id) = bubble.get("id").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if keep_ids.contains(id) {
+            continue;
+        }
+        let Some(bbox) = bubble.get("bbox") else {
+            continue;
+        };
+        let Some(rect) = serde_json::from_value::<Rect>(bbox.clone())
+            .ok()
+            .and_then(|rect| rect.validate().ok())
+        else {
+            continue;
+        };
+        let area_ratio = ((rect.x2 - rect.x1).max(0.0) * (rect.y2 - rect.y1).max(0.0)) / page_area;
+        if area_ratio < 0.30 {
+            continue;
+        }
+        let source_text = items
+            .iter()
+            .find(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(id))
+            .and_then(|item| item.get("source_text").and_then(serde_json::Value::as_str))
+            .unwrap_or_default();
+        let chars = source_text.chars().filter(|ch| !ch.is_whitespace()).count();
+        if chars < 80 {
+            return Err(FukidashiError::Diagnostic {
+                message: format!(
+                    "prose source item {id:?} is implausibly short for its page-spanning region; refusing destructive cleaning"
+                ),
+                details: serde_json::json!({
+                    "stage": "prose_coverage",
+                    "code": "collapsed_prose_source",
+                    "id": id,
+                    "source_chars": chars,
+                    "bbox_area_ratio": area_ratio,
+                    "next_step": "retry OCR with a corrected source item or set keep_source=true for this prose item; no pixels were cleaned",
+                }),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Reject overlapping auto-generated prose groups before their rectangles can
+/// be used for destructive cleaning or typesetting.  Dense prose commonly has
+/// adjacent line boxes, so only substantial overlap relative to the smaller
+/// box is treated as an unsafe merge.
+fn validate_prose_group_geometry(
+    analysis: &serde_json::Value,
+    plan: &StrictSubmissionPlan,
+) -> Result<(), FukidashiError> {
+    let Some(bubbles) = analysis
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(());
+    };
+    let keep_ids = plan
+        .selected
+        .iter()
+        .filter(|selection| selection.keep_source)
+        .map(|selection| selection.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let selected_ids = plan
+        .selected
+        .iter()
+        .map(|selection| selection.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let groups = bubbles
+        .iter()
+        .filter_map(|bubble| {
+            let id = bubble.get("id")?.as_str()?;
+            let recognizer = bubble.get("recognizer")?.as_str()?;
+            if !selected_ids.contains(id)
+                || (recognizer != "prose-group" && recognizer != "baberu-ocr")
+            {
+                return None;
+            }
+            let rect = serde_json::from_value::<Rect>(bubble.get("bbox")?.clone())
+                .ok()?
+                .validate()
+                .ok()?;
+            Some((id, recognizer, rect))
+        })
+        .collect::<Vec<_>>();
+    let mut collisions = Vec::new();
+    for left_index in 0..groups.len() {
+        let (left_id, left_recognizer, left) = groups[left_index];
+        for (right_id, right_recognizer, right) in groups.iter().skip(left_index + 1).copied() {
+            if left_recognizer != "prose-group" && right_recognizer != "prose-group" {
+                continue;
+            }
+            if !rects_overlap(left, right) {
+                continue;
+            }
+            let intersection_width = (left.x2.min(right.x2) - left.x1.max(right.x1)).max(0.0);
+            let intersection_height = (left.y2.min(right.y2) - left.y1.max(right.y1)).max(0.0);
+            let intersection = intersection_width * intersection_height;
+            let left_area = (left.x2 - left.x1) * (left.y2 - left.y1);
+            let right_area = (right.x2 - right.x1) * (right.y2 - right.y1);
+            let overlap_ratio = intersection / left_area.min(right_area).max(1.0);
+            if overlap_ratio < 0.25 || (keep_ids.contains(left_id) && keep_ids.contains(right_id)) {
+                continue;
+            }
+            collisions.push(serde_json::json!({
+                "ids": [left_id, right_id],
+                "overlap_ratio": overlap_ratio,
+                "bboxes": [
+                    { "id": left_id, "bbox": left },
+                    { "id": right_id, "bbox": right },
+                ],
+            }));
+        }
+    }
+    if collisions.is_empty() {
+        return Ok(());
+    }
+    Err(FukidashiError::Diagnostic {
+        message: "overlapping automatic prose regions are unsafe to clean or render; preserve both regions or correct the source analysis".into(),
+        details: serde_json::json!({
+            "stage": "prose_geometry",
+            "code": "overlapping_prose_groups",
+            "overlap_threshold": 0.25,
+            "collisions": collisions,
+            "next_step": "Resubmit keep_source=true for both IDs in every reported collision, or correct the OCR grouping and restart this page; no pixels were cleaned or rendered.",
+        }),
     })
 }
 
@@ -787,6 +1698,12 @@ fn extract_tool_json(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("operation failed")
             .to_owned();
+        if let Some(details) = value.get("diagnostic").cloned() {
+            return Err(FukidashiError::Diagnostic {
+                message: format!("{operation}: {message}"),
+                details,
+            });
+        }
         return Err(FukidashiError::Inference(format!("{operation}: {message}")));
     }
     Ok(value)
@@ -796,6 +1713,506 @@ fn strict_response_items(items: &[SavedTranslationItem]) -> Vec<serde_json::Valu
     items.iter().map(strict_item_json).collect()
 }
 
+fn japanese_prose_char_count(text: &str) -> usize {
+    text.chars()
+        .filter(|character| {
+            matches!(
+                character,
+                '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'
+            )
+        })
+        .count()
+}
+
+fn metadata_or_art_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_email = text.contains('@') && text.contains('.');
+    let has_date = text
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .count()
+        >= 2
+        && text
+            .chars()
+            .any(|character| "/.-年月日".contains(character));
+    has_email
+        || has_date
+        || text
+            .chars()
+            .all(|character| character.is_whitespace() || ".．．…・~～-—_".contains(character))
+        || [
+            "発行",
+            "発行日",
+            "印刷",
+            "連絡先",
+            "著者",
+            "contact",
+            "email",
+            "date",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// OCR line detection can leave a short paragraph line just outside the
+/// detector's broad prose group.  On a dense Japanese prose page those lines
+/// are part of the body and must be required source items, otherwise the
+/// renderer preserves a visible Japanese fragment beside the translation.
+fn is_main_japanese_prose_line(line: &serde_json::Value, items: &[serde_json::Value]) -> bool {
+    let text = line
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if japanese_prose_char_count(text) < 3 || metadata_or_art_text(text) {
+        return false;
+    }
+    let confidence = line
+        .get("confidence")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.35);
+    if confidence < 0.35 {
+        return false;
+    }
+    let Some(rect) = json_bbox(line) else {
+        return false;
+    };
+    let prose_rects = items.iter().filter_map(|item| {
+        if item
+            .get("keep_source")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || item
+                .get("preserve_by_default")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        {
+            return None;
+        }
+        let kind = item
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if !matches!(kind, "dialogue" | "prose" | "prose-line") {
+            return None;
+        }
+        json_bbox(item)
+    });
+    let prose_rects = prose_rects.collect::<Vec<_>>();
+    if prose_rects.len() < 2 {
+        return false;
+    }
+    let min_y = prose_rects
+        .iter()
+        .map(|rect| rect.y1)
+        .fold(f32::INFINITY, f32::min);
+    let max_y = prose_rects
+        .iter()
+        .map(|rect| rect.y2)
+        .fold(f32::NEG_INFINITY, f32::max);
+    // Keep the heading and footer out of this fallback.  The line must sit in
+    // the vertical body span and be close to one of the existing groups.
+    if rect.y1 <= min_y || rect.y2 > max_y + 60.0 {
+        return false;
+    }
+    prose_rects.iter().any(|group| {
+        let vertical_gap = if rect.y1 > group.y2 {
+            rect.y1 - group.y2
+        } else if group.y1 > rect.y2 {
+            group.y1 - rect.y2
+        } else {
+            0.0
+        };
+        let horizontal_overlap = rect.x1.max(group.x1) < rect.x2.min(group.x2);
+        vertical_gap <= 70.0 && horizontal_overlap
+    })
+}
+
+/// Reject sparse, page-spanning OCR boxes that bridge separate text columns.
+/// These are often chart dividers or graphic artifacts; they must remain
+/// explicit preserved detections instead of being promoted as body prose.
+fn is_wide_sparse_column_bridge(line: &serde_json::Value, lines: &[serde_json::Value]) -> bool {
+    let Some(rect) = json_bbox(line) else {
+        return false;
+    };
+    let span = lines
+        .iter()
+        .filter_map(json_bbox)
+        .fold(None, |bounds: Option<(f32, f32)>, other| {
+            Some(match bounds {
+                Some((min_x, max_x)) => (min_x.min(other.x1), max_x.max(other.x2)),
+                None => (other.x1, other.x2),
+            })
+        })
+        .map(|(min_x, max_x)| max_x - min_x)
+        .unwrap_or(0.0);
+    let width = rect.x2 - rect.x1;
+    let height = rect.y2 - rect.y1;
+    let text = line
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let compact_chars = text.chars().filter(|ch| ch.is_alphanumeric()).count();
+    if span <= 0.0
+        || width / span < 0.75
+        || width / height.max(1.0) < 18.0
+        || compact_chars as f32 / width.max(1.0) >= 0.025
+    {
+        return false;
+    }
+    let neighbor_centers = lines
+        .iter()
+        .filter_map(|other| {
+            let other_rect = json_bbox(other)?;
+            let other_text = other.get("text")?.as_str()?.trim();
+            (other_rect.x1.max(rect.x1) < other_rect.x2.min(rect.x2)
+                && (other_rect.y1.max(rect.y1) - other_rect.y2.min(rect.y2)).max(0.0) <= 120.0
+                && japanese_prose_char_count(other_text) >= 8)
+                .then_some((other_rect.x1 + other_rect.x2) * 0.5)
+        })
+        .collect::<Vec<_>>();
+    let Some(min_center) = neighbor_centers.iter().copied().reduce(f32::min) else {
+        return false;
+    };
+    let Some(max_center) = neighbor_centers.iter().copied().reduce(f32::max) else {
+        return false;
+    };
+    max_center - min_center >= span * 0.30
+}
+
+/// Use the detector's line inventory as page context when the bubble detector
+/// found only part of a prose page. Requiring existing translated bubbles here
+/// hid the remaining paragraphs on afterwords with weak detector coverage.
+fn is_dense_body_line(
+    line: &serde_json::Value,
+    items: &[serde_json::Value],
+    lines: &[serde_json::Value],
+) -> bool {
+    if is_wide_sparse_column_bridge(line, lines) {
+        return false;
+    }
+    if is_main_japanese_prose_line(line, items) {
+        return true;
+    }
+    let text = line
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    let confidence = line
+        .get("confidence")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.35);
+    let Some(rect) = json_bbox(line) else {
+        return false;
+    };
+    if japanese_prose_char_count(text) < 8 || metadata_or_art_text(text) || confidence < 0.20 {
+        return false;
+    }
+    let candidates = lines
+        .iter()
+        .filter_map(|other| {
+            let other_text = other
+                .get("text")
+                .and_then(serde_json::Value::as_str)?
+                .trim();
+            let other_confidence = other
+                .get("confidence")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.35);
+            let other_rect = json_bbox(other)?;
+            (japanese_prose_char_count(other_text) >= 8
+                && !metadata_or_art_text(other_text)
+                && other_confidence >= 0.20
+                && (other_rect.y1 != rect.y1 || other_rect.y2 != rect.y2)
+                && (other_rect.y1.max(rect.y1) - other_rect.y2.min(rect.y2)).max(0.0) <= 120.0
+                && other_rect.x1.max(rect.x1) < other_rect.x2.min(rect.x2))
+            .then_some(other_rect)
+        })
+        .collect::<Vec<_>>();
+    !candidates.is_empty()
+}
+
+/// Keep every detector line represented by the strict handoff. OCR can
+/// associate a small line with a broad bubble while the bubble-level
+/// recognizer omits that line from `source_text`; allowing it to disappear
+/// makes a later destructive clean fail after the client already translated
+/// the page. Legacy checkpoints are reconciled lazily: every uncovered line
+/// becomes an explicit source-preserved item, including confident lines. This
+/// is deliberately fail-safe for resumed jobs: a client can still translate
+/// the surrounding items, while the source pixels for an omitted line are
+/// never erased. The caller persists this normalization before issuing a
+/// work token.
+fn augment_missing_detected_text_items(
+    analysis: &mut serde_json::Value,
+) -> Result<Vec<serde_json::Value>, FukidashiError> {
+    let detected_bubbles = analysis
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let Some(lines) = analysis
+        .get("text_lines")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+    else {
+        return Ok(Vec::new());
+    };
+    let Some(items) = analysis
+        .get_mut("translation_handoff")
+        .and_then(|handoff| handoff.get_mut("items"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return Ok(Vec::new());
+    };
+    let mut additions = Vec::new();
+    let mut auto_preserved = Vec::new();
+    // Some OCR checkpoints already contain the unmatched line as a preserved
+    // text-* item.  Promote those items before reconciling text_lines so a
+    // line that is present in both arrays cannot be mistaken for an already
+    // safe preservation decision.
+    let existing_items = items.clone();
+    for item_index in 0..items.len() {
+        let item = &existing_items[item_index];
+        if !(item
+            .get("keep_source")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+            || item
+                .get("preserve_by_default")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false))
+            || item.get("kind").and_then(serde_json::Value::as_str) != Some("unmatched_text")
+        {
+            continue;
+        }
+        let Some(source_text) = item.get("source_text").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let synthetic_line = serde_json::json!({
+            "text": source_text,
+            "confidence": item.get("confidence").cloned().unwrap_or(serde_json::Value::Null),
+            "bbox": item.get("bbox").cloned().unwrap_or(serde_json::Value::Null),
+        });
+        if !is_dense_body_line(&synthetic_line, &existing_items, &lines) {
+            continue;
+        }
+        let item = &mut items[item_index];
+        item["kind"] = serde_json::Value::String("prose-line".into());
+        item["preserve_by_default"] = serde_json::Value::Bool(false);
+        item["keep_source"] = serde_json::Value::Bool(false);
+        item["needs_review"] = serde_json::Value::Bool(true);
+        item["translation"] = serde_json::Value::Null;
+        item["status"] = serde_json::Value::String("pending".into());
+        item["auto_preserved"] = serde_json::Value::Bool(false);
+        item["auto_promoted_prose"] = serde_json::Value::Bool(true);
+    }
+    for (index, line) in lines.iter().enumerate() {
+        let Some(id) = line
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+        else {
+            continue;
+        };
+        let Some(rect) = json_bbox(line) else {
+            continue;
+        };
+        let source_text = line
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if source_text.is_empty() {
+            continue;
+        }
+        let source_language = line
+            .get("source_language")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto");
+        let body_line = is_dense_body_line(line, items, &lines);
+        let matching_id = items.iter().position(|item| {
+            item.get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|item_id| item_id == id)
+        });
+        if let Some(item_index) = matching_id {
+            let item = &mut items[item_index];
+            if body_line {
+                item["kind"] = serde_json::Value::String("prose-line".into());
+                item["preserve_by_default"] = serde_json::Value::Bool(false);
+                item["keep_source"] = serde_json::Value::Bool(false);
+                item["needs_review"] = serde_json::Value::Bool(true);
+                item["translation"] = serde_json::Value::Null;
+                item["status"] = serde_json::Value::String("pending".into());
+                item["auto_preserved"] = serde_json::Value::Bool(false);
+                item["auto_promoted_prose"] = serde_json::Value::Bool(true);
+                continue;
+            }
+            if !item
+                .get("keep_source")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                item["kind"] = serde_json::Value::String("unmatched_text".into());
+                item["preserve_by_default"] = serde_json::Value::Bool(true);
+                item["keep_source"] = serde_json::Value::Bool(true);
+                item["needs_review"] = serde_json::Value::Bool(true);
+                item["translation"] = serde_json::Value::Null;
+                item["status"] = serde_json::Value::String("preserved".into());
+                let audit = serde_json::json!({
+                    "id": id,
+                    "detected_text_index": index,
+                    "confidence": line.get("confidence").cloned().unwrap_or(serde_json::Value::Null),
+                    "source_text": source_text,
+                    "reason": "legacy handoff item did not explicitly preserve the detected line",
+                });
+                auto_preserved.push(audit);
+            }
+            continue;
+        }
+        if detected_bubble_handoff_covers_line(
+            &detected_bubbles,
+            items,
+            rect,
+            source_text,
+            source_language,
+            line.get("confidence")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(1.0),
+        ) {
+            // The bubble-level OCR can differ from its tighter line crop.
+            // This is still one speech balloon; use its best OCR for the
+            // bubble translation instead of producing a second overlay.
+            continue;
+        }
+        // The OCR handoff may already contain this line under a detector
+        // generated text-* ID.  On a dense Japanese prose span that existing
+        // preserve item is still part of the body, so promote it in place to
+        // keep the stable ID while making the translation decision required.
+        if body_line {
+            let promoted_index = items.iter().position(|item| {
+                (item
+                    .get("keep_source")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                    || item
+                        .get("preserve_by_default")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false))
+                    && item
+                        .get("source_text")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|item_text| item_text.trim() == source_text)
+                    && json_bbox(item).is_some_and(|item_rect| rects_overlap(rect, item_rect))
+            });
+            if let Some(item_index) = promoted_index {
+                let item = &mut items[item_index];
+                item["kind"] = serde_json::Value::String("prose-line".into());
+                item["preserve_by_default"] = serde_json::Value::Bool(false);
+                item["keep_source"] = serde_json::Value::Bool(false);
+                item["needs_review"] = serde_json::Value::Bool(true);
+                item["translation"] = serde_json::Value::Null;
+                item["status"] = serde_json::Value::String("pending".into());
+                item["auto_preserved"] = serde_json::Value::Bool(false);
+                item["auto_promoted_prose"] = serde_json::Value::Bool(true);
+                continue;
+            }
+        }
+        let already_covered = items.iter().any(|item| {
+            let Some(item_rect) = json_bbox(item) else {
+                return false;
+            };
+            let item_source = item
+                .get("source_text")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| item.get("ocr_text").and_then(serde_json::Value::as_str))
+                .unwrap_or_default();
+            let item_language = item
+                .get("source_language")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("auto");
+            rects_overlap(rect, item_rect)
+                && source_text_covers_line(item_source, source_text, item_language)
+        });
+        if already_covered {
+            continue;
+        }
+        let confidence = line
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .filter(|confidence| confidence.is_finite())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
+        additions.push(serde_json::json!({
+            "id": id,
+            "kind": if body_line { "prose-line" } else { "unmatched_text" },
+            "preserve_by_default": !body_line,
+            "source_text": source_text,
+            "ocr_text": source_text,
+            "source_language": source_language,
+            "confidence": confidence,
+            "bbox": rect,
+            "correction_applied": false,
+            "status": if body_line { "pending" } else { "preserved" },
+            "translation": serde_json::Value::Null,
+            "keep_source": !body_line,
+            "needs_review": true,
+            "auto_preserved": !body_line,
+            "auto_promoted_prose": body_line,
+            "detected_text_index": index,
+        }));
+        if !body_line {
+            auto_preserved.push(serde_json::json!({
+                "id": id,
+                "detected_text_index": index,
+                "confidence": confidence,
+                "source_text": source_text,
+                "reason": "legacy handoff omitted a detected line; source was preserved automatically",
+            }));
+        }
+    }
+    if !additions.is_empty() {
+        items.extend(additions);
+    }
+    if !auto_preserved.is_empty() {
+        let strict = analysis
+            .as_object_mut()
+            .expect("analysis is an object")
+            .entry("strict_v1")
+            .or_insert_with(|| serde_json::json!({}));
+        if !strict.is_object() {
+            *strict = serde_json::json!({});
+        }
+        let audit = strict
+            .as_object_mut()
+            .expect("strict_v1 is an object")
+            .entry("auto_preserved_items")
+            .or_insert_with(|| serde_json::json!([]));
+        let audit_items = audit.as_array_mut().ok_or_else(|| {
+            FukidashiError::InvalidInput("strict_v1.auto_preserved_items must be an array".into())
+        })?;
+        let existing_audit_ids = audit_items
+            .iter()
+            .filter_map(|item| {
+                item.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<BTreeSet<_>>();
+        for entry in &auto_preserved {
+            if entry
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| !existing_audit_ids.contains(id))
+            {
+                audit_items.push(entry.clone());
+            }
+        }
+    }
+    Ok(auto_preserved)
+}
+
 fn resolve_sfx_mode(raw: Option<&str>) -> Result<bool, FukidashiError> {
     match raw.unwrap_or("preserve") {
         "preserve" => Ok(false),
@@ -803,6 +2220,30 @@ fn resolve_sfx_mode(raw: Option<&str>) -> Result<bool, FukidashiError> {
         value => Err(FukidashiError::InvalidInput(format!(
             "sfx_mode must be preserve or replace, got {value:?}"
         ))),
+    }
+}
+
+/// Normalize the small OCR route enum accepted by MCP clients. Older
+/// clients sometimes copied an inferred analysis value such as `en|latin`
+/// back into a request; that is a mixed-page result, not a valid override.
+/// Treat it as automatic routing so a later page cannot invalidate an already
+/// completed page.
+fn normalize_requested_source_language(
+    raw: Option<String>,
+) -> Result<Option<String>, FukidashiError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = raw.trim().to_ascii_lowercase();
+    if value.is_empty() || value == "auto" || value.contains('|') {
+        return Ok(None);
+    }
+    if matches!(value.as_str(), "ja" | "zh" | "ko" | "en" | "latin") {
+        Ok(Some(value))
+    } else {
+        Err(FukidashiError::InvalidInput(format!(
+            "unsupported OCR source_language {value:?}; use auto, ja, zh, ko, en, or latin"
+        )))
     }
 }
 
@@ -1111,6 +2552,12 @@ impl FukidashiServer {
     ) -> Result<serde_json::Value, FukidashiError> {
         let all_items = saved_translation_items(analysis)?;
         let items = translatable_items(&all_items, replace_sfx, target_language.as_deref());
+        let auto_preserved_items = analysis
+            .get("strict_v1")
+            .and_then(|strict| strict.get("auto_preserved_items"))
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let preserved_items = if replace_sfx {
             Vec::new()
         } else {
@@ -1131,8 +2578,9 @@ impl FukidashiServer {
                 "page_number": pending.page_number,
                 "total_pages": pending.total_pages,
                 "translation_items": [],
-            "required_translation_ids": [],
+                "required_translation_ids": [],
             "preserved_items": preserved_items,
+            "auto_preserved_items": auto_preserved_items,
             "lore": self.workflow.read_lore(&pending.job_dir).map_err(|error| {
                 FukidashiError::InvalidInput(format!("read job lore: {error}"))
             })?,
@@ -1169,6 +2617,7 @@ impl FukidashiServer {
             "sfx_mode": if replace_sfx { "replace" } else { "preserve" },
             "translation_items": strict_response_items(&items),
             "preserved_items": preserved_items,
+            "auto_preserved_items": auto_preserved_items,
             "lore": self.workflow.read_lore(&pending.job_dir).map_err(|error| {
                 FukidashiError::InvalidInput(format!("read job lore: {error}"))
             })?,
@@ -1182,6 +2631,13 @@ impl FukidashiServer {
                 "required_ids": ids,
             },
         });
+        if !auto_preserved_items.is_empty() {
+            value["warnings"] = serde_json::json!([{
+                "code": "auto_preserved_unrepresented_text",
+                "message": "Legacy analysis had detected text outside the translated handoff. Fukidashi preserved those source pixels automatically so a retry cannot erase them.",
+                "items": auto_preserved_items,
+            }]);
+        }
         emit_page_progress(
             pending.page_number,
             pending.total_pages,
@@ -1240,10 +2696,16 @@ impl FukidashiServer {
                 }
             };
             let persist = workflow.write_analysis_artifact(&image_path, &value);
-            engine.release_sessions();
-            persist.map_err(|error| {
-                FukidashiError::Inference(format!("analysis checkpoint write failed: {error}"))
-            })?;
+            // Keep detector/recognizer sessions alive until the page's clean
+            // and typeset boundary.  The submit path releases them once the
+            // page is complete; preflight keeps the same lifecycle across its
+            // whole bounded inventory.
+            if let Err(error) = persist {
+                engine.release_sessions();
+                return Err(FukidashiError::Inference(format!(
+                    "analysis checkpoint write failed: {error}"
+                )));
+            }
             let mut value = value;
             value["strict_runtime"] = serde_json::json!({
                 "sessions_recycled": recycled,
@@ -1296,11 +2758,18 @@ impl FukidashiServer {
             }
         }
         preserved["translation_handoff"]["status"] = serde_json::Value::String("preserved".into());
+        let auto_preserved_items = preserved
+            .get("strict_v1")
+            .and_then(|strict| strict.get("auto_preserved_items"))
+            .cloned();
         preserved["strict_v1"] = serde_json::json!({
             "status": "preserved",
             "sfx_mode": if replace_sfx { "replace" } else { "preserve" },
             "preserved_count": items.len(),
         });
+        if let Some(auto_preserved_items) = auto_preserved_items {
+            preserved["strict_v1"]["auto_preserved_items"] = auto_preserved_items;
+        }
         self.workflow
             .write_analysis_artifact(&pending.source_image, &preserved)
             .map_err(|error| {
@@ -1378,11 +2847,29 @@ impl FukidashiServer {
                 "Analyzing layout & OCR..."
             };
             emit_page_progress(pending.page_number, pending.total_pages, analyzing);
-            let analysis = if pending.analysis_path.is_file() {
+            let mut analysis = if pending.analysis_path.is_file() {
                 read_saved_analysis(&self.workflow, &pending.analysis_path)?
             } else {
                 self.analyze_strict_page(&pending, request).await?
             };
+            let handoff_before = analysis
+                .get("translation_handoff")
+                .and_then(|handoff| handoff.get("items"))
+                .cloned();
+            let auto_preserved = augment_missing_detected_text_items(&mut analysis)?;
+            let handoff_changed = handoff_before.as_ref()
+                != analysis
+                    .get("translation_handoff")
+                    .and_then(|handoff| handoff.get("items"));
+            if !auto_preserved.is_empty() || handoff_changed {
+                self.workflow
+                    .write_analysis_artifact(&pending.source_image, &analysis)
+                    .map_err(|error| {
+                        FukidashiError::Inference(format!(
+                            "persist strict source-item handoff: {error}"
+                        ))
+                    })?;
+            }
             let all_items = saved_translation_items(&analysis)?;
             let items = translatable_items(
                 &all_items,
@@ -1406,6 +2893,12 @@ impl FukidashiServer {
                         continue;
                     }
                     Ok(None) => {
+                        // Preserve-only jobs do not pass through the normal
+                        // submit boundary, so release any retained OCR
+                        // sessions explicitly before exposing review_ready.
+                        let _ = self
+                            .release_models(Parameters(ReleaseModelsRequest {}))
+                            .await;
                         emit_page_progress(
                             pending.total_pages,
                             pending.total_pages,
@@ -1475,6 +2968,7 @@ impl FukidashiServer {
                     } else {
                         "preserve".into()
                     }),
+                    translate_cover: false,
                 };
                 self.prepare_strict_page(next, &next_request).await
             }
@@ -1532,7 +3026,10 @@ impl FukidashiServer {
                     claim.total_pages,
                     "Page complete",
                 );
-                json_result(&value, true)
+                // The requested page is already rendered. A failure while
+                // preparing the next page is resumable follow-up state, not a
+                // failed submission for the completed page.
+                json_result(&value, false)
             }
         }
     }
@@ -1665,10 +3162,26 @@ impl FukidashiServer {
                 .difference(&seen)
                 .cloned()
                 .collect::<Vec<_>>();
-            return Err(FukidashiError::InvalidInput(format!(
-                "translation submission is incomplete; missing stable ids: {}",
-                missing.join(", ")
-            )));
+            let missing_items = missing
+                .iter()
+                .filter_map(|id| {
+                    index_by_id
+                        .get(id)
+                        .map(|index| serde_json::json!({"id": id, "index": index}))
+                })
+                .collect::<Vec<_>>();
+            return Err(FukidashiError::Diagnostic {
+                message: format!(
+                    "invalid input: translation submission is incomplete; missing stable ids: {}",
+                    missing.join(", ")
+                ),
+                details: serde_json::json!({
+                    "stage": "submit_validation",
+                    "code": "missing_translation_items",
+                    "missing_items": missing_items,
+                    "next_step": "Submit exactly one decision for every required_translation_ids entry; use keep_source=true for any item that should remain unchanged, then retry the same work_token.",
+                }),
+            });
         }
         Ok(StrictSubmissionPlan {
             all_items,
@@ -1752,6 +3265,10 @@ impl FukidashiServer {
                 }
             }
         }
+        let auto_preserved_items = analysis
+            .get("strict_v1")
+            .and_then(|strict| strict.get("auto_preserved_items"))
+            .cloned();
         analysis["translation_handoff"]["status"] = serde_json::Value::String("submitted".into());
         analysis["strict_v1"] = serde_json::json!({
             "status": "submitted",
@@ -1765,6 +3282,9 @@ impl FukidashiServer {
                     .count()
             },
         });
+        if let Some(auto_preserved_items) = auto_preserved_items {
+            analysis["strict_v1"]["auto_preserved_items"] = auto_preserved_items;
+        }
         Ok(())
     }
 
@@ -1837,6 +3357,7 @@ impl FukidashiServer {
                 max_font_size: None,
                 text: selection.text.clone(),
                 font_path: None,
+                requested_font_path: None,
                 text_color: item
                     .get("text_color")
                     .and_then(serde_json::Value::as_str)
@@ -1868,6 +3389,9 @@ fn resolve_typeset_request(req: TypesetRequest) -> (String, Vec<TypesetPayload>,
         .bubbles
         .into_iter()
         .map(|mut bubble| {
+            if bubble.requested_font_path.is_none() && bubble.font_path.is_some() {
+                bubble.requested_font_path.clone_from(&bubble.font_path);
+            }
             if bubble.font_path.is_none() {
                 bubble.font_path.clone_from(&req.font_path);
             }
@@ -1887,6 +3411,32 @@ fn resolve_typeset_request(req: TypesetRequest) -> (String, Vec<TypesetPayload>,
         })
         .collect();
     (req.image_path, bubbles, req.fallback_font_paths)
+}
+
+/// Resolve the historical effective global font for a typeset request: the
+/// managed/materialized path the renderer actually used, not the raw operator
+/// request. Generic desktop primaries substitute to the managed bundled Comic
+/// Neue (mirroring the per-bubble substitution); other requests materialize
+/// into the managed job fonts directory. Returns the raw request when it
+/// cannot be materialized (the render then never depended on it because every
+/// bubble carried an explicit font or fell back to the bundled default).
+fn effective_global_font_path(
+    workflow: &Workflow,
+    job_root: &std::path::Path,
+    requested: Option<&str>,
+) -> Option<String> {
+    let requested = requested.filter(|path| !path.trim().is_empty())?;
+    if crate::workflow::is_generic_desktop_font(std::path::Path::new(requested)) {
+        return workflow
+            .materialize_bundled_font(job_root, &crate::fonts::COMIC_NEUE_REGULAR)
+            .map(|path| path.display().to_string())
+            .ok();
+    }
+    workflow
+        .materialize_font_path(job_root, std::path::Path::new(requested))
+        .map(|path| path.display().to_string())
+        .ok()
+        .or_else(|| Some(requested.to_owned()))
 }
 
 fn materialize_bundled_typeset_fonts(
@@ -1959,6 +3509,98 @@ fn json_bbox(item: &serde_json::Value) -> Option<Rect> {
         .and_then(|rect| rect.validate().ok())
 }
 
+/// A text line fully inside a detected speech-bubble contour is another OCR
+/// view of that bubble only when its OCR text is already represented by the
+/// matching handoff item. Requiring the detector contour, item, text, and
+/// containment prevents broad rectangles from hiding independent text.
+fn detected_bubble_handoff_covers_line(
+    bubbles: &[serde_json::Value],
+    items: &[serde_json::Value],
+    line_rect: Rect,
+    line_text: &str,
+    line_language: &str,
+    line_confidence: f64,
+) -> bool {
+    bubbles.iter().any(|bubble| {
+        if bubble
+            .get("detector_label")
+            .and_then(serde_json::Value::as_i64)
+            != Some(0)
+        {
+            return false;
+        }
+        let Some(id) = bubble.get("id").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let Some(bubble_rect) = json_bbox(bubble) else {
+            return false;
+        };
+        if !rect_contains(bubble_rect, line_rect) {
+            return false;
+        }
+        items.iter().any(|item| {
+            if item.get("id").and_then(serde_json::Value::as_str) != Some(id) {
+                return false;
+            }
+            if item
+                .get("keep_source")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || item.get("kind").and_then(serde_json::Value::as_str) == Some("unmatched_text")
+            {
+                return false;
+            }
+            let source_text = item
+                .get("source_text")
+                .or_else(|| item.get("ocr_text"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let source_language = item
+                .get("source_language")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(line_language);
+            let cjk_fragment_match = cjk_fragment_is_covered(source_text, line_text);
+            let lower_confidence_crop = line_confidence <= 0.25
+                && cjk_text_char_count(source_text) >= 3
+                && cjk_text_char_count(line_text) >= 2
+                && bubble
+                    .get("confidence")
+                    .and_then(serde_json::Value::as_f64)
+                    .is_some_and(|confidence| confidence >= line_confidence + 0.15);
+            (source_text_covers_line(source_text, line_text, source_language)
+                || cjk_fragment_match
+                || lower_confidence_crop)
+                && json_bbox(item).is_some_and(|item_rect| rect_contains(item_rect, line_rect))
+        })
+    })
+}
+
+fn cjk_text_char_count(text: &str) -> usize {
+    text.chars()
+        .filter(|character| {
+            matches!(
+                character,
+                '\u{3040}'..='\u{30ff}'
+                    | '\u{3400}'..='\u{4dbf}'
+                    | '\u{4e00}'..='\u{9fff}'
+                    | '\u{f900}'..='\u{faff}'
+                    | '\u{ac00}'..='\u{d7af}'
+            )
+        })
+        .count()
+}
+
+/// Short CJK OCR crops are often a fragment of the better bubble-level OCR.
+/// Treat a two-or-more-character substring as represented only after geometry
+/// has confirmed that the crop sits inside the same detected bubble and item.
+fn cjk_fragment_is_covered(source: &str, line: &str) -> bool {
+    let fragment = normalized_source_text(line);
+    cjk_text_char_count(line) >= 2
+        && cjk_text_char_count(line) == line.chars().filter(|ch| ch.is_alphanumeric()).count()
+        && !fragment.is_empty()
+        && normalized_source_text(source).contains(&fragment)
+}
+
 fn analysis_bubble_bbox(
     analysis: &serde_json::Value,
     id: &str,
@@ -2003,6 +3645,9 @@ fn checkpoint_item_is_preserved(item: &serde_json::Value, replace_sfx: bool) -> 
         .unwrap_or(false);
     if keep_source {
         return true;
+    }
+    if item.get("kind").and_then(serde_json::Value::as_str) == Some("prose-line") {
+        return false;
     }
     if replace_sfx {
         return false;
@@ -2073,7 +3718,8 @@ fn checkpoint_item_is_translatable_dialogue(
         .get("kind")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("dialogue");
-    !id.starts_with("text-") && kind != "unmatched_text"
+    kind == "prose-line"
+        || !id.starts_with("text-") && kind != "unmatched_text"
         || is_vietnamese_target(target_language)
             && is_english_prose(
                 item.get("source_language")
@@ -2103,6 +3749,11 @@ fn checkpoint_text_regions(
         .and_then(serde_json::Value::as_array)
         .map(|items| items.as_slice())
         .unwrap_or(&[]);
+    let detected_bubbles = value
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+        .map(|bubbles| bubbles.as_slice())
+        .unwrap_or(&[]);
     let mut preserved_bboxes = Vec::new();
     let mut translatable_bboxes = Vec::new();
     let target_language = value
@@ -2119,6 +3770,11 @@ fn checkpoint_text_regions(
             continue;
         };
         if checkpoint_item_is_translatable_dialogue(item, replace_sfx, target_language) {
+            let item_id = item
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown-item")
+                .to_owned();
             let source_text = item
                 .get("source_text")
                 .and_then(serde_json::Value::as_str)
@@ -2145,9 +3801,24 @@ fn checkpoint_text_regions(
                     .get("id")
                     .and_then(serde_json::Value::as_str)
                     .is_some_and(|id| id.starts_with("text-"));
-            translatable_bboxes.push((rect, source_text, source_language, geometry_anchor));
+            translatable_bboxes.push((
+                rect,
+                item_id,
+                source_text,
+                source_language,
+                geometry_anchor,
+            ));
         } else if checkpoint_item_is_preserved(item, replace_sfx) {
-            preserved_bboxes.push(rect);
+            preserved_bboxes.push((
+                rect,
+                item.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                item.get("auto_preserved")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            ));
         }
     }
     let lines = value
@@ -2157,7 +3828,7 @@ fn checkpoint_text_regions(
             FukidashiError::InvalidInput("analysis checkpoint has no text_lines array".into())
         })?;
     let mut regions = Vec::with_capacity(lines.len());
-    for line in lines {
+    for (line_index, line) in lines.iter().enumerate() {
         let rect = serde_json::from_value::<Rect>(line.get("bbox").cloned().unwrap_or_default())
             .map_err(FukidashiError::from)
             .and_then(Rect::validate)?;
@@ -2165,30 +3836,81 @@ fn checkpoint_text_regions(
             .get("text")
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
+        let line_language = line
+            .get("source_language")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("auto");
+        let line_confidence = line
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(1.0);
+        let bubble_coverage = detected_bubble_handoff_covers_line(
+            detected_bubbles,
+            handoff_items,
+            rect,
+            line_text,
+            line_language,
+            line_confidence,
+        );
+        let line_id = line
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let automatic_preservation = preserved_bboxes
+            .iter()
+            .any(|(_, id, automatic)| *automatic && id == line_id);
+        // An explicit preserved detector item wins over a broad dialogue
+        // rectangle that happens to overlap it.  This is how a low-confidence
+        // uncovered line remains source pixels without blocking the rest of
+        // the bubble's translated lines from being cleaned. Auto-preserved
+        // legacy crops are different: when a better bubble OCR item fully
+        // contains the low-confidence crop, the translated bubble owns it.
+        if preserved_bboxes.iter().any(|(preserved, _, _)| {
+            rects_overlap(rect, *preserved)
+                && rect_contains(*preserved, rect)
+                && rect_contains(rect, *preserved)
+        }) && !(automatic_preservation && bubble_coverage)
+        {
+            continue;
+        }
         let overlapping_translatable = translatable_bboxes
             .iter()
-            .filter(|(bubble, _, _, _)| rects_overlap(rect, *bubble))
+            .filter(|(bubble, _, _, _, _)| rects_overlap(rect, *bubble))
             .collect::<Vec<_>>();
         if !overlapping_translatable.is_empty() {
-            if overlapping_translatable
-                .iter()
-                .any(|(bubble, source, language, geometry_anchor)| {
+            if overlapping_translatable.iter().any(
+                |(bubble, _, source, language, geometry_anchor)| {
                     source_text_covers_line(source, line_text, language)
+                        || bubble_coverage
                         || (*geometry_anchor && rect_contains(*bubble, rect))
-                })
-            {
+                },
+            ) {
                 regions.push(rect);
                 continue;
             }
-            return Err(FukidashiError::InvalidInput(
-                "detected text inside a translated region is not represented by its source item; refusing destructive cleaning".into(),
-            ));
-        }
-        if preserved_bboxes
-            .iter()
-            .any(|preserved| rects_overlap(rect, *preserved))
-        {
-            continue;
+            let overlapping_item_ids = overlapping_translatable
+                .iter()
+                .map(|(_, item_id, _, _, _)| item_id.clone())
+                .collect::<Vec<_>>();
+            let details = serde_json::json!({
+                "stage": "strict_clean",
+                "code": "unrepresented_detected_text",
+                "detected_line_index": line_index,
+                "detected_line_id": line.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "detected_text": line_text,
+                "source_language": line
+                    .get("source_language")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("auto"),
+                "confidence": line.get("confidence").cloned().unwrap_or(serde_json::Value::Null),
+                "bbox": rect,
+                "overlapping_item_ids": overlapping_item_ids,
+                "next_step": "Correct the translation handoff for the detected line, or submit keep_source=true for the affected item and retry the same work_token; the server will not erase an unrepresented region.",
+            });
+            return Err(FukidashiError::Diagnostic {
+                message: "invalid input: detected text inside a translated region is not represented by its source item; refusing destructive cleaning".into(),
+                details,
+            });
         }
         // Low-confidence unmatched detections are commonly art/sfx geometry
         // (for example the dots on a chastity device), not text strokes.  Do
@@ -2206,10 +3928,21 @@ fn checkpoint_text_regions(
             .and_then(serde_json::Value::as_str)
             .unwrap_or("auto");
         if is_vietnamese_target(target_language) && is_english_prose(source_language, line_text) {
-            return Err(FukidashiError::InvalidInput(
-                "detected sentence-like text has no translated item; refusing destructive cleaning"
-                    .into(),
-            ));
+            let details = serde_json::json!({
+                "stage": "strict_clean",
+                "code": "unmatched_sentence_like_text",
+                "detected_line_index": line_index,
+                "detected_line_id": line.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                "detected_text": line_text,
+                "source_language": source_language,
+                "confidence": line.get("confidence").cloned().unwrap_or(serde_json::Value::Null),
+                "bbox": rect,
+                "next_step": "Add the detected sentence to the translation handoff or explicitly preserve it with keep_source=true, then retry the same work_token; the server will not silently pass it through.",
+            });
+            return Err(FukidashiError::Diagnostic {
+                message: "invalid input: detected sentence-like text has no translated item; refusing destructive cleaning".into(),
+                details,
+            });
         }
         // A line without a matching item may be a sound effect or artwork.
         // Leave it in the source image; only item-backed lines may enter a
@@ -2284,6 +4017,467 @@ impl FukidashiServer {
     }
 
     #[tool(
+        name = "fukidashi_translation_preflight",
+        description = "Run one bounded, resumable 1/N OCR preflight over the managed page inventory. Reuses existing analysis checkpoints, keeps one hot OCR session for new pages, reports visible page progress, classifies each page as bubble/prose/mixed/skip, and persists a routing manifest for later translation_start calls. Every result and progress event reports reused_cached_pages, newly_processed_pages, total_pages, within_job_cached_pages, cross_job_cached_pages (always zero because no cross-job cache exists), and pass-through/skip counts; the human cache message is Reused cached pages: X/N; newly processed: Y/N. Cover-like page 1 is skip/preserve by default; pass translate_cover=true to opt in. Dense prose and mixed pages keep every unrepresented source block for explicit preservation. Translation and cleaning still proceed through the serial strict-v1 submit loop. source_language accepts only auto, ja, zh, ko, en, or latin; legacy pipe values such as en|latin are normalized to automatic routing. Call this once before repeated fukidashi_translation_start calls when speed and visible page progress matter."
+    )]
+    pub async fn translation_preflight(
+        &self,
+        Parameters(req): Parameters<TranslationPreflightRequest>,
+    ) -> CallToolResult {
+        let mut req = req;
+        if let Some(mode) = req.ocr_mode.as_deref()
+            && !matches!(mode, "local" | "auto")
+        {
+            return json_result(
+                &serde_json::json!({"protocol":"strict-v1","error":"ocr_mode must be local or auto"}),
+                true,
+            );
+        }
+        if let Err(error) = resolve_sfx_mode(req.sfx_mode.as_deref()) {
+            return json_result(
+                &serde_json::json!({"protocol":"strict-v1","error":error.to_string()}),
+                true,
+            );
+        }
+        req.source_language = match normalize_requested_source_language(req.source_language.take())
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return json_result(
+                    &serde_json::json!({
+                        "protocol": "strict-v1",
+                        "error": error.to_string(),
+                        "next_step": "use source_language=auto, ja, zh, ko, en, or latin"
+                    }),
+                    true,
+                );
+            }
+        };
+        let selectors = [
+            req.image_path.is_some(),
+            req.job_path.is_some(),
+            req.job_id.is_some(),
+        ]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+        if selectors != 1 {
+            return json_result(
+                &serde_json::json!({
+                    "protocol":"strict-v1",
+                    "error":"provide exactly one of image_path, job_path, or job_id"
+                }),
+                true,
+            );
+        }
+        if req.scope.is_some() && (req.job_path.is_some() || req.job_id.is_some()) {
+            return json_result(
+                &serde_json::json!({"protocol":"strict-v1","error":"scope is accepted only with image_path"}),
+                true,
+            );
+        }
+        let job = if let Some(raw) = req.image_path.as_deref() {
+            let source = match path(raw) {
+                Ok(source) if source.is_file() => source,
+                Ok(source) => {
+                    return json_result(
+                        &serde_json::json!({"protocol":"strict-v1","error":FukidashiError::MissingAsset { path: source }.to_string()}),
+                        true,
+                    );
+                }
+                Err(error) => {
+                    return json_result(&serde_json::json!({"error":error.to_string()}), true);
+                }
+            };
+            let scope = match req.scope.as_ref().map(resolve_analysis_scope).transpose() {
+                Ok(scope) => scope,
+                Err(error) => {
+                    return json_result(&serde_json::json!({"error":error.to_string()}), true);
+                }
+            };
+            match self.workflow.register_analysis(&source, scope.as_ref()) {
+                Ok(registration) => registration.job_dir,
+                Err(error) => {
+                    return json_result(
+                        &serde_json::json!({"protocol":"strict-v1","error":format!("unable to register managed page scope: {error}")}),
+                        true,
+                    );
+                }
+            }
+        } else if let Some(raw) = req.job_path.as_deref() {
+            match self.workflow.resolve_managed_job_path(raw) {
+                Ok(job) => job,
+                Err(error) => {
+                    return json_result(&serde_json::json!({"error":error.to_string()}), true);
+                }
+            }
+        } else {
+            match self
+                .workflow
+                .resolve_managed_job_id(req.job_id.as_deref().unwrap_or_default())
+            {
+                Ok(job) => job,
+                Err(error) => {
+                    return json_result(&serde_json::json!({"error":error.to_string()}), true);
+                }
+            }
+        };
+        let sources = match self.workflow.managed_source_paths_for_editor(&job) {
+            Ok(sources) => sources,
+            Err(error) => {
+                return json_result(&serde_json::json!({"error":error.to_string()}), true);
+            }
+        };
+        let total_pages = sources.len();
+        let ocr = Arc::clone(&self.ocr);
+        let workflow = Arc::clone(&self.workflow);
+        let config = self.config.clone();
+        let source_language = req.source_language.clone();
+        let target_language = req.target_language.clone();
+        let translate_cover = req.translate_cover;
+        let effective_target_language = target_language
+            .clone()
+            .unwrap_or_else(|| config.configured_target_language());
+        // Preflight artifacts depend on every setting that can change routing,
+        // OCR output, or the generated handoff. Keep the structured context in
+        // the manifest/checkpoint so older artifacts without it fail closed.
+        let preflight_context = serde_json::json!({
+            "source_language": source_language.as_deref().unwrap_or("auto"),
+            "target_language": effective_target_language,
+            "translate_cover": translate_cover,
+            "ocr_mode": req.ocr_mode.as_deref().unwrap_or("auto"),
+            "sfx_mode": req.sfx_mode.as_deref().unwrap_or("preserve"),
+            "models_dir": config.models_dir.to_string_lossy(),
+            "provider": config.provider(),
+        });
+        let prior_preflight_context = match self.workflow.read_preflight_manifest(&job) {
+            Ok(manifest) => {
+                manifest.and_then(|manifest| manifest.get("preflight_context").cloned())
+            }
+            Err(error) => {
+                return json_result(
+                    &serde_json::json!({"protocol":"strict-v1","error":format!("unable to validate existing preflight context: {error}")}),
+                    true,
+                );
+            }
+        };
+        if prior_preflight_context.as_ref() != Some(&preflight_context) {
+            let has_downstream_stages = match self.workflow.managed_page_records(&job) {
+                Ok(pages) => pages.iter().any(|page| {
+                    matches!(
+                        page.get("state").and_then(serde_json::Value::as_str),
+                        Some("cleaned" | "rendered")
+                    )
+                }),
+                Err(error) => {
+                    return json_result(
+                        &serde_json::json!({"protocol":"strict-v1","error":format!("unable to inspect managed page stages: {error}")}),
+                        true,
+                    );
+                }
+            };
+            if has_downstream_stages {
+                return json_result(
+                    &serde_json::json!({
+                        "protocol":"strict-v1",
+                        "error":"preflight context changed after this job already has cleaned or rendered pages; use a fresh job for the new source/target language, cover, OCR, SFX, or model settings",
+                        "next_step":"start a fresh managed job with the desired preflight settings; the existing job and its artifacts are unchanged"
+                    }),
+                    true,
+                );
+            }
+        }
+        let job_for_worker = job.clone();
+        let job_id = job
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let job_id_for_worker = job_id.clone();
+        let preflight_context_for_response = preflight_context.clone();
+        let permit = match Arc::clone(&self.slots).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                return json_result(
+                    &serde_json::json!({"protocol":"strict-v1","error":format!("OCR worker capacity closed: {error}")}),
+                    true,
+                );
+            }
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut engine = ocr.lock().map_err(|_| {
+                FukidashiError::RuntimeUnavailable("OCR session lock poisoned".into())
+            })?;
+            let previous_manifest = workflow
+                .read_preflight_manifest(&job_for_worker)
+                .ok()
+                .flatten();
+            let preflight_context_for_worker = preflight_context.clone();
+            let operation = (|| {
+                let mut pages = Vec::with_capacity(sources.len());
+                // Persist an empty, resumable marker before the first model
+                // call. Each completed page is then committed immediately so
+                // a client cancellation or model failure never loses all
+                // completed routing work.
+                let persist_progress = |pages: &[serde_json::Value]| {
+                    let mut partial = serde_json::json!({
+                        "protocol": "strict-v1",
+                        "status": "preflight_partial",
+                        "job_id": job_id_for_worker,
+                        "total_pages": total_pages,
+                        "translate_cover": translate_cover,
+                        "preflight_context": preflight_context_for_worker,
+                        "pages": pages,
+                        "next_action": {"tool":"fukidashi_translation_preflight","arguments":{"job_id":job_id_for_worker}},
+                    });
+                    attach_preflight_cache_telemetry(&mut partial, pages, total_pages);
+                    workflow.write_preflight_manifest(&job_for_worker, &partial)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        FukidashiError::Inference(format!(
+                            "persist resumable preflight manifest: {error}"
+                        ))
+                    })
+                };
+                persist_progress(&pages)?;
+                for (index, source) in sources.iter().enumerate() {
+                    let page_number = index + 1;
+                    emit_preflight_progress(
+                        page_number,
+                        total_pages,
+                        "Preflight OCR & route...",
+                        &pages,
+                    );
+                    let managed = workflow
+                        .managed_page(&job_for_worker, source)
+                        .map_err(|error| FukidashiError::InvalidInput(error.to_string()))?;
+                    let cached = managed.analysis_path.is_file();
+                    let source_hash = workflow
+                        .source_file_sha256(source)
+                        .map_err(|error| FukidashiError::InvalidInput(error.to_string()))?;
+                    let saved = if cached {
+                        Some(read_saved_analysis(&workflow, &managed.analysis_path)?)
+                    } else {
+                        None
+                    };
+                    let cache_matches_source = saved.as_ref().is_some_and(|analysis| {
+                        analysis
+                            .get("preflight_source_sha256")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|hash| hash == source_hash)
+                            && analysis.get("preflight_context")
+                                == Some(&preflight_context_for_worker)
+                    });
+                    let previous_context_matches = previous_manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.get("preflight_context"))
+                        == Some(&preflight_context_for_worker);
+                    if previous_context_matches && cache_matches_source {
+                        if let Some(previous) = previous_manifest
+                        .as_ref()
+                        .and_then(|manifest| manifest.get("pages"))
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|pages| {
+                            pages.iter().find(|page| {
+                                page.get("page_number").and_then(serde_json::Value::as_u64)
+                                    == Some(page_number as u64)
+                                    && page
+                                        .get("source_sha256")
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some(source_hash.as_str())
+                                    && page.get("preflight_context")
+                                        == Some(&preflight_context_for_worker)
+                            })
+                        })
+                        {
+                            emit_preflight_progress(
+                                page_number,
+                                total_pages,
+                                "Preflight cache hit...",
+                                &pages,
+                            );
+                            let mut cached_page = previous.clone();
+                            cached_page["cache_hit"] = serde_json::Value::Bool(true);
+                            cached_page["cache_source"] =
+                                serde_json::Value::String("within_job_manifest".into());
+                            cached_page["pass_through"] = serde_json::Value::Bool(
+                                cached_page.get("classification").and_then(serde_json::Value::as_str)
+                                    == Some("skip"),
+                            );
+                            cached_page["skip"] = cached_page["pass_through"].clone();
+                            pages.push(cached_page);
+                            persist_progress(&pages)?;
+                            continue;
+                        }
+                    }
+                    let reused = cache_matches_source;
+                    let mut analysis = if cache_matches_source {
+                        saved.expect("cache match implies saved analysis")
+                    } else {
+                        let route = engine.thumbnail_route(&config, source)?;
+                        if route.classification == "bubble" && !cached {
+                            let pending = serde_json::json!({
+                                "preflight_page_kind": "bubble",
+                                "bubbles": [],
+                                "text_lines": [],
+                                "unmatched_text": [],
+                                "translation_handoff": {"items": []},
+                            });
+                            pages.push(preflight_page_manifest(
+                                page_number,
+                                source,
+                                &source_hash,
+                                &pending,
+                                false,
+                            ));
+                            if let Some(page) = pages.last_mut() {
+                                page["bubble_count"] = serde_json::json!(route.bubble_count);
+                                page["text_line_count"] = serde_json::json!(route.line_count);
+                            }
+                            persist_progress(&pages)?;
+                            continue;
+                        }
+                        let mut value = if route.classification == "skip" {
+                            // A sparse title/cover has no safe text region;
+                            // strict preserve mode will create its verified
+                            // pass-through stage without a fabricated box.
+                            synthetic_skip_analysis(
+                                source_language.as_deref(),
+                                target_language.as_deref(),
+                                &config,
+                                false,
+                            )
+                        } else {
+                            let analysis = engine.analyze(
+                                &config,
+                                source,
+                                source_language.as_deref(),
+                                target_language.as_deref(),
+                            )?;
+                            let value = serde_json::to_value(analysis)?;
+                            if !translate_cover && cover_like_analysis(page_number, &value) {
+                                synthetic_skip_analysis(
+                                    source_language.as_deref(),
+                                    target_language.as_deref(),
+                                    &config,
+                                    true,
+                                )
+                            } else {
+                                value
+                            }
+                        };
+                        value["preflight_source_sha256"] =
+                            serde_json::Value::String(source_hash.clone());
+                        value["preflight_context"] = preflight_context_for_worker.clone();
+                        workflow
+                            .write_analysis_artifact(source, &value)
+                            .map_err(|error| {
+                                FukidashiError::Inference(format!(
+                                    "analysis checkpoint write failed: {error}"
+                                ))
+                            })?;
+                        value
+                    };
+                    let handoff_before = analysis
+                        .get("translation_handoff")
+                        .and_then(|handoff| handoff.get("items"))
+                        .cloned();
+                    let auto_preserved = augment_missing_detected_text_items(&mut analysis)?;
+                    let handoff_changed = handoff_before.as_ref()
+                        != analysis
+                            .get("translation_handoff")
+                            .and_then(|handoff| handoff.get("items"));
+                    if !auto_preserved.is_empty() || handoff_changed {
+                        workflow
+                            .write_analysis_artifact(source, &analysis)
+                            .map_err(|error| {
+                                FukidashiError::Inference(format!(
+                                    "preflight source-item handoff write failed: {error}"
+                                ))
+                            })?;
+                    }
+                    if analysis.get("preflight_source_sha256").is_none() {
+                        analysis["preflight_source_sha256"] =
+                            serde_json::Value::String(source_hash.clone());
+                        workflow
+                            .write_analysis_artifact(source, &analysis)
+                            .map_err(|error| {
+                                FukidashiError::Inference(format!(
+                                    "analysis cache refresh failed: {error}"
+                                ))
+                            })?;
+                    }
+                    analysis["preflight_context"] = preflight_context_for_worker.clone();
+                    pages.push(preflight_page_manifest(
+                        page_number,
+                        source,
+                        &source_hash,
+                        &analysis,
+                        reused,
+                    ));
+                    if let Some(page) = pages.last_mut() {
+                        page["preflight_context"] = preflight_context_for_worker.clone();
+                    }
+                    persist_progress(&pages)?;
+                }
+                Ok::<_, FukidashiError>(pages)
+            })();
+            // One explicit release at the job boundary.  This keeps the
+            // detector/recognizer sessions hot across pages but never leaks
+            // model memory after a completed or failed preflight.
+            engine.release_sessions();
+            operation
+        })
+        .await;
+        let pages = match result {
+            Ok(Ok(pages)) => pages,
+            Ok(Err(error)) => {
+                return json_result(
+                    &serde_json::json!({"protocol":"strict-v1","error":error.to_string()}),
+                    true,
+                );
+            }
+            Err(error) => {
+                return json_result(
+                    &serde_json::json!({"protocol":"strict-v1","error":format!("preflight worker failed: {error}")}),
+                    true,
+                );
+            }
+        };
+        let mut manifest = serde_json::json!({
+            "protocol": "strict-v1",
+            "status": "preflight_ready",
+            "job_id": job_id,
+            "total_pages": total_pages,
+            "translate_cover": translate_cover,
+            "preflight_context": preflight_context_for_response,
+            "pages": pages,
+            "next_action": {"tool":"fukidashi_translation_start","arguments":{"job_id":job.file_name().and_then(|name| name.to_str()).unwrap_or_default(),"translate_cover":translate_cover}},
+        });
+        attach_preflight_cache_telemetry(&mut manifest, &pages, total_pages);
+        let manifest_path = match self.workflow.write_preflight_manifest(&job, &manifest) {
+            Ok(path) => path,
+            Err(error) => {
+                return json_result(
+                    &serde_json::json!({"protocol":"strict-v1","error":format!("persist preflight manifest: {error}")}),
+                    true,
+                );
+            }
+        };
+        emit_page_progress(
+            total_pages,
+            total_pages,
+            "Preflight ready; waiting for page translation...",
+        );
+        let mut response = manifest;
+        response["manifest_path"] = serde_json::Value::String(manifest_path.display().to_string());
+        response["progress"] = page_progress_json(total_pages, total_pages, "Preflight ready");
+        attach_preflight_cache_telemetry(&mut response, &pages, total_pages);
+        json_result(&response, false)
+    }
+
+    #[tool(
         name = "fukidashi_put_lore",
         description = "Validate and atomically write lore before the first submit; use {schema:1,characters:[\"Fuyu\",{id:\"kuga\",names:[\"Kuga\"]}],pronouns:[],glossary:[{source:\"proprietress\",target:\"bà chủ\"}]} (character strings are canonicalized to {id,names,notes}). Known fields are checked, unknown top-level fields are retained, and malformed or oversized values return the expected-shape error; this never invokes an LLM."
     )]
@@ -2308,12 +4502,13 @@ impl FukidashiServer {
 
     #[tool(
         name = "fukidashi_translation_start",
-        description = "Strict-v1 server-owned translation loop. Start from one source image or resume with job_id/job_path. The server analyzes or reuses the first unfinished page and returns compact stable translation items plus an opaque work_token. sfx_mode=preserve (default) keeps structurally unmatched text-* items out of translation, cleaning, and typesetting; preserve-only pages receive a verified pass-through stage and advance automatically; use replace only explicitly. Do not inspect managed job files or construct artifact paths; the submit call accepts only that token and the exact item IDs."
+        description = "Strict-v1 server-owned translation loop. Start from one source image or resume with job_id/job_path. For a fresh multi-page job, call fukidashi_translation_preflight once first; it returns resumable 1/N routing and cached page analysis. The server analyzes or reuses the first unfinished page and returns compact stable translation_items plus explicit preserved_items and an opaque work_token. Every detected source item is either listed in required_translation_ids or listed as preserved; submit exactly one decision for each required ID. Cover-like page 1 is preserved by default; set translate_cover=true during preflight/start to translate it. Dense prose groups are fail-closed when source coverage is missing or implausibly short. source_language accepts auto, ja, zh, ko, en, or latin; legacy pipe values such as en|latin are normalized to automatic routing. sfx_mode=preserve (default) keeps structurally unmatched text-* items out of translation, cleaning, and typesetting; preserve-only pages receive a verified pass-through stage and advance automatically; use replace only explicitly. Do not inspect managed job files or construct artifact paths; the submit call accepts only that token and the exact item IDs."
     )]
     pub async fn translation_start(
         &self,
         Parameters(req): Parameters<TranslationStartRequest>,
     ) -> CallToolResult {
+        let mut req = req;
         if let Some(mode) = req.ocr_mode.as_deref()
             && !matches!(mode, "local" | "auto")
         {
@@ -2336,6 +4531,20 @@ impl FukidashiServer {
                 true,
             );
         }
+        req.source_language = match normalize_requested_source_language(req.source_language.take())
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return json_result(
+                    &serde_json::json!({
+                        "protocol": "strict-v1",
+                        "error": error.to_string(),
+                        "next_step": "use source_language=auto, ja, zh, ko, en, or latin"
+                    }),
+                    true,
+                );
+            }
+        };
         if req.scope.is_some() && (req.job_path.is_some() || req.job_id.is_some()) {
             return json_result(
                 &serde_json::json!({
@@ -2358,6 +4567,43 @@ impl FukidashiServer {
                 );
             }
         };
+        // A new multi-page source gets one explicit bulk routing pass before
+        // any page-level translation token is issued. Existing job_id/job_path
+        // callers retain the legacy per-page resume path when no manifest is
+        // available, so old managed jobs remain resumable and untouched.
+        if req.image_path.is_some() {
+            let total_pages = self.workflow.managed_job_page_count(&job).unwrap_or(0);
+            let preflight_ready = self
+                .workflow
+                .read_preflight_manifest(&job)
+                .ok()
+                .flatten()
+                .is_some_and(|manifest| {
+                    manifest.get("status").and_then(serde_json::Value::as_str)
+                        == Some("preflight_ready")
+                });
+            let needs_preflight = total_pages > 1 && !preflight_ready;
+            if needs_preflight {
+                let job_id = job
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let mut value = serde_json::json!({
+                    "protocol": "strict-v1",
+                    "status": "preflight_required",
+                    "job_id": job_id,
+                    "total_pages": total_pages,
+                    "next_action": {
+                        "tool": "fukidashi_translation_preflight",
+                        "arguments": {"job_id": job_id, "translate_cover": req.translate_cover},
+                    },
+                    "next_step": "call fukidashi_translation_preflight once; then resume with fukidashi_translation_start using the returned job_id",
+                });
+                attach_page_progress(&mut value, 0, total_pages, "Preflight required");
+                emit_page_progress(0, total_pages, "Preflight required before page translation");
+                return json_result(&value, false);
+            }
+        }
         let pending = match self.workflow.next_pending_page(&job) {
             Ok(Some(page)) => page,
             Ok(None) => {
@@ -2395,6 +4641,14 @@ impl FukidashiServer {
                     "error": error.to_string(),
                     "next_step": "fix the reported runtime/model issue and call fukidashi_translation_start again with the same job_id"
                 });
+                add_error_diagnostic(&mut value, &error);
+                if let Some(next_step) = value.get("diagnostic").and_then(|diagnostic| {
+                    diagnostic
+                        .get("next_step")
+                        .and_then(serde_json::Value::as_str)
+                }) {
+                    value["next_step"] = serde_json::Value::String(next_step.to_owned());
+                }
                 attach_page_progress(&mut value, page_number, total_pages, "Error");
                 json_result(&value, true)
             }
@@ -2403,7 +4657,7 @@ impl FukidashiServer {
 
     #[tool(
         name = "fukidashi_translation_submit",
-        description = "Strict-v1 continuation. Submit exactly one translation decision for every stable ID returned by fukidashi_translation_start. The server owns analysis, cleaning, typesetting, stage reuse, model release, and page advancement; do not send image, analysis, clean, mask, font, or output paths. Use keep_source=true and/or needs_review=true for uncertain OCR instead of aborting the page. When every required item uses keep_source=true, the server records a verified source pass-through, skips cleaning/typesetting with an empty crop list, consumes the token once, and returns completed_page plus the next_action."
+        description = "Strict-v1 continuation. Submit exactly one translation decision for every stable ID in required_translation_ids returned by fukidashi_translation_start; preserved_items are already explicit source decisions and must not be omitted from your review. The server owns analysis, cleaning, typesetting, stage reuse, model release, and page advancement; do not send image, analysis, clean, mask, font, or output paths. Use keep_source=true and/or needs_review=true for uncertain OCR instead of aborting the page. When every required item uses keep_source=true, the server records a verified source pass-through, skips cleaning/typesetting with an empty crop list, consumes the token once, and returns completed_page plus the next_action."
     )]
     pub async fn translation_submit(
         &self,
@@ -2431,6 +4685,14 @@ impl FukidashiServer {
                 "work_token": req.work_token,
                 "next_step": "correct the submission or runtime issue and retry the same work_token; call start again only after a stale-token error"
             });
+            add_error_diagnostic(&mut value, &error);
+            if let Some(next_step) = value.get("diagnostic").and_then(|diagnostic| {
+                diagnostic
+                    .get("next_step")
+                    .and_then(serde_json::Value::as_str)
+            }) {
+                value["next_step"] = serde_json::Value::String(next_step.to_owned());
+            }
             attach_page_progress(&mut value, claim.page_number, claim.total_pages, "Error");
             json_result(&value, true)
         };
@@ -2485,6 +4747,12 @@ impl FukidashiServer {
             Ok(plan) => plan,
             Err(error) => return fail(self, error),
         };
+        if let Err(error) = validate_prose_source_coverage(&analysis, &claim.source_image, &plan) {
+            return fail(self, error);
+        }
+        if let Err(error) = validate_prose_group_geometry(&analysis, &plan) {
+            return fail(self, error);
+        }
         let all_keep_source = !plan.selected.is_empty()
             && plan.selected.iter().all(|selection| selection.keep_source);
         let payloads = if all_keep_source {
@@ -2743,6 +5011,13 @@ impl FukidashiServer {
                 true,
             );
         }
+        let source_language = match normalize_requested_source_language(req.source_language.clone())
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return json_result(&serde_json::json!({"error":error.to_string()}), true);
+            }
+        };
         let requested_checkpoint_path = match req.checkpoint_path.as_deref().map(path).transpose() {
             Ok(value) => value,
             Err(error) => {
@@ -2832,7 +5107,7 @@ impl FukidashiServer {
                     };
                     let ocr = Arc::clone(&self.ocr);
                     let config = self.config.clone();
-                    let source = req.source_language;
+                    let source = source_language;
                     let target = req.target_language;
                     let corrections = req.corrected_source_text;
                     let response_detail = response_detail.to_owned();
@@ -2975,7 +5250,7 @@ impl FukidashiServer {
             match checkpoint_text_regions(&analysis_path, replace_sfx) {
                 Ok(mut regions) => text_regions.append(&mut regions),
                 Err(error) => {
-                    return json_result(&serde_json::json!({"error":error.to_string()}), true);
+                    return json_result(&error_json(&error), true);
                 }
             }
         }
@@ -3076,7 +5351,7 @@ impl FukidashiServer {
         };
         match result {
             Ok(v) => json_result(&v, false),
-            Err(e) => json_result(&serde_json::json!({"error":e.to_string()}), true),
+            Err(e) => json_result(&error_json(&e), true),
         }
     }
     #[tool(
@@ -3120,9 +5395,10 @@ impl FukidashiServer {
     }
     #[tool(
         name = "fukidashi_typeset",
-        description = "Render supplied translations into speech bubbles using shaped glyph metrics. Use bundled Comic Neue for comic dialogue and Patrick Hand coverage for Vietnamese; do not pass generic Windows UI fonts such as Arial, Calibri, Segoe UI, Tahoma, Verdana, Times, or DejaVu Sans as a primary because the server substitutes Comic Neue and reports the substitution."
+        description = "Render supplied translations into speech bubbles using shaped glyph metrics. Use bundled Comic Neue for comic dialogue and Patrick Hand coverage for Vietnamese. Chinese, Korean, and Japanese glyphs use configured or installed system CJK fonts when available. Do not pass generic Windows UI fonts such as Arial, Calibri, Segoe UI, Tahoma, Verdana, Times, or DejaVu Sans as a primary because the server substitutes Comic Neue and reports the substitution."
     )]
     pub async fn typeset(&self, Parameters(req): Parameters<TypesetRequest>) -> CallToolResult {
+        let req_global_font = req.font_path.clone();
         let (image_path, bubbles, fallback_font_paths) = resolve_typeset_request(req);
         let image_path = match path(&image_path) {
             Ok(p) => p,
@@ -3262,6 +5538,12 @@ impl FukidashiServer {
                 );
             }
         };
+        // Historical effective global font: the managed path the renderer
+        // actually used. Operator provenance stays in
+        // `requested_global_font_path`; the historical rerender baseline must
+        // be a usable managed value, not an external path that may disappear.
+        let effective_global_font =
+            effective_global_font_path(&workflow, &job_root, req_global_font.as_deref());
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _render_lock = render_lock;
@@ -3299,7 +5581,23 @@ impl FukidashiServer {
                 }
                 value["font_substitutions"] = serde_json::Value::Array(substitutions);
             }
-            let qa = crate::typeset::post_render_qa(&clean_artifact, &value)?;
+            let mut qa = crate::typeset::post_render_qa(&clean_artifact, &value)?;
+            if let Some(qa_obj) = qa.as_object_mut() {
+                qa_obj.insert(
+                    "global_font_path".to_owned(),
+                    effective_global_font
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+                qa_obj.insert(
+                    "requested_global_font_path".to_owned(),
+                    req_global_font
+                        .clone()
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
             let sidecar = workflow
                 .register_render_locked(
                     &output_path,
@@ -3495,13 +5793,29 @@ impl FukidashiServer {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         if action == "request_fixes" {
+            let persistence_path = served
+                .get("persistence_path")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from);
+            let project_dir = persistence_path.as_ref().and_then(|path| path.parent());
+            let job_id = project_dir
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .map(str::to_owned);
+            let state_revision = project_dir
+                .and_then(|dir| std::fs::read(dir.join("project.json")).ok())
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .and_then(|state| state.get("state_revision")?.as_u64());
             let value = serde_json::json!({
                 "protocol": "review-v1",
                 "status": "fixes_requested",
                 "editor_url": url,
+                "job_id": job_id,
+                "format": req.format,
+                "state_revision": state_revision,
                 "review": review,
                 "feedback": review.get("feedback").cloned().unwrap_or(serde_json::Value::Array(Vec::new())),
-                "next_action": "apply the returned feedback, serve the editor again, and call fukidashi_review_and_export",
+                "next_action": "Apply the returned feedback and call fukidashi_review_and_export with this job_id and format",
             });
             return json_result(&value, false);
         }
@@ -3544,6 +5858,531 @@ impl FukidashiServer {
     /// Export an already-approved review's project directory and wrap the
     /// result in the standard review-v1 envelope. Shared by the live-review
     /// path and the already-completed fast path in `review_and_export_inner`.
+    ///
+    /// The exporter proves it packages the exact artifacts of the approved
+    /// frozen semantic snapshot: revision, job identity, snapshot signature,
+    /// checkpoint identity, expected page set, completed entries, and current
+    /// validated artifact hashes/signatures must ALL agree. Approving snapshot
+    /// A and then exporting modified semantics B is rejected even when the
+    /// page count is unchanged (Blocker 7).
+    fn verify_approval_binding(
+        project_dir: &Path,
+        review: &serde_json::Value,
+    ) -> anyhow::Result<bool> {
+        // The wait response is intentionally compact and may omit audit
+        // details. Once a review exists on disk, that file is authoritative;
+        // the caller-supplied value is only a compatibility fallback for
+        // older/unit fixtures that have no persisted review file.
+        let persisted_review = project_dir
+            .join("review.json")
+            .is_file()
+            .then(|| std::fs::read(project_dir.join("review.json")))
+            .transpose()?
+            .map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes))
+            .transpose()?;
+        let review = persisted_review.as_ref().unwrap_or(review);
+        let binding = review
+            .get("audit")
+            .and_then(|audit| audit.as_array())
+            .into_iter()
+            .flatten()
+            .rev()
+            .find(|entry| {
+                entry.get("event").and_then(|event| event.as_str()) == Some("approve_export")
+                    && entry.get("approval").is_some()
+            })
+            .and_then(|entry| entry.get("approval"))
+            .cloned();
+        let Some(binding) = binding else {
+            // Legacy approval without a frozen snapshot keeps the old loose
+            // semantics for compatibility.
+            return Ok(false);
+        };
+        let revision = review
+            .get("revision")
+            .and_then(|revision| revision.as_u64());
+        let binding_revision = binding
+            .get("revision")
+            .and_then(|revision| revision.as_u64());
+        if revision != binding_revision {
+            anyhow::bail!("approval binding revision does not match the review revision");
+        }
+        let Some(revision) = revision else {
+            anyhow::bail!("approval binding review has no revision");
+        };
+        // approved_pages must be exactly the full 0..N set, not just a
+        // matching count.
+        let approved_pages = review
+            .get("approved_pages")
+            .and_then(|pages| pages.as_array())
+            .map(|pages| {
+                pages
+                    .iter()
+                    .filter_map(|page| page.as_u64())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let packaged_pages = binding
+            .get("packaged_pages")
+            .and_then(|pages| pages.as_u64())
+            .unwrap_or(0);
+        let manifest_bytes = std::fs::read(project_dir.join("project.json"))
+            .map_err(|_| anyhow::anyhow!("approval binding cannot read project.json"))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|_| anyhow::anyhow!("approval binding cannot parse project.json"))?;
+        let manifest_pages = manifest
+            .get("pages")
+            .and_then(|pages| pages.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let expected_set: Vec<u64> = (0..manifest_pages.len() as u64).collect();
+        let mut approved_sorted = approved_pages.clone();
+        approved_sorted.sort_unstable();
+        if approved_sorted != expected_set
+            || packaged_pages as usize != manifest_pages.len()
+            || manifest_pages.is_empty()
+        {
+            anyhow::bail!("approval binding does not cover the approved pages");
+        }
+        // Job identity: the binding, the checkpoint, and the directory must
+        // all name the same job.
+        let dir_job_id = project_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let binding_job_id = binding
+            .get("job_id")
+            .and_then(|job| job.as_str())
+            .unwrap_or("");
+        if !binding_job_id.is_empty() && binding_job_id != dir_job_id {
+            anyhow::bail!("approval binding job does not match this project directory");
+        }
+        let checkpoint =
+            crate::approval::load_approval_checkpoint(project_dir, revision).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "approval binding has no matching checkpoint for revision {revision}; re-approve the current revision"
+                )
+            })?;
+        if checkpoint.job_id != dir_job_id
+            || (!binding_job_id.is_empty() && checkpoint.job_id != binding_job_id)
+        {
+            anyhow::bail!("approval checkpoint job does not match this project directory");
+        }
+        let binding_signature = binding
+            .get("snapshot_signature")
+            .and_then(|signature| signature.as_str())
+            .unwrap_or("");
+        if binding_signature.is_empty() || checkpoint.snapshot_signature != binding_signature {
+            anyhow::bail!(
+                "approval checkpoint does not match the approved snapshot; re-approve the current revision"
+            );
+        }
+        // Full-state binding: recompute the post-render semantic signature of
+        // every current page. ANY semantic drift since approval — including on
+        // pages that were clean at approval time — blocks the export.
+        let current_state = crate::editor::approval_state_signature(&manifest, Some(project_dir));
+        let current_state_signature = crate::approval::snapshot_signature(&current_state);
+        let binding_state = binding
+            .get("state_signature")
+            .and_then(|signature| signature.as_str())
+            .unwrap_or("");
+        if !binding_state.is_empty() && binding_state != current_state_signature {
+            anyhow::bail!(
+                "project semantics changed since approval (snapshot {binding_signature}); re-approve the current revision so the export binds to its frozen snapshot"
+            );
+        }
+        // Per-page proof: every dirty page of the frozen plan must hold a
+        // complete checkpoint entry whose semantic signature, input hashes,
+        // output path, and live output bytes validate right now.
+        let dirty_pages: Vec<usize> = binding
+            .get("dirty_pages")
+            .and_then(|pages| pages.as_array())
+            .map(|pages| {
+                pages
+                    .iter()
+                    .filter_map(|page| page.as_u64().and_then(|index| usize::try_from(index).ok()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let managed = project_dir.join("job.json").is_file()
+            || project_dir.join(".fukidashi-job.json").is_file();
+        let workflow = if managed {
+            project_dir
+                .parent()
+                .map(|parent| crate::workflow::Workflow::new(parent.to_path_buf()))
+                .transpose()
+                .map_err(|error| {
+                    anyhow::anyhow!("approval binding cannot open workflow: {error}")
+                })?
+        } else {
+            None
+        };
+        for page_index in dirty_pages {
+            let page = manifest_pages.get(page_index).ok_or_else(|| {
+                anyhow::anyhow!("approval binding page {page_index} is outside the current project")
+            })?;
+            let semantic_render_signature =
+                crate::editor::post_render_page_signature(&manifest, page);
+            let page_id = page
+                .get("id")
+                .and_then(|id| id.as_str())
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("page-{page_index}"));
+            let output_path = page
+                .get("rendered_image_path")
+                .and_then(|path| path.as_str())
+                .map(|path| {
+                    let candidate = std::path::Path::new(path);
+                    if candidate.is_absolute() {
+                        candidate.to_path_buf()
+                    } else {
+                        project_dir.join(candidate)
+                    }
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!("approval binding page {page_index} has no rendered image path")
+                })?;
+            let (source_sha256, clean_sha256) = match workflow.as_ref() {
+                Some(managed_workflow) => {
+                    let corrected = page
+                        .get("corrected_cleaned_image_path")
+                        .and_then(|path| path.as_str())
+                        .map(std::path::PathBuf::from)
+                        .filter(|path| {
+                            let absolute = if path.is_absolute() {
+                                path.clone()
+                            } else {
+                                project_dir.join(path)
+                            };
+                            absolute.is_file()
+                        });
+                    let base = page
+                        .get("cleaned_image_path")
+                        .and_then(|path| path.as_str())
+                        .map(std::path::PathBuf::from);
+                    let mut hashes = (String::new(), String::new());
+                    for candidate in corrected.into_iter().chain(base) {
+                        let absolute = if candidate.is_absolute() {
+                            candidate
+                        } else {
+                            project_dir.join(candidate)
+                        };
+                        if let Ok(clean) = managed_workflow.validate_clean_input(&absolute) {
+                            hashes = (clean.source_sha256, clean.cleaned_sha256);
+                            break;
+                        }
+                    }
+                    hashes
+                }
+                None => (String::new(), String::new()),
+            };
+            if workflow.as_ref().is_some_and(|managed_workflow| {
+                managed_workflow
+                    .validate_render_input(&output_path)
+                    .is_err()
+            }) {
+                anyhow::bail!(
+                    "approval binding page {page_index} cached render is invalid; re-approve the current revision"
+                );
+            }
+            let expected = crate::approval::ExpectedPageProvenance {
+                page_index,
+                page_id,
+                semantic_render_signature,
+                source_sha256,
+                clean_sha256,
+                output_path,
+            };
+            let entry = checkpoint.pages.get(&page_index.to_string()).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "approval binding page {page_index} has no completed checkpoint entry; re-approve the current revision"
+                )
+            })?;
+            let live_hash = crate::approval::sha256_file(&expected.output_path).ok();
+            if !crate::approval::checkpoint_entry_valid(entry, &expected, live_hash.as_deref()) {
+                anyhow::bail!(
+                    "approval binding page {page_index} no longer matches its approved artifact; re-approve the current revision"
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// Revalidate every managed rendered artifact while the caller holds the
+    /// job render lease. Approval checkpoints cover dirty pages; export must
+    /// also prove that clean/reused pages still point at their own live,
+    /// sidecar-backed artifacts before packaging begins.
+    fn validate_managed_export_artifacts(
+        project_dir: &Path,
+        bound_approval: bool,
+    ) -> anyhow::Result<()> {
+        let managed = project_dir.join("job.json").is_file()
+            || project_dir.join(".fukidashi-job.json").is_file();
+        if !managed {
+            return Ok(());
+        }
+        let workflow = Workflow::new(
+            project_dir
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("managed export job has no jobs root"))?
+                .to_path_buf(),
+        )?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(project_dir.join("project.json")).map_err(
+                |error| anyhow::anyhow!("read project.json for artifact validation: {error}"),
+            )?)?;
+        let pages = manifest
+            .get("pages")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("managed project has no pages"))?;
+        // Sidecars written before semantic_render_signature was introduced
+        // still contain enough provenance to be checked against the cached
+        // editor state.  Defer this comparison until the first legacy page
+        // is found; modern sidecars keep the existing fast path.
+        let mut legacy_dirty_pages: Option<BTreeSet<usize>> = None;
+        let mut legacy_sidecars = Vec::new();
+        for (index, page) in pages.iter().enumerate() {
+            let rendered = page
+                .get("rendered_image_path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("page {index} has no rendered image path"))?;
+            let rendered_path = {
+                let candidate = Path::new(rendered);
+                if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    project_dir.join(candidate)
+                }
+            };
+            let artifact = workflow
+                .validate_render_input(&rendered_path)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "managed export page {index} rendered artifact is invalid: {error}"
+                    )
+                })?;
+            let mut expected_semantic = String::new();
+            let mut legacy_signature_missing = false;
+            if bound_approval {
+                expected_semantic = crate::editor::post_render_page_signature(&manifest, page);
+                let actual_semantic = artifact
+                    .qa
+                    .get("semantic_render_signature")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                match actual_semantic {
+                    Some(actual_semantic)
+                        if !crate::approval::semantic_render_signatures_equal(
+                            &actual_semantic,
+                            &expected_semantic,
+                        ) =>
+                    {
+                        anyhow::bail!(
+                            "managed export page {index} render sidecar semantic signature is stale; re-render and re-approve"
+                        );
+                    }
+                    Some(_) => {}
+                    None => {
+                        legacy_signature_missing = true;
+                        // A legacy sidecar has no independent semantic claim.
+                        // Before upgrading it, compare its cached typeset
+                        // payload with every page in the current project. The
+                        // workflow comparison ignores renderer-only metadata,
+                        // validates typeset completeness, and still forces a
+                        // rerender for a changed translation/geometry/stroke.
+                        if legacy_dirty_pages.is_none() {
+                            let dirty_pages = workflow
+                                .editor_render_plan(project_dir, &manifest)
+                                .map_err(|error| {
+                                    anyhow::anyhow!(
+                                        "managed export legacy sidecar verification failed: {error}"
+                                    )
+                                })?
+                                .into_iter()
+                                .collect::<BTreeSet<_>>();
+                            legacy_dirty_pages = Some(dirty_pages);
+                        }
+                        let dirty_pages = legacy_dirty_pages
+                            .as_ref()
+                            .expect("legacy dirty pages were just stored");
+                        if dirty_pages.contains(&index) {
+                            anyhow::bail!(
+                                "managed export page {index} legacy render sidecar does not match current semantics; re-render and re-approve"
+                            );
+                        }
+                    }
+                }
+                if artifact.rendered_sha256.trim().is_empty() {
+                    anyhow::bail!(
+                        "managed export page {index} render sidecar has no rendered byte hash; re-render and re-approve"
+                    );
+                }
+                let actual_hash = crate::approval::sha256_file(&rendered_path)?;
+                if actual_hash != artifact.rendered_sha256 {
+                    anyhow::bail!(
+                        "managed export page {index} rendered byte hash is stale; re-render and re-approve"
+                    );
+                }
+            }
+            let source = page
+                .get("image_path")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("page {index} has no source image path"))?;
+            let source_path = {
+                let candidate = Path::new(source);
+                if candidate.is_absolute() {
+                    candidate.to_path_buf()
+                } else {
+                    project_dir.join(candidate)
+                }
+            };
+            let expected_source = std::fs::canonicalize(&source_path).map_err(|error| {
+                anyhow::anyhow!("page {index} source image cannot be resolved: {error}")
+            })?;
+            let actual_source = std::fs::canonicalize(&artifact.source_image).map_err(|error| {
+                anyhow::anyhow!("page {index} render source cannot be resolved: {error}")
+            })?;
+            if expected_source != actual_source {
+                anyhow::bail!(
+                    "managed export page {index} rendered artifact is bound to the wrong source page"
+                );
+            }
+            if bound_approval {
+                let expected_clean = page
+                    .get("corrected_cleaned_image_path")
+                    .or_else(|| page.get("cleaned_image_path"))
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("page {index} has no clean image path"))?;
+                let expected_clean_path = {
+                    let candidate = Path::new(expected_clean);
+                    if candidate.is_absolute() {
+                        candidate.to_path_buf()
+                    } else {
+                        project_dir.join(candidate)
+                    }
+                };
+                let expected_clean =
+                    std::fs::canonicalize(&expected_clean_path).map_err(|error| {
+                        anyhow::anyhow!("page {index} clean image cannot be resolved: {error}")
+                    })?;
+                let actual_clean =
+                    std::fs::canonicalize(&artifact.cleaned_image).map_err(|error| {
+                        anyhow::anyhow!(
+                            "page {index} render clean image cannot be resolved: {error}"
+                        )
+                    })?;
+                let clean_alias = if expected_clean != actual_clean {
+                    if !legacy_signature_missing {
+                        anyhow::bail!(
+                            "managed export page {index} rendered artifact is bound to the wrong clean image"
+                        );
+                    }
+                    let expected_clean_artifact = workflow
+                        .validate_clean_input(&expected_clean_path)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "managed export page {index} legacy clean alias cannot be validated: {error}"
+                            )
+                        })?;
+                    let actual_clean_artifact = workflow
+                        .validate_clean_input(&artifact.cleaned_image)
+                        .map_err(|error| {
+                            anyhow::anyhow!(
+                                "managed export page {index} legacy render clean artifact is invalid: {error}"
+                            )
+                        })?;
+                    if expected_clean_artifact.source_sha256 != actual_clean_artifact.source_sha256
+                        || expected_clean_artifact.cleaned_sha256
+                            != actual_clean_artifact.cleaned_sha256
+                        || std::fs::canonicalize(&expected_clean_artifact.source_image)?
+                            != std::fs::canonicalize(&actual_clean_artifact.source_image)?
+                    {
+                        anyhow::bail!(
+                            "managed export page {index} legacy clean alias has different provenance; re-render and re-approve"
+                        );
+                    }
+                    Some(expected_clean)
+                } else {
+                    None
+                };
+                if legacy_signature_missing {
+                    legacy_sidecars.push((
+                        PathBuf::from(format!("{}.fukidashi-render.json", rendered_path.display())),
+                        expected_semantic,
+                        clean_alias,
+                    ));
+                }
+            }
+        }
+        // Upgrade only after every page has passed the export checks.  Each
+        // update is atomic and records the signature derived from the
+        // already-bound project state, so a partial failed export cannot
+        // create a false approval; a later retry simply sees a modern
+        // sidecar. Existing non-missing signatures are never rewritten.
+        for (sidecar_path, semantic_signature, clean_alias) in legacy_sidecars {
+            let mut sidecar: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&sidecar_path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "read legacy render sidecar {} for migration: {error}",
+                        sidecar_path.display()
+                    )
+                })?)
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "parse legacy render sidecar {} for migration: {error}",
+                        sidecar_path.display()
+                    )
+                })?;
+            if let Some(expected_clean_path) = clean_alias {
+                sidecar["cleaned_image"] =
+                    serde_json::Value::String(expected_clean_path.display().to_string());
+                sidecar["clean_sidecar"] = serde_json::Value::String(format!(
+                    "{}.fukidashi-clean.json",
+                    expected_clean_path.display()
+                ));
+            }
+            {
+                let qa = sidecar
+                    .get_mut("qa")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "legacy render sidecar {} has no QA object; re-render and re-approve",
+                            sidecar_path.display()
+                        )
+                    })?;
+                match qa.get("semantic_render_signature") {
+                    Some(serde_json::Value::String(existing))
+                        if crate::approval::semantic_render_signatures_equal(
+                            existing,
+                            &semantic_signature,
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Some(_) => anyhow::bail!(
+                        "managed export render sidecar {} changed during validation",
+                        sidecar_path.display()
+                    ),
+                    None => {
+                        qa.insert(
+                            "semantic_render_signature".to_owned(),
+                            serde_json::Value::String(semantic_signature),
+                        );
+                    }
+                }
+            }
+            crate::editor::atomic_json_save(&sidecar_path, &sidecar).map_err(|error| {
+                anyhow::anyhow!(
+                    "migrate legacy render sidecar {}: {error}",
+                    sidecar_path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     async fn export_approved_project(
         &self,
         project_dir: PathBuf,
@@ -3551,6 +6390,9 @@ impl FukidashiServer {
         review: serde_json::Value,
         url: String,
     ) -> CallToolResult {
+        // The actual export path re-reads the authoritative review while
+        // holding the writer lease. This also covers the compact wait result,
+        // which intentionally does not carry the full audit trail.
         let export = self
             .export(Parameters(ExportRequest {
                 project_dir: project_dir.display().to_string(),
@@ -3592,6 +6434,621 @@ impl FukidashiServer {
     ) -> CallToolResult {
         self.review_and_export_inner(req, launch_default_browser)
             .await
+    }
+
+    #[tool(
+        name = "fukidashi_retranslation_source",
+        description = "For a missing-dialogue review flag, crop and OCR the exact bbox from the ORIGINAL managed source page. Use the exact zero-based page. Pass bbox as an object {x1,y1,x2,y2}, a four-number array [x1,y1,x2,y2], or flat numeric x1,y1,x2,y2 fields; region/bounds/rect are accepted aliases. The rendered/cleaned image is never used for source recognition. Returns normalized bbox, source_ocr, and the crop image for visual review; pass that source_ocr and bbox to fukidashi_retranslation_submit."
+    )]
+    pub async fn retranslation_source(
+        &self,
+        Parameters(req): Parameters<RetranslationSourceRequest>,
+    ) -> CallToolResult {
+        let operation = async {
+            let job = self.workflow.resolve_managed_job_id(&req.job_id)?;
+            let _render_lock = self.workflow.acquire_render_lock(&job)?;
+            let source = self
+                .workflow
+                .managed_source_paths_for_editor(&job)?
+                .get(req.page)
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "page index {} is outside the managed page inventory",
+                        req.page
+                    )
+                })?;
+            let page_state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(job.join("project.json"))?)?;
+            let page = page_state
+                .get("pages")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|pages| pages.get(req.page))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("page index {} is outside editor state", req.page)
+                })?;
+            let page_image = page
+                .get("image_path")
+                .or_else(|| page.get("source_image"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("review page has no source image identity"))?;
+            let page_image = PathBuf::from(page_image);
+            let page_image = if page_image.is_absolute() {
+                page_image
+            } else {
+                job.join(page_image)
+            };
+            let page_image = std::fs::canonicalize(page_image)?;
+            if page_image != source {
+                anyhow::bail!(
+                    "review page index does not match the managed page inventory; refresh feedback"
+                );
+            }
+            let rect = parse_retranslation_bbox(req.bbox.as_ref(), req.x1, req.y1, req.x2, req.y2)?;
+            let has_flag = page
+                .get("issues")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|issues| {
+                    issues.iter().any(|issue| {
+                        issue.get("origin").and_then(serde_json::Value::as_str)
+                            == Some("missing-dialogue-flag")
+                            && issue.get("issue_type").and_then(serde_json::Value::as_str)
+                                == Some("wrong_or_missing_bubble")
+                            && issue
+                                .get("bbox")
+                                .cloned()
+                                .and_then(|value| serde_json::from_value::<Rect>(value).ok())
+                                .is_some_and(|flag_bbox| rects_close(flag_bbox, rect))
+                    })
+                });
+            if !has_flag {
+                anyhow::bail!("bbox does not match a current missing-dialogue flag on this page");
+            }
+            let (width, height) = image::image_dimensions(&source)?;
+            if rect.x1 < 0.0 || rect.y1 < 0.0 || rect.x2 > width as f32 || rect.y2 > height as f32 {
+                anyhow::bail!("source bbox is outside the managed page bounds");
+            }
+            let x_pad = ((rect.x2 - rect.x1) * 0.12).max(12.0);
+            let y_pad = ((rect.y2 - rect.y1) * 0.12).max(12.0);
+            let crop_bbox = Rect {
+                x1: (rect.x1 - x_pad).max(0.0),
+                y1: (rect.y1 - y_pad).max(0.0),
+                x2: (rect.x2 + x_pad).min(width as f32),
+                y2: (rect.y2 + y_pad).min(height as f32),
+            };
+            let left = crop_bbox.x1.floor() as u32;
+            let top = crop_bbox.y1.floor() as u32;
+            let right = crop_bbox.x2.ceil().min(width as f32) as u32;
+            let bottom = crop_bbox.y2.ceil().min(height as f32) as u32;
+            let permit = Arc::clone(&self.slots)
+                .acquire_owned()
+                .await
+                .map_err(|error| anyhow::anyhow!("OCR worker capacity closed: {error}"))?;
+            let ocr = Arc::clone(&self.ocr);
+            let config = self.config.clone();
+            let source_for_worker = source.clone();
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let _permit = permit;
+                let original = image::open(&source_for_worker)?.to_rgb8();
+                let crop = image::imageops::crop_imm(
+                    &original,
+                    left,
+                    top,
+                    right.saturating_sub(left),
+                    bottom.saturating_sub(top),
+                )
+                .to_image();
+                let mut crop_file = tempfile::Builder::new().suffix(".png").tempfile()?;
+                image::DynamicImage::ImageRgb8(crop.clone())
+                    .write_to(crop_file.as_file_mut(), image::ImageFormat::Png)?;
+                crop_file.as_file().sync_all()?;
+                let crop_bytes = std::fs::read(crop_file.path())?;
+                let mut engine = ocr
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("OCR session lock poisoned"))?;
+                let analysis = engine.analyze(&config, crop_file.path(), None, None);
+                let _ = engine.finish_heavy_call(config.session_recycle_pages());
+                match analysis {
+                    Ok(analysis) => {
+                        let texts = analysis
+                            .translation_handoff
+                            .items
+                            .iter()
+                            .map(|item| item.source_text.trim())
+                            .filter(|text| !text.is_empty())
+                            .collect::<Vec<_>>();
+                        Ok((crop_bytes, texts.join("\n"), None))
+                    }
+                    Err(error) => Ok((crop_bytes, String::new(), Some(error.to_string()))),
+                }
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("source crop OCR worker failed: {error}"))??;
+            drop(_render_lock);
+            Ok::<_, anyhow::Error>((crop_bbox, rect, result.0, result.1, result.2))
+        }
+        .await;
+        match operation {
+            Ok((crop_bbox, rect, crop_bytes, source_ocr, ocr_error)) => {
+                let value = serde_json::json!({
+                    "protocol": "retranslation-v1",
+                    "status": if source_ocr.trim().is_empty() { "ocr_empty" } else { "source_ready" },
+                    "job_id": req.job_id,
+                    "page": req.page,
+                    "bbox": rect,
+                    "source_crop_bbox": crop_bbox,
+                    "source_ocr": source_ocr,
+                    "ocr_error": ocr_error,
+                    "source": "original_managed_page"
+                });
+                let encoded =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, crop_bytes);
+                CallToolResult::success(vec![
+                    ContentBlock::text(
+                        serde_json::to_string(&value)
+                            .unwrap_or_else(|error| format!("{{\"error\":{error}}}")),
+                    ),
+                    ContentBlock::image(encoded, "image/png"),
+                ])
+            }
+            Err(error) => json_result(
+                &serde_json::json!({
+                    "protocol": "retranslation-v1",
+                    "status": "source_ocr_failed",
+                    "error": format!("{error:#}"),
+                    "next_action": "Verify the page and bbox from missing-dialogue feedback, then retry source OCR"
+                }),
+                true,
+            ),
+        }
+    }
+
+    #[tool(
+        name = "fukidashi_retranslation_submit",
+        description = "Submit a fresh translation for one reviewed item. For an existing bubble, pass job_id, zero-based page, bubble_id, expected_current_translation, and translation. For missing-dialogue feedback, pass job_id, page, bbox as {x1,y1,x2,y2}, [x1,y1,x2,y2], or flat numeric x1,y1,x2,y2 fields, plus translation; region/bounds/rect are accepted aliases. First call fukidashi_retranslation_source with the same coordinates to inspect/OCR the original-source crop, then optionally pass source_ocr or corrected source_text. If the flagged region overlaps an existing empty bubble, the server fills that bubble instead of adding a duplicate; otherwise it adds a manual bubble. It then cleans/typesets against the original page. Optionally pass the original export format (zip, epub, or html_monolith). The tool rejects stale or unflagged items and rolls back the page artifacts on render failure."
+    )]
+    pub async fn retranslation_submit(
+        &self,
+        Parameters(req): Parameters<RetranslationSubmitRequest>,
+    ) -> CallToolResult {
+        let result = (|| -> anyhow::Result<serde_json::Value> {
+            if req.translation.trim().is_empty() {
+                anyhow::bail!("translation must not be empty");
+            }
+            if req.translation.len() > 4096 {
+                anyhow::bail!("translation is too long (maximum 4096 UTF-8 bytes)");
+            }
+            if req
+                .format
+                .as_deref()
+                .is_some_and(|format| !matches!(format, "zip" | "epub" | "html_monolith"))
+            {
+                anyhow::bail!("format must be zip, epub, or html_monolith");
+            }
+            let job = self.workflow.resolve_managed_job_id(&req.job_id)?;
+            // Hold the same cross-process lease as editor saves/renders from
+            // before reading project.json until the transaction commits or
+            // rolls back. This makes the revision check and backups meaningful.
+            let _render_lock = self.workflow.acquire_render_lock(&job)?;
+            let project_path = job.join("project.json");
+            let bytes = std::fs::read(&project_path)
+                .map_err(|e| anyhow::anyhow!("read managed editor state: {e}"))?;
+            let mut state: serde_json::Value = serde_json::from_slice(&bytes)
+                .map_err(|e| anyhow::anyhow!("parse managed editor state: {e}"))?;
+            let revision = state
+                .get("state_revision")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if req
+                .state_revision
+                .is_some_and(|expected| expected != revision)
+            {
+                anyhow::bail!(
+                    "stale editor state revision {}; current revision is {revision}; refresh review feedback",
+                    req.state_revision.unwrap()
+                );
+            }
+            let sources = self.workflow.managed_source_paths_for_editor(&job)?;
+            let source = sources.get(req.page).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "page index {} is outside the managed page inventory",
+                    req.page
+                )
+            })?;
+            let page = state
+                .get_mut("pages")
+                .and_then(serde_json::Value::as_array_mut)
+                .and_then(|pages| pages.get_mut(req.page))
+                .ok_or_else(|| anyhow::anyhow!("page index {} is outside this job", req.page))?;
+            let page_source = page
+                .get("image_path")
+                .or_else(|| page.get("source_image"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("review page has no source image identity"))?;
+            let page_source = PathBuf::from(page_source);
+            let page_source = if page_source.is_absolute() {
+                page_source
+            } else {
+                job.join(page_source)
+            };
+            let page_source = std::fs::canonicalize(&page_source)
+                .map_err(|e| anyhow::anyhow!("resolve review page source: {e}"))?;
+            if page_source != source {
+                anyhow::bail!(
+                    "review page index does not match the managed page inventory; refresh feedback"
+                );
+            }
+            let target_id = if let Some(bubble_id) = req.bubble_id.as_deref() {
+                let bubbles = page
+                    .get_mut("bubbles")
+                    .and_then(serde_json::Value::as_array_mut)
+                    .ok_or_else(|| anyhow::anyhow!("page has no editable bubbles"))?;
+                let matches = bubbles
+                    .iter_mut()
+                    .filter(|bubble| {
+                        bubble.get("id").and_then(serde_json::Value::as_str) == Some(bubble_id)
+                    })
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    anyhow::bail!(
+                        "bubble_id must identify exactly one bubble on the requested page"
+                    );
+                }
+                let bubble = &mut matches.into_iter().next().unwrap();
+                if bubble
+                    .get("retranslate_requested")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                {
+                    anyhow::bail!("bubble is not currently marked for retranslation");
+                }
+                let current = bubble
+                    .get("translation")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if Some(current) != req.expected_current_translation.as_deref() {
+                    anyhow::bail!(
+                        "bubble translation changed since feedback; refresh review feedback before submitting"
+                    );
+                }
+                let source_text = ["source_ocr", "source_text", "text"]
+                    .into_iter()
+                    .filter_map(|key| bubble.get(key).and_then(serde_json::Value::as_str))
+                    .find(|text| !text.trim().is_empty())
+                    .unwrap_or("");
+                if source_text.trim().is_empty() {
+                    anyhow::bail!(
+                        "bubble has no source OCR text; rerun OCR or provide source text in the editor before requesting retranslation"
+                    );
+                }
+                bubble["translation"] = serde_json::Value::String(req.translation.clone());
+                bubble["retranslate_requested"] = serde_json::Value::Bool(false);
+                // A retranslation request is an explicit decision to replace a
+                // preserve-source result for this bubble.
+                bubble["preserve_source"] = serde_json::Value::Bool(false);
+                bubble["keep_source"] = serde_json::Value::Bool(false);
+                bubble_id.to_owned()
+            } else {
+                let bbox =
+                    parse_retranslation_bbox(req.bbox.as_ref(), req.x1, req.y1, req.x2, req.y2)?;
+                let source_ocr = req.source_ocr.as_deref().unwrap_or("").trim();
+                let source_text = req
+                    .source_text
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .unwrap_or(source_ocr);
+                if source_ocr.len() > 4096 || source_text.len() > 4096 {
+                    anyhow::bail!("source text is too long (maximum 4096 UTF-8 bytes)");
+                }
+                let (width, height) = image::image_dimensions(&source)?;
+                if bbox.x1 < 0.0
+                    || bbox.y1 < 0.0
+                    || bbox.x2 > width as f32
+                    || bbox.y2 > height as f32
+                {
+                    anyhow::bail!("missing-dialogue bbox is outside the managed source page");
+                }
+                let flags = page
+                    .get("issues")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| anyhow::anyhow!("page has no missing-dialogue review flag"))?;
+                let matches = flags
+                    .iter()
+                    .filter(|issue| {
+                        issue.get("origin").and_then(serde_json::Value::as_str)
+                            == Some("missing-dialogue-flag")
+                            && issue.get("issue_type").and_then(serde_json::Value::as_str)
+                                == Some("wrong_or_missing_bubble")
+                            && issue
+                                .get("bbox")
+                                .cloned()
+                                .and_then(|value| serde_json::from_value::<Rect>(value).ok())
+                                .is_some_and(|flag_bbox| rects_close(flag_bbox, bbox))
+                    })
+                    .count();
+                if matches != 1 {
+                    anyhow::bail!(
+                        "bbox must match exactly one current missing-dialogue review flag"
+                    );
+                }
+                let existing_empty_id = best_overlapping_empty_bubble(page, bbox);
+                let replaced_handoff_id = if existing_empty_id.is_none() {
+                    best_overlapping_orphaned_handoff_item(&self.workflow, &source, page, bbox)?
+                } else {
+                    None
+                };
+                let bubble_id = if let Some(existing_id) = existing_empty_id {
+                    let bubbles = page
+                        .get_mut("bubbles")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .ok_or_else(|| anyhow::anyhow!("page has no editable bubbles"))?;
+                    let bubble = bubbles
+                        .iter_mut()
+                        .find(|bubble| {
+                            bubble.get("id").and_then(serde_json::Value::as_str)
+                                == Some(existing_id.as_str())
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("overlapping empty bubble disappeared"))?;
+                    bubble["translation"] = serde_json::Value::String(req.translation.clone());
+                    bubble["preserve_source"] = serde_json::Value::Bool(false);
+                    bubble["keep_source"] = serde_json::Value::Bool(false);
+                    bubble["retranslate_requested"] = serde_json::Value::Bool(false);
+                    bubble["render_dirty"] = serde_json::Value::Bool(true);
+                    if !source_text.trim().is_empty() {
+                        bubble["source_text"] = serde_json::Value::String(source_text.to_owned());
+                    }
+                    if !source_ocr.is_empty() {
+                        bubble["source_ocr"] = serde_json::Value::String(source_ocr.to_owned());
+                    }
+                    existing_id
+                } else {
+                    let bubble_id = format!("missing-dialogue-{}", uuid::Uuid::new_v4().simple());
+                    let bbox_json = serde_json::to_value(bbox)?;
+                    let bubbles = page
+                        .get_mut("bubbles")
+                        .and_then(serde_json::Value::as_array_mut)
+                        .ok_or_else(|| anyhow::anyhow!("page has no editable bubbles"))?;
+                    bubbles.push(serde_json::json!({
+                        "id": bubble_id,
+                        "bbox": bbox_json,
+                        "bubble_bbox": bbox_json,
+                        "text_bbox": bbox_json,
+                        "source_text": source_text,
+                        "source_ocr": source_ocr,
+                        "translation": req.translation,
+                        "kind": "manual_dialogue",
+                        "manual": true,
+                        "replaces_handoff_ids": replaced_handoff_id.iter().collect::<Vec<_>>(),
+                        "preserve_source": false,
+                        "keep_source": false,
+                        "retranslate_requested": false,
+                        "render_dirty": true
+                    }));
+                    bubble_id
+                };
+                if let Some(issues) = page
+                    .get_mut("issues")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    issues.retain(|issue| {
+                        issue.get("origin").and_then(serde_json::Value::as_str)
+                            != Some("missing-dialogue-flag")
+                            || issue.get("issue_type").and_then(serde_json::Value::as_str)
+                                != Some("wrong_or_missing_bubble")
+                            || issue
+                                .get("bbox")
+                                .cloned()
+                                .and_then(|value| serde_json::from_value::<Rect>(value).ok())
+                                .is_none_or(|flag_bbox| !rects_close(flag_bbox, bbox))
+                    });
+                }
+                bubble_id
+            };
+            let previous_render = page
+                .get("rendered_image_path")
+                .and_then(serde_json::Value::as_str)
+                .map(|raw| {
+                    if std::path::Path::new(raw).is_absolute() {
+                        std::path::PathBuf::from(raw)
+                    } else {
+                        job.join(raw)
+                    }
+                })
+                .ok_or_else(|| anyhow::anyhow!("page has no current rendered image"))?;
+            let previous_render = self
+                .workflow
+                .require_owned(&previous_render, "current rendered page")?;
+            let raw_cleaned = page
+                .get("cleaned_image_path")
+                .or_else(|| page.get("cleaned_path"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("page has no current clean image"))?;
+            let raw_cleaned = PathBuf::from(raw_cleaned);
+            let actual_cleaned = self.workflow.require_owned(
+                &if raw_cleaned.is_absolute() {
+                    raw_cleaned
+                } else {
+                    job.join(raw_cleaned)
+                },
+                "current clean page",
+            )?;
+            let (_analysis, mask, cleaned, corrected_clean, rendered_path) =
+                self.workflow.page_artifacts_for_source(&source)?;
+            let removed_ids = page
+                .get("removed_bubbles")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|removed| {
+                    removed
+                        .as_str()
+                        .or_else(|| removed.get("id").and_then(serde_json::Value::as_str))
+                })
+                .collect::<BTreeSet<_>>();
+            let target_request_index = page
+                .get("bubbles")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|bubble| {
+                    bubble
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none_or(|id| !removed_ids.contains(id))
+                })
+                .position(|bubble| {
+                    bubble.get("id").and_then(serde_json::Value::as_str) == Some(target_id.as_str())
+                });
+            let target_render_path = actual_cleaned
+                .parent()
+                .ok_or_else(|| anyhow::anyhow!("clean page has no parent directory"))?
+                .join("rendered.png");
+            let manifest_path = if job.join("job.json").is_file() {
+                job.join("job.json")
+            } else {
+                job.join(".fukidashi-job.json")
+            };
+            let mut artifacts = vec![
+                project_path.clone(),
+                job.join("translations.json"),
+                manifest_path,
+                previous_render.clone(),
+                target_render_path.clone(),
+                rendered_path.clone(),
+                mask,
+                cleaned.clone(),
+                actual_cleaned.clone(),
+                corrected_clean.clone(),
+            ];
+            for path in [
+                previous_render.clone(),
+                target_render_path.clone(),
+                rendered_path,
+                cleaned.clone(),
+                corrected_clean,
+            ] {
+                for suffix in [".fukidashi-render.json", ".fukidashi-clean.json"] {
+                    artifacts.push(PathBuf::from(format!("{}{}", path.display(), suffix)));
+                }
+            }
+            artifacts.push(PathBuf::from(format!(
+                "{}{}",
+                actual_cleaned.display(),
+                ".fukidashi-clean.json"
+            )));
+            // The editor may write a clean derivative for brush strokes or
+            // source restoration, keyed by the incoming project revision.
+            if let Some(parent) = actual_cleaned.parent() {
+                artifacts.push(parent.join(format!("editor-clean-{revision}.png")));
+                artifacts
+                    .push(parent.join(format!("editor-clean-{revision}.png.fukidashi-clean.json")));
+            }
+            for font in std::iter::once(&crate::fonts::COMIC_NEUE_REGULAR)
+                .chain(crate::fonts::bundled_fallbacks())
+            {
+                let name = font
+                    .file_name
+                    .chars()
+                    .map(|character| {
+                        if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_')
+                        {
+                            character
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect::<String>();
+                artifacts.push(
+                    job.join("fonts")
+                        .join(format!("{}-{name}", &font.sha256[..16])),
+                );
+            }
+            let snapshots = snapshot_managed_files(&self.workflow, &job, artifacts)?;
+            let rendered_result = crate::editor::render_editor_page_locked(
+                &self.workflow,
+                &job,
+                &source,
+                &state,
+                req.page,
+            );
+            let rendered = match rendered_result {
+                Ok(value) => value,
+                Err(error) => {
+                    restore_managed_files(&snapshots).map_err(|restore_error| {
+                        anyhow::anyhow!(
+                            "rerender failed ({error:#}) and restoring job artifacts failed ({restore_error:#})"
+                        )
+                    })?;
+                    return Err(error.context("fresh translation was not saved or committed"));
+                }
+            };
+            let typeset = rendered.get("typeset").unwrap_or(&serde_json::Value::Null);
+            let target_report = target_request_index.and_then(|index| {
+                typeset
+                    .get("bubbles")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|bubbles| {
+                        bubbles.iter().find(|bubble| {
+                            bubble.get("index").and_then(serde_json::Value::as_u64)
+                                == Some(index as u64)
+                        })
+                    })
+            });
+            let target_failure = match (target_request_index, target_report) {
+                (None, _) => Some("renderer omitted the requested bubble".to_owned()),
+                (_, None) => {
+                    Some("renderer returned no layout result for the requested bubble".to_owned())
+                }
+                (Some(_), Some(report))
+                    if report.get("skipped").and_then(serde_json::Value::as_bool) == Some(true) =>
+                {
+                    Some(format!(
+                        "reason: {}",
+                        report
+                            .get("skip_reason")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("skipped")
+                    ))
+                }
+                _ => None,
+            };
+            if let Some(failure) = target_failure {
+                restore_managed_files(&snapshots)?;
+                anyhow::bail!(
+                    "fresh translation was not committed because the requested bubble did not render ({failure}); the previous translation, render, and managed artifacts were restored; shorten it or adjust the bubble in the editor"
+                );
+            }
+            Ok(serde_json::json!({
+                "protocol": "retranslation-v1",
+                "status": "rendered",
+                "job_id": req.job_id,
+                "page": req.page,
+                "bubble_id": target_id,
+                "rendered_image_path": rendered.get("rendered_image_path"),
+                "typeset": typeset,
+                "next_action": {
+                    "tool": "fukidashi_review_and_export",
+                    "arguments": {
+                        "job_id": req.job_id,
+                        "format": req.format.as_deref().unwrap_or("zip")
+                    },
+                    "instruction": "Keep this call pending for the operator to review the updated job and approve export"
+                }
+            }))
+        })();
+        match result {
+            Ok(value) => json_result(&value, false),
+            Err(error) => json_result(
+                &serde_json::json!({
+                    "protocol": "retranslation-v1",
+                    "status": "rejected",
+                    "error": format!("{error:#}"),
+                    "next_action": "Use the exact current feedback coordinates and translation; if the render reports text_overflow, shorten the translation or adjust the bubble in the editor, then submit again"
+                }),
+                true,
+            ),
+        }
     }
 
     #[tool(
@@ -3846,6 +7303,7 @@ impl FukidashiServer {
         }
         let format = req.format;
         let exports_dir = self.config.exports_dir();
+        let export_workflow = self.workflow.clone();
         let permit = match Arc::clone(&self.slots).acquire_owned().await {
             Ok(permit) => permit,
             Err(e) => {
@@ -3857,6 +7315,21 @@ impl FukidashiServer {
         };
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            // The same job-wide render lease covers authoritative review
+            // binding, all-page sidecar/hash validation, and archive reads.
+            // This closes the validation-to-package window for both direct
+            // fukidashi_export and automatic review_and_export.
+            let _render_lock = export_workflow.acquire_render_lock(&project_dir)?;
+            if !project_dir.join("review.json").is_file() {
+                anyhow::bail!(
+                    "export is blocked: this managed job has not been served through the review editor"
+                );
+            }
+            export_workflow.validate_export_job(&project_dir)?;
+            crate::editor::export_gate(&project_dir)?;
+            let bound_approval =
+                FukidashiServer::verify_approval_binding(&project_dir, &serde_json::Value::Null)?;
+            FukidashiServer::validate_managed_export_artifacts(&project_dir, bound_approval)?;
             crate::export::export_project_to(&project_dir, &format, Some(&exports_dir))
         })
         .await;
@@ -3882,11 +7355,22 @@ impl ServerHandler for FukidashiServer {
             .with_instructions(
                 "Local managed comic-translation workflow. Prefer the strict-v1 two-call loop: call \
                 fukidashi_translation_start with one source image, job_path, or job_id, then call \
+                fukidashi_translation_preflight once for a multi-page, resumable 1/N OCR routing pass when speed \
+                and visible page progress matter; it persists reusable analysis checkpoints and classifies \
+                bubble/prose/mixed/skip pages while translation and rendering remain serial. Cover-like page 1 \
+                is preserved by default; pass translate_cover=true to opt in. source_language must be auto, ja, \
+                zh, ko, en, or latin; legacy pipe values such as en|latin are normalized to automatic routing. \
+                Preflight reports reused_cached_pages, newly_processed_pages, total_pages, within_job_cached_pages, \
+                cross_job_cached_pages (always zero; no cross-job cache is used), and pass-through/skip counts, \
+                with the message Reused cached pages: X/N; newly processed: Y/N. \
+                Dense prose source blocks are preserved and the server fails closed when a required prose group \
+                is missing or implausibly short. Then call \
                 fukidashi_get_lore (or use the page_ready lore template) before the first submit and \
                 fukidashi_put_lore for known names, pronouns, and glossary terms; flag unknown speakers \
                 with needs_review=true. A compact lore example is {schema:1,characters:[\"Fuyu\"],pronouns:[],glossary:[{source:\"proprietress\",target:\"bà chủ\"}]}; character name strings are returned canonically as {id,names,notes}. Lore is client-authored and this server never invokes an LLM. \
                 fukidashi_translation_submit with only the returned work_token and one structured decision for \
-                each required_translation_ids entry. The server owns page selection, analysis, clean, typeset, \
+                each required_translation_ids entry; preserved_items are explicit source decisions and are \
+                not omitted from review. The server owns page selection, analysis, clean, typeset, \
                 stage reuse, model release, and advancement. sfx_mode=preserve is the default: structurally \
                 unmatched text-* items are reported as preserved audit data and are excluded from required \
                 translations, cleaning, and typesetting; preserve-only pages get a verified pass-through stage; \
@@ -3902,7 +7386,10 @@ impl ServerHandler for FukidashiServer {
                 Comic Neue or another legitimate comic face as the primary; never pass generic Windows UI \
                 faces such as Arial, Calibri, Segoe UI, Tahoma, Verdana, Times, or DejaVu Sans as a primary. \
                 The server substitutes bundled Comic Neue and reports the requested and resolved faces; Patrick \
-                Hand covers Vietnamese and Noto Sans Symbols 2 is reserved for symbols. Use \
+                Hand covers Vietnamese, Noto Sans Symbols 2 covers symbols, and configured/platform \
+                fonts provide CJK glyph coverage when installed. The native editor also registers \
+                available system CJK fonts so Chinese, Korean, and Japanese stay readable in its \
+                translation field. Use \
                 fukidashi_release_models between bounded legacy batches on memory-constrained machines. For \
                 acquisition, fukidashi_search_manga searches native MangaDex only and returns an exact manga_id \
                 plus a suggested latest=true pull. For a vague latest request, call fukidashi_pull_chapter with \
@@ -3927,6 +7414,262 @@ mod tests {
             OcrRegion, PageAnalysis, TranslationHandoff, TranslationItem, VisionCorrection,
         },
     };
+
+    #[test]
+    fn preflight_manifest_classifies_prose_and_skip_pages() {
+        let prose = serde_json::json!({
+            "bubbles": [{"recognizer":"prose-group"}],
+            "unmatched_text": [{"id":"text-1"}],
+            "text_lines": [{"text":"あとがき 本文"}],
+            "translation_handoff": {"items": [
+                {"source_text":"あとがき 本文", "preserve_by_default":false},
+                {"source_text":"author@example.com", "preserve_by_default":true}
+            ]}
+        });
+        assert_eq!(preflight_page_kind(&prose), "mixed");
+        let skip = serde_json::json!({
+            "bubbles": [],
+            "unmatched_text": [{"id":"text-1"}],
+            "text_lines": [{"text":"ロゴ"}],
+            "translation_handoff": {"items": [
+                {"source_text":"ロゴ", "preserve_by_default":true}
+            ]}
+        });
+        assert_eq!(preflight_page_kind(&skip), "skip");
+    }
+
+    #[test]
+    fn preflight_cache_telemetry_distinguishes_reuse_and_new_work() {
+        let page = |cached: bool, classification: &str| {
+            serde_json::json!({
+                "cached_analysis": cached,
+                "cache_hit": false,
+                "classification": classification,
+                "pass_through": classification == "skip",
+            })
+        };
+        let cold_one = vec![page(false, "prose")];
+        let cold_one_telemetry = preflight_cache_telemetry(&cold_one, 1);
+        assert_eq!(cold_one_telemetry["reused_cached_pages"], 0);
+        assert_eq!(cold_one_telemetry["newly_processed_pages"], 1);
+        assert_eq!(
+            cold_one_telemetry["message"],
+            "Reused cached pages: 0/1; newly processed: 1/1"
+        );
+        let cached_one = vec![page(true, "prose")];
+        let cached_one_telemetry = preflight_cache_telemetry(&cached_one, 1);
+        assert_eq!(cached_one_telemetry["reused_cached_pages"], 1);
+        assert_eq!(cached_one_telemetry["newly_processed_pages"], 0);
+        assert_eq!(
+            cached_one_telemetry["message"],
+            "Reused cached pages: 1/1; newly processed: 0/1"
+        );
+
+        let reused = vec![page(true, "bubble"); 5];
+        let telemetry = preflight_cache_telemetry(&reused, 5);
+        assert_eq!(telemetry["reused_cached_pages"], 5);
+        assert_eq!(telemetry["newly_processed_pages"], 0);
+        assert_eq!(telemetry["within_job_cached_pages"], 5);
+        assert_eq!(telemetry["cross_job_cached_pages"], 0);
+        assert_eq!(telemetry["pass_through_pages"], 0);
+        assert_eq!(
+            telemetry["message"],
+            "Reused cached pages: 5/5; newly processed: 0/5"
+        );
+
+        let fresh = vec![page(false, "bubble"); 5];
+        let telemetry = preflight_cache_telemetry(&fresh, 5);
+        assert_eq!(telemetry["reused_cached_pages"], 0);
+        assert_eq!(telemetry["newly_processed_pages"], 5);
+        assert_eq!(telemetry["within_job_cached_pages"], 0);
+        assert_eq!(
+            telemetry["message"],
+            "Reused cached pages: 0/5; newly processed: 5/5"
+        );
+
+        let partial = vec![
+            page(true, "bubble"),
+            page(true, "skip"),
+            page(false, "prose"),
+            page(false, "mixed"),
+            page(false, "bubble"),
+        ];
+        let telemetry = preflight_cache_telemetry(&partial, 5);
+        assert_eq!(telemetry["reused_cached_pages"], 2);
+        assert_eq!(telemetry["newly_processed_pages"], 3);
+        assert_eq!(telemetry["pass_through_pages"], 1);
+        assert_eq!(telemetry["skip_pages"], 1);
+        assert_eq!(telemetry["cross_job_cache_available"], false);
+    }
+
+    #[test]
+    fn missing_body_line_is_promoted_inside_dense_prose_span() {
+        let items = vec![
+            serde_json::json!({
+                "id": "heading",
+                "kind": "dialogue",
+                "keep_source": false,
+                "bbox": {"x1": 100.0, "y1": 100.0, "x2": 900.0, "y2": 180.0}
+            }),
+            serde_json::json!({
+                "id": "body",
+                "kind": "dialogue",
+                "keep_source": false,
+                "bbox": {"x1": 100.0, "y1": 220.0, "x2": 900.0, "y2": 500.0}
+            }),
+            serde_json::json!({
+                "id": "footer",
+                "kind": "unmatched_text",
+                "keep_source": true,
+                "bbox": {"x1": 100.0, "y1": 600.0, "x2": 900.0, "y2": 800.0}
+            }),
+        ];
+        let body_line = serde_json::json!({
+            "text": "ありすぎゃんは",
+            "confidence": 0.44,
+            "bbox": {"x1": 120.0, "y1": 515.0, "x2": 500.0, "y2": 545.0}
+        });
+        assert!(is_main_japanese_prose_line(&body_line, &items));
+        let footer_line = serde_json::json!({
+            "text": "発行日 2002/5/1",
+            "confidence": 0.90,
+            "bbox": {"x1": 120.0, "y1": 610.0, "x2": 500.0, "y2": 640.0}
+        });
+        assert!(!is_main_japanese_prose_line(&footer_line, &items));
+    }
+
+    #[test]
+    fn existing_unmatched_body_item_is_promoted_by_handoff_normalization() {
+        let mut analysis = serde_json::json!({
+            "text_lines": [{
+                "id": "line-body",
+                "text": "ありすぎゃんは",
+                "confidence": 0.44,
+                "bbox": {"x1": 120.0, "y1": 515.0, "x2": 500.0, "y2": 545.0}
+            }],
+            "translation_handoff": {"items": [
+                {"id":"heading", "kind":"dialogue", "keep_source":false,
+                 "bbox":{"x1":100.0,"y1":100.0,"x2":900.0,"y2":180.0}},
+                {"id":"body", "kind":"dialogue", "keep_source":false,
+                 "bbox":{"x1":100.0,"y1":220.0,"x2":900.0,"y2":500.0}},
+                {"id":"text-body", "kind":"unmatched_text", "keep_source":true,
+                 "source_text":"ありすぎゃんは", "bbox":{"x1":120.0,"y1":515.0,"x2":500.0,"y2":545.0}}
+            ]}
+        });
+        let audit = augment_missing_detected_text_items(&mut analysis).unwrap();
+        assert!(audit.is_empty());
+        let item = &analysis["translation_handoff"]["items"][2];
+        assert_eq!(item["kind"], "prose-line");
+        assert_eq!(item["keep_source"], false);
+        assert_eq!(item["status"], "pending");
+    }
+
+    #[test]
+    fn mixed_source_language_alias_is_safe_and_schema_is_enum() {
+        assert_eq!(
+            normalize_requested_source_language(Some("en|latin".into())).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_requested_source_language(Some("auto".into())).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_requested_source_language(Some("JA".into())).unwrap(),
+            Some("ja".into())
+        );
+        assert!(normalize_requested_source_language(Some("ja|zh".into())).is_ok());
+    }
+
+    #[test]
+    fn cover_classifier_requires_explicit_opt_in_signal() {
+        let cover = serde_json::json!({
+            "bubbles": [
+                {"detector_label": 2, "bbox": {"x1": 0.0, "y1": 0.0, "x2": 100.0, "y2": 100.0}},
+                {"detector_label": 2, "bbox": {"x1": 0.0, "y1": 0.0, "x2": 100.0, "y2": 100.0}}
+            ],
+            "translation_handoff": {"items": [
+                {"source_text": "ようこそ welcome to cafe"},
+                {"source_text": "DOJIN R18"}
+            ]}
+        });
+        assert!(cover_like_analysis(1, &cover));
+        assert!(!cover_like_analysis(2, &cover));
+        let dialogue = serde_json::json!({
+            "bubbles": [{"detector_label": 0}],
+            "translation_handoff": {"items": [{"source_text": "ようこそ"}]}
+        });
+        assert!(!cover_like_analysis(1, &dialogue));
+    }
+
+    #[test]
+    fn completed_page_keeps_success_when_next_page_preparation_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = FukidashiServer::new(test_config(temp.path())).unwrap();
+        let claim = TranslationClaim {
+            job_dir: temp.path().join("job"),
+            source_image: temp.path().join("page.png"),
+            page_number: 1,
+            total_pages: 2,
+            analysis_path: temp.path().join("analysis.json"),
+            analysis_sha256: "hash".into(),
+            item_ids: BTreeSet::new(),
+            source_language: None,
+            target_language: Some("vi".into()),
+            replace_sfx: false,
+            in_progress: false,
+            consumed: true,
+        };
+        let result = server.completed_translation_response(
+            &claim,
+            Err(FukidashiError::InvalidInput(
+                "next page needs corrected input".into(),
+            )),
+            false,
+        );
+        let value = extract_tool_json(result.clone(), "completed page").unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert_eq!(value["status"], "page_complete");
+        assert_eq!(value["completed_page"], 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_multi_page_start_requires_resumable_preflight() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("comic");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        for page in [1, 2] {
+            image::RgbImage::from_pixel(24, 24, image::Rgb([255, 255, 255]))
+                .save(source_dir.join(format!("{page}.png")))
+                .unwrap();
+        }
+        let server = FukidashiServer::new(test_config(temp.path())).unwrap();
+        let value = extract_tool_json(
+            server
+                .translation_start(Parameters(TranslationStartRequest {
+                    image_path: Some(source_dir.join("1.png").display().to_string()),
+                    job_path: None,
+                    job_id: None,
+                    ocr_mode: None,
+                    source_language: Some("ja".into()),
+                    target_language: Some("vi".into()),
+                    scope: None,
+                    sfx_mode: None,
+                    translate_cover: false,
+                }))
+                .await,
+            "preflight gate",
+        )
+        .unwrap();
+        assert_eq!(value["status"], "preflight_required");
+        assert_eq!(value["total_pages"], 2);
+        assert_eq!(
+            value["next_action"]["tool"],
+            "fukidashi_translation_preflight"
+        );
+        assert_eq!(value["progress"]["current_page"], 0);
+        assert_eq!(value["progress"]["total_pages"], 2);
+    }
 
     #[test]
     fn server_info_exposes_portable_workflow_instructions() {
@@ -3977,6 +7720,226 @@ mod tests {
             instructions
                 .contains("character name strings are returned canonically as {id,names,notes}")
         );
+    }
+
+    #[test]
+    fn opencode_stringified_scope_is_accepted_without_changing_schema() {
+        let encoded_scope = serde_json::json!({
+            "include_paths": [
+                r"C:\comic\1.webp",
+                r"C:\comic\2.webp"
+            ]
+        })
+        .to_string();
+        let request: TranslationStartRequest = serde_json::from_value(serde_json::json!({
+            "image_path": r"C:\comic\1.webp",
+            "target_language": "vi",
+            "scope": encoded_scope,
+        }))
+        .unwrap();
+        assert_eq!(
+            request.scope.unwrap().include_paths,
+            Some(vec![
+                r"C:\comic\1.webp".to_owned(),
+                r"C:\comic\2.webp".to_owned()
+            ])
+        );
+
+        let object_request: TranslationStartRequest = serde_json::from_value(serde_json::json!({
+            "scope": {"start_page": 1, "end_page": 2},
+        }))
+        .unwrap();
+        let scope = object_request.scope.unwrap();
+        assert_eq!(scope.start_page, Some(1));
+        assert_eq!(scope.end_page, Some(2));
+    }
+
+    #[tokio::test]
+    async fn opencode_invalid_submit_returns_actionable_json_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let server = FukidashiServer::new(test_config(temp.path())).unwrap();
+        let result = server
+            .translation_submit(Parameters(TranslationSubmitRequest {
+                work_token: "strict-v1-not-a-live-token".into(),
+                translations: Vec::new(),
+            }))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let text = result
+            .content
+            .into_iter()
+            .find_map(|block| match block {
+                ContentBlock::Text(value) => Some(value.text),
+                _ => None,
+            })
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["protocol"], "strict-v1");
+        assert!(
+            value["error"]
+                .as_str()
+                .unwrap()
+                .contains("unknown or expired")
+        );
+        assert_eq!(
+            value["next_step"],
+            "call fukidashi_translation_start to obtain a fresh work_token"
+        );
+    }
+
+    #[test]
+    fn approval_binding_accepts_legacy_and_binds_frozen_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().to_path_buf();
+        let job_id = project_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let rendered0 = project_dir.join("rendered-0.png");
+        let rendered1 = project_dir.join("rendered-1.png");
+        std::fs::write(&rendered0, b"approved-bytes-0").unwrap();
+        std::fs::write(&rendered1, b"approved-bytes-1").unwrap();
+        let state = serde_json::json!({
+            "schema_version": 1,
+            "font_path": serde_json::Value::Null,
+            "pages": [
+                {"id": "p0", "image_path": "a.png", "rendered_image_path": "rendered-0.png", "bubbles": []},
+                {"id": "p1", "image_path": "b.png", "rendered_image_path": "rendered-1.png", "bubbles": []}
+            ]
+        });
+        std::fs::write(
+            project_dir.join("project.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        // Legacy approval without a frozen snapshot keeps loose semantics.
+        let legacy = serde_json::json!({
+            "revision": 4,
+            "approved_pages": [0, 1],
+            "audit": [{"event": "approve_export", "revision": 4}]
+        });
+        assert!(FukidashiServer::verify_approval_binding(&project_dir, &legacy).is_ok());
+        // A bound approval must match revision, page coverage, checkpoint
+        // identity, and current artifact hashes/signatures.
+        let snapshot = crate::approval::ApprovalSnapshot::freeze(
+            job_id.clone(),
+            4,
+            &crate::editor::approval_state_signature(&state, Some(&project_dir)),
+            vec![0],
+        );
+        let mut checkpoint = crate::approval::ApprovalCheckpoint::fresh(&snapshot);
+        let expected = crate::approval::ExpectedPageProvenance {
+            page_index: 0,
+            page_id: "p0".into(),
+            semantic_render_signature: crate::editor::post_render_page_signature(
+                &state,
+                &state["pages"][0],
+            ),
+            source_sha256: String::new(),
+            clean_sha256: String::new(),
+            output_path: rendered0.clone(),
+        };
+        let output_sha256 = crate::approval::sha256_file(&rendered0).unwrap();
+        checkpoint.mark_complete(crate::approval::ApprovalPageCheckpoint::new(
+            0,
+            "p0".into(),
+            expected.semantic_render_signature.clone(),
+            String::new(),
+            String::new(),
+            rendered0.display().to_string(),
+            output_sha256,
+        ));
+        crate::approval::save_approval_checkpoint(&project_dir, 4, &checkpoint).unwrap();
+        let binding = crate::approval::approval_audit_value(&snapshot, &[0], &[vec![0]], 2, 1);
+        let bound = serde_json::json!({
+            "revision": 4,
+            "approved_pages": [0, 1],
+            "audit": [{
+                "event": "approve_export",
+                "revision": 4,
+                "approval": binding.clone(),
+            }]
+        });
+        assert!(FukidashiServer::verify_approval_binding(&project_dir, &bound).is_ok());
+        // The live wait response is deliberately compact; export must read
+        // the full audit from the authoritative review.json instead of
+        // silently downgrading to legacy semantics.
+        std::fs::write(
+            project_dir.join("review.json"),
+            serde_json::to_vec(&bound).unwrap(),
+        )
+        .unwrap();
+        let compact_wait_result = serde_json::json!({
+            "review_session_id": "session",
+            "revision": 4,
+            "action": "approve_export",
+            "approved_pages": [0, 1]
+        });
+        assert!(
+            FukidashiServer::verify_approval_binding(&project_dir, &compact_wait_result).is_ok()
+        );
+        // Approving snapshot A then modifying semantics to B without changing
+        // the page count must NOT export under A's approval.
+        let mut drifted = state.clone();
+        drifted["pages"][1]["bubbles"] = serde_json::json!([{
+            "id": "b1",
+            "bbox": {"x1": 1, "y1": 1, "x2": 8, "y2": 8},
+            "translation": "changed after approval"
+        }]);
+        std::fs::write(
+            project_dir.join("project.json"),
+            serde_json::to_vec(&drifted).unwrap(),
+        )
+        .unwrap();
+        assert!(FukidashiServer::verify_approval_binding(&project_dir, &bound).is_err());
+        // Restore the approved state: the binding verifies again.
+        std::fs::write(
+            project_dir.join("project.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        assert!(FukidashiServer::verify_approval_binding(&project_dir, &bound).is_ok());
+        // Corrupting the approved artifact also blocks the export.
+        std::fs::write(&rendered0, b"tampered-bytes").unwrap();
+        assert!(FukidashiServer::verify_approval_binding(&project_dir, &bound).is_err());
+        let wrong_revision = serde_json::json!({
+            "revision": 5,
+            "approved_pages": [0, 1],
+            "audit": [{
+                "event": "approve_export",
+                "revision": 5,
+                "approval": binding.clone(),
+            }]
+        });
+        assert!(FukidashiServer::verify_approval_binding(&project_dir, &wrong_revision).is_err());
+        let wrong_coverage = serde_json::json!({
+            "revision": 4,
+            "approved_pages": [0],
+            "audit": [{
+                "event": "approve_export",
+                "revision": 4,
+                "approval": binding.clone(),
+            }]
+        });
+        assert!(FukidashiServer::verify_approval_binding(&project_dir, &wrong_coverage).is_err());
+    }
+
+    #[test]
+    fn effective_global_font_records_managed_path_not_raw_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        let workflow = crate::workflow::Workflow::new(jobs).unwrap();
+        let job = workflow.allocate_job().unwrap();
+        // No request means no historical global.
+        assert_eq!(effective_global_font_path(&workflow, &job, None), None);
+        // A generic desktop primary substitutes to a managed bundled font.
+        let effective = effective_global_font_path(&workflow, &job, Some("Arial")).unwrap();
+        assert_ne!(effective, "Arial");
+        assert!(std::path::Path::new(&effective).is_file());
+        // Operator provenance is recorded separately by the caller.
+        let requested = Some("Arial".to_owned());
+        assert_eq!(requested.as_deref(), Some("Arial"));
     }
 
     #[test]
@@ -4049,6 +8012,40 @@ mod tests {
                 }]
             }
         })
+    }
+
+    #[test]
+    fn incomplete_submission_reports_missing_ids_and_indices() {
+        let analysis = strict_fixture_analysis();
+        let claim = TranslationClaim {
+            job_dir: PathBuf::from("C:/jobs/job"),
+            source_image: PathBuf::from("C:/source/page.png"),
+            page_number: 1,
+            total_pages: 1,
+            analysis_path: PathBuf::from("C:/jobs/job/pages/0001/analysis.json"),
+            analysis_sha256: "hash".into(),
+            item_ids: ["bubble-1".into()].into_iter().collect(),
+            source_language: Some("ja".into()),
+            target_language: Some("vi".into()),
+            replace_sfx: false,
+            in_progress: false,
+            consumed: false,
+        };
+        let error =
+            FukidashiServer::validate_strict_submissions(&analysis, &claim, &[]).unwrap_err();
+        let FukidashiError::Diagnostic { details, .. } = error else {
+            panic!("expected missing-item diagnostic");
+        };
+        assert_eq!(details["stage"], "submit_validation");
+        assert_eq!(details["code"], "missing_translation_items");
+        assert_eq!(details["missing_items"][0]["id"], "bubble-1");
+        assert_eq!(details["missing_items"][0]["index"], 0);
+        assert!(
+            details["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("keep_source=true")
+        );
     }
 
     #[test]
@@ -4159,6 +8156,139 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("not represented") || error.contains("no translated item"));
+    }
+
+    #[test]
+    fn clean_mask_reports_page5_style_overlap_diagnostic() {
+        let analysis = serde_json::json!({
+            "target_language": "vi",
+            "text_lines": [{
+                "id": "line-d42e9cb6664f1873",
+                "text": "遠ざからないで！！",
+                "source_language": "en",
+                "confidence": 0.28843334317207336,
+                "bbox": {
+                    "x1": 603.8469848632812,
+                    "y1": 1162.83837890625,
+                    "x2": 716.2561645507812,
+                    "y2": 1380.9078369140625
+                }
+            }],
+            "translation_handoff": {"items": [{
+                "id": "bubble-fc12e7a6c0bb34c0",
+                "kind": "dialogue",
+                "source_text": "ありすにしてもらえたら最高だなぁって．．．ね？",
+                "source_language": "ja",
+                "bbox": {
+                    "x1": 688.6068115234375,
+                    "y1": 1134.5416259765625,
+                    "x2": 891.0330200195312,
+                    "y2": 1391.91943359375
+                }
+            }]}
+        });
+        let (_dir, path) = write_checkpoint(&analysis);
+        let error = checkpoint_text_regions(&path, false).unwrap_err();
+        let FukidashiError::Diagnostic { details, .. } = &error else {
+            panic!("expected structured strict-clean diagnostic, got {error:?}");
+        };
+        assert_eq!(details["stage"], "strict_clean");
+        assert_eq!(details["code"], "unrepresented_detected_text");
+        assert_eq!(details["detected_line_index"], 0);
+        assert_eq!(details["detected_line_id"], "line-d42e9cb6664f1873");
+        assert_eq!(
+            details["overlapping_item_ids"][0],
+            "bubble-fc12e7a6c0bb34c0"
+        );
+        assert_eq!(details["confidence"], 0.28843334317207336);
+        assert!(
+            details["next_step"]
+                .as_str()
+                .unwrap()
+                .contains("keep_source=true")
+        );
+
+        let payload = error_json(&error);
+        assert_eq!(payload["stage"], "strict_clean");
+        assert_eq!(payload["code"], "unrepresented_detected_text");
+        assert_eq!(payload["diagnostic"]["bbox"]["x1"], 603.8469848632812);
+
+        let mut normalized = analysis.clone();
+        let preserved = augment_missing_detected_text_items(&mut normalized).unwrap();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0]["id"], "line-d42e9cb6664f1873");
+        assert_eq!(
+            normalized["translation_handoff"]["items"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["keep_source"],
+            true
+        );
+        assert_eq!(
+            normalized["translation_handoff"]["items"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()["id"],
+            "line-d42e9cb6664f1873"
+        );
+        let (_dir, normalized_path) = write_checkpoint(&normalized);
+        assert!(checkpoint_text_regions(&normalized_path, false).is_ok());
+    }
+
+    #[test]
+    fn legacy_unrepresented_confident_line_is_auto_preserved_idempotently() {
+        let mut analysis = serde_json::json!({
+            "target_language": "vi",
+            "text_lines": [{
+                "id": "line-dialogue",
+                "text": "？",
+                "source_language": "ja",
+                "confidence": 0.74,
+                "bbox": {"x1": 10.0, "y1": 10.0, "x2": 30.0, "y2": 30.0}
+            }],
+            "translation_handoff": {"items": [{
+                "id": "bubble-1",
+                "kind": "dialogue",
+                "source_text": "こんにちは",
+                "source_language": "ja",
+                "confidence": 0.99,
+                "bbox": {"x1": 1.0, "y1": 1.0, "x2": 40.0, "y2": 40.0},
+                "status": "pending"
+            }]}
+        });
+        let first = augment_missing_detected_text_items(&mut analysis).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["detected_text_index"], 0);
+        assert_eq!(
+            analysis["translation_handoff"]["items"][1]["kind"],
+            "unmatched_text"
+        );
+        assert_eq!(
+            analysis["translation_handoff"]["items"][1]["keep_source"],
+            true
+        );
+        assert_eq!(
+            analysis["translation_handoff"]["items"][1]["status"],
+            "preserved"
+        );
+        assert_eq!(
+            analysis["strict_v1"]["auto_preserved_items"][0]["id"],
+            "line-dialogue"
+        );
+        assert!(
+            augment_missing_detected_text_items(&mut analysis)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            analysis["translation_handoff"]["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -4338,6 +8468,11 @@ mod tests {
     #[test]
     fn strict_submission_updates_dialogue_by_id_when_preserved_text_is_first() {
         let mut analysis = strict_fixture_analysis();
+        analysis["strict_v1"]["auto_preserved_items"] = serde_json::json!([{
+            "id": "line-legacy",
+            "detected_text_index": 4,
+            "reason": "legacy handoff omitted a detected line"
+        }]);
         let items = analysis["translation_handoff"]["items"]
             .as_array_mut()
             .unwrap();
@@ -4372,6 +8507,10 @@ mod tests {
         assert_eq!(saved[0]["status"], "preserved");
         assert_eq!(saved[1]["id"], "bubble-1");
         assert_eq!(saved[1]["translation"], "dịch");
+        assert_eq!(
+            analysis["strict_v1"]["auto_preserved_items"][0]["id"],
+            "line-legacy"
+        );
     }
 
     #[test]
@@ -4792,6 +8931,18 @@ mod tests {
                 serde_json::json!({}),
             )
             .unwrap();
+        // Seed the strict editor provenance expected by bound approval. The
+        // fixture starts from a legacy-looking registration, then upgrades
+        // its sidecar exactly as a current renderer would.
+        let editor_state = workflow.editor_state(&rendered_path, None).unwrap();
+        let semantic =
+            crate::editor::post_render_page_signature(&editor_state, &editor_state["pages"][0]);
+        let sidecar_path =
+            std::path::PathBuf::from(format!("{}.fukidashi-render.json", rendered_path.display()));
+        let mut sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
+        sidecar["qa"]["semantic_render_signature"] = serde_json::Value::String(semantic);
+        std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
 
         let job_id = registration
             .job_dir
@@ -4885,6 +9036,7 @@ mod tests {
         assert_eq!(fixes_value["protocol"], "review-v1");
         assert_eq!(fixes_value["status"], "fixes_requested");
         assert_eq!(fixes_value["review"]["action"], "request_fixes");
+        let final_review_path = review_path.clone();
         let result = server
             .review_and_export_inner(
                 review_request,
@@ -4896,7 +9048,7 @@ mod tests {
                         FukidashiError::RuntimeUnavailable("test editor URL has no token".into())
                     })?;
                     let review: serde_json::Value = serde_json::from_slice(
-                        &std::fs::read(&review_path).map_err(FukidashiError::Io)?,
+                        &std::fs::read(&final_review_path).map_err(FukidashiError::Io)?,
                     )?;
                     let revision = review["revision"].as_u64().ok_or_else(|| {
                         FukidashiError::RuntimeUnavailable("test review has no revision".into())
@@ -4934,6 +9086,158 @@ mod tests {
         let output = value["export"]["output_path"].as_str().unwrap();
         assert!(std::path::Path::new(output).is_file());
         assert!(output.ends_with(".zip"));
+        let persisted_review: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&review_path).unwrap()).unwrap();
+        let revision = persisted_review["revision"].as_u64().unwrap();
+        let binding = persisted_review["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|entry| entry["event"] == "approve_export")
+            .unwrap();
+        assert_eq!(binding["approval"]["dirty_pages"], serde_json::json!([]));
+        assert!(crate::approval::checkpoint_path(&registration.job_dir, revision).is_file());
+
+        // Direct export must use the same binding and all-page validation as
+        // the automatic path. This page was reused (zero dirty pages), so its
+        // bytes are covered by the export-time managed artifact check.
+        std::fs::write(&rendered_path, b"tampered-after-approval").unwrap();
+        let direct = server
+            .export(Parameters(ExportRequest {
+                project_dir: registration.job_dir.display().to_string(),
+                format: "zip".into(),
+            }))
+            .await;
+        let direct_error = extract_tool_json(direct, "tampered direct export").unwrap_err();
+        assert!(direct_error.to_string().contains("invalid"));
+    }
+
+    #[test]
+    fn bound_export_rejects_stale_reused_sidecar_and_missing_render_hash() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("comic");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let source = source_dir.join("page-1.png");
+        image::RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255]))
+            .save(&source)
+            .unwrap();
+
+        let workflow = Workflow::new(temp.path().join("jobs")).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+        let (cleaned_path, _, _) = workflow.write_passthrough_clean_artifact(&source).unwrap();
+        let rendered_path = workflow.page_artifacts_for_source(&source).unwrap().4;
+        crate::typeset::typeset_page(&cleaned_path, &[], &rendered_path).unwrap();
+        let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
+        workflow
+            .register_render(
+                &rendered_path,
+                &clean,
+                serde_json::json!({"request_bubbles": [], "report": {"bubbles": []}}),
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let state = workflow.editor_state(&rendered_path, None).unwrap();
+        let sidecar_path =
+            std::path::PathBuf::from(format!("{}.fukidashi-render.json", rendered_path.display()));
+        let mut sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
+        // Model a legacy editor-clean alias: it is a separate path with an
+        // independently valid clean sidecar, but the same source and bytes
+        // as the canonical clean image recorded by project.json.
+        let legacy_clean = cleaned_path.with_file_name("legacy-clean.png");
+        std::fs::copy(&cleaned_path, &legacy_clean).unwrap();
+        let legacy_clean_sidecar =
+            std::path::PathBuf::from(format!("{}.fukidashi-clean.json", legacy_clean.display()));
+        let mut clean_sidecar: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(format!("{}.fukidashi-clean.json", cleaned_path.display())).unwrap(),
+        )
+        .unwrap();
+        clean_sidecar["cleaned_image"] =
+            serde_json::Value::String(legacy_clean.display().to_string());
+        std::fs::write(
+            &legacy_clean_sidecar,
+            serde_json::to_vec_pretty(&clean_sidecar).unwrap(),
+        )
+        .unwrap();
+        sidecar["cleaned_image"] = serde_json::Value::String(legacy_clean.display().to_string());
+        sidecar["clean_sidecar"] =
+            serde_json::Value::String(legacy_clean_sidecar.display().to_string());
+        let expected_semantic =
+            crate::editor::post_render_page_signature(&state, &state["pages"][0]);
+        sidecar["qa"]
+            .as_object_mut()
+            .unwrap()
+            .remove("semantic_render_signature");
+        std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
+        let project_path = registration.job_dir.join("project.json");
+        std::fs::write(&project_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        assert!(
+            FukidashiServer::validate_managed_export_artifacts(&registration.job_dir, true).is_ok()
+        );
+        let migrated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
+        assert_eq!(
+            migrated["qa"]["semantic_render_signature"],
+            expected_semantic
+        );
+        assert_eq!(
+            std::fs::canonicalize(migrated["cleaned_image"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&cleaned_path).unwrap()
+        );
+
+        let mut stale = state.clone();
+        stale["pages"][0]["bubbles"] = serde_json::json!([{
+            "id": "after-approval",
+            "bbox": {"x1": 1.0, "y1": 1.0, "x2": 8.0, "y2": 8.0},
+            "translation": "stale sidecar"
+        }]);
+        let mut legacy_sidecar = migrated.clone();
+        legacy_sidecar["qa"]
+            .as_object_mut()
+            .unwrap()
+            .remove("semantic_render_signature");
+        std::fs::write(
+            &sidecar_path,
+            serde_json::to_vec_pretty(&legacy_sidecar).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(&project_path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+        let legacy_stale_error =
+            FukidashiServer::validate_managed_export_artifacts(&registration.job_dir, true)
+                .unwrap_err()
+                .to_string();
+        assert!(legacy_stale_error.contains("legacy render sidecar"));
+        let still_legacy: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
+        assert!(
+            still_legacy["qa"]
+                .get("semantic_render_signature")
+                .is_none()
+        );
+
+        std::fs::write(&project_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        sidecar["qa"]["semantic_render_signature"] =
+            serde_json::Value::String(expected_semantic.clone());
+        std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
+        std::fs::write(&project_path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
+        let stale_error =
+            FukidashiServer::validate_managed_export_artifacts(&registration.job_dir, true)
+                .unwrap_err()
+                .to_string();
+        assert!(stale_error.contains("semantic signature"));
+
+        std::fs::write(&project_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+        sidecar["qa"]["semantic_render_signature"] = serde_json::Value::String(
+            crate::editor::post_render_page_signature(&state, &state["pages"][0]),
+        );
+        sidecar["rendered_sha256"] = serde_json::Value::String(String::new());
+        std::fs::write(&sidecar_path, serde_json::to_vec_pretty(&sidecar).unwrap()).unwrap();
+        let missing_hash_error =
+            FukidashiServer::validate_managed_export_artifacts(&registration.job_dir, true)
+                .unwrap_err()
+                .to_string();
+        assert!(missing_hash_error.contains("byte hash"));
     }
 
     #[test]
@@ -5132,6 +9436,7 @@ mod tests {
                 padding: None,
                 text: "Xin chào".into(),
                 font_path: None,
+                requested_font_path: None,
                 min_font_size: Some(7.0),
                 max_font_size: None,
                 text_color: None,
@@ -5183,6 +9488,7 @@ mod tests {
             padding: None,
             text: "Tiếng Việt".into(),
             font_path: None,
+            requested_font_path: None,
             min_font_size: None,
             max_font_size: None,
             text_color: None,
@@ -5249,6 +9555,7 @@ mod tests {
             padding: None,
             text: "Tiếng Việt ❤".into(),
             font_path: Some(requested.display().to_string()),
+            requested_font_path: None,
             min_font_size: None,
             max_font_size: None,
             text_color: None,
@@ -5304,5 +9611,57 @@ mod tests {
                 .is_some_and(|id| id.ends_with("NotoSansSymbols2-Regular.ttf"))
                 && run["text"] == "❤"
         }));
+    }
+
+    #[test]
+    fn font_provenance_scenarios_6_and_7_global_font_affects_inherited_not_explicit() {
+        let req_inherited = TypesetRequest {
+            image_path: "clean.png".into(),
+            font_path: Some("fonts/new-global.ttf".into()),
+            bubbles: vec![TypesetPayload {
+                id: Some("bubble-inherited".into()),
+                text: "Hello".into(),
+                font_path: None,
+                requested_font_path: None,
+                ..Default::default()
+            }],
+            padding: None,
+            min_font_size: None,
+            max_font_size: None,
+            shape: None,
+            fallback_font_paths: Vec::new(),
+        };
+        let (_, resolved_inherited, _) = resolve_typeset_request(req_inherited);
+        assert_eq!(
+            resolved_inherited[0].font_path.as_deref(),
+            Some("fonts/new-global.ttf")
+        );
+        assert_eq!(resolved_inherited[0].requested_font_path, None);
+
+        let req_explicit = TypesetRequest {
+            image_path: "clean.png".into(),
+            font_path: Some("fonts/new-global.ttf".into()),
+            bubbles: vec![TypesetPayload {
+                id: Some("bubble-explicit".into()),
+                text: "Hello".into(),
+                font_path: Some("fonts/bubble-explicit.ttf".into()),
+                requested_font_path: Some("fonts/bubble-explicit.ttf".into()),
+                ..Default::default()
+            }],
+            padding: None,
+            min_font_size: None,
+            max_font_size: None,
+            shape: None,
+            fallback_font_paths: Vec::new(),
+        };
+        let (_, resolved_explicit, _) = resolve_typeset_request(req_explicit);
+        assert_eq!(
+            resolved_explicit[0].font_path.as_deref(),
+            Some("fonts/bubble-explicit.ttf")
+        );
+        assert_eq!(
+            resolved_explicit[0].requested_font_path.as_deref(),
+            Some("fonts/bubble-explicit.ttf")
+        );
     }
 }

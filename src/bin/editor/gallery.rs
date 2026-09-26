@@ -17,7 +17,20 @@ impl EditorApp {
                     .as_ref()
                     .map(EditorState::page_count)
                     .unwrap_or_default();
-                egui::ScrollArea::vertical().show_rows(
+                // `show_rows` virtualizes the gallery. egui 0.31's
+                // `ScrollArea` has no row-targeting helper (that API belongs
+                // to `egui_extras::TableBuilder`), so convert the target row
+                // to its content offset before the visible range is chosen.
+                // The request is one-shot and is only set by the page-number
+                // jump control; clicking next/previous or a thumbnail does
+                // not fight the operator's current scroll.
+                let gallery_scroll_target = self.gallery_scroll_target.take();
+                let mut scroll_area = egui::ScrollArea::vertical();
+                if let Some(target) = gallery_scroll_target {
+                    let row_height = super::THUMBNAIL_ROW_HEIGHT + ui.spacing().item_spacing.y;
+                    scroll_area = scroll_area.vertical_scroll_offset(target as f32 * row_height);
+                }
+                scroll_area.show_rows(
                     ui,
                     super::THUMBNAIL_ROW_HEIGHT,
                     page_count,
@@ -95,12 +108,7 @@ impl EditorApp {
                                 egui::Color32::WHITE,
                             );
                             if response.clicked() {
-                                self.cancel_drag();
-                                self.current_page = index;
-                                self.canvas.selected = None;
-                                self.canvas.selected_issue = None;
-                                self.canvas.brush_overlay_dirty = true;
-                                self.canvas.fit_applied = false;
+                                self.set_current_page(index);
                             }
                         }
                     },

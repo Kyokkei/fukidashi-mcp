@@ -70,6 +70,14 @@ pub fn recover_typeset_payloads(
     apply: bool,
 ) -> Result<RecoveryReport> {
     let job = workflow.resolve_managed_job_path(job_path)?;
+    // Recovery mutates project.json from a client supplied transcript. Keep
+    // the read/merge/backup/write transaction behind the same lease export
+    // uses so a stale recovery snapshot cannot overwrite an approved render.
+    let _render_lock = if apply {
+        Some(workflow.acquire_render_lock(&job)?)
+    } else {
+        None
+    };
     let transcript = fs::canonicalize(transcript_path)
         .with_context(|| format!("resolve transcript {}", transcript_path.display()))?;
     let calls = parse_calls(&transcript)?;
@@ -196,6 +204,13 @@ pub fn migrate_managed_fonts(
     apply: bool,
 ) -> Result<FontMigrationReport> {
     let job = workflow.resolve_managed_job_path(job_path)?;
+    // Font migration rewrites project.json and must serialize with export and
+    // editor persistence. Dry-run inspection remains read-only.
+    let _render_lock = if apply {
+        Some(workflow.acquire_render_lock(&job)?)
+    } else {
+        None
+    };
     let project_path = job.join("project.json");
     let mut state: Value = serde_json::from_slice(
         &fs::read(&project_path).with_context(|| format!("read {}", project_path.display()))?,

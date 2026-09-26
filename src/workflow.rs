@@ -412,8 +412,84 @@ struct ManifestLock {
 
 /// Held while an editor or MCP typeset operation writes a deterministic page
 /// render. The lock is advisory but works across independent MCP processes.
+///
+/// The guard is reentrant for the thread that already owns the job lease: an
+/// operation-wide approval lease stays held across the whole render pipeline
+/// while per-page renders on the same worker thread attach to it instead of
+/// reacquiring the lock file (which would deadlock or time out). Other
+/// threads and processes still contend on the real lock file with its
+/// heartbeat and PID-liveness recovery.
 pub struct RenderLock {
-    _lease: LockLease,
+    _lease: Option<LockLease>,
+    reentrant_key: Option<String>,
+}
+
+impl Drop for RenderLock {
+    fn drop(&mut self) {
+        if let Some(key) = self.reentrant_key.take() {
+            RENDER_LOCK_HELD.with(|held| {
+                if let Ok(mut held) = held.try_borrow_mut()
+                    && let Some(position) = held.iter().rposition(|candidate| candidate == &key)
+                {
+                    held.remove(position);
+                }
+            });
+        }
+    }
+}
+
+thread_local! {
+    /// Canonical job directories whose render lease is held by this thread.
+    static RENDER_LOCK_HELD: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl RenderLock {
+    /// Acquire the render-style lease (heartbeat + PID liveness) on an
+    /// explicit lock file. Managed jobs go through
+    /// [`Workflow::acquire_render_lock`]; ad-hoc editor jobs without a
+    /// `job.json` manifest use this directly so every writer still shares one
+    /// mechanism, one filename, and one recovery rule.
+    pub(crate) fn acquire_for_path(path: PathBuf, label: &str) -> Result<Self> {
+        let key = path.display().to_string();
+        if RENDER_LOCK_HELD.with(|held| held.borrow().iter().any(|candidate| candidate == &key)) {
+            // The calling thread already owns the operation-wide lease for
+            // this job (approval pipeline). Attach reentrantly: no file
+            // operation, no second heartbeat. The outer guard keeps the real
+            // file lease alive; dropping this guard only pops the depth.
+            RENDER_LOCK_HELD.with(|held| held.borrow_mut().push(key.clone()));
+            return Ok(RenderLock {
+                _lease: None,
+                reentrant_key: Some(key),
+            });
+        }
+        let lease = acquire_lock_file(path, label)?;
+        RENDER_LOCK_HELD.with(|held| held.borrow_mut().push(key.clone()));
+        Ok(RenderLock {
+            _lease: Some(lease),
+            reentrant_key: Some(key),
+        })
+    }
+
+    /// Fast, nonblocking variant for UI-thread persistence. A busy export is
+    /// reported immediately so egui never spends the lock wait interval
+    /// blocked; worker paths continue to use the bounded waiting acquire.
+    pub(crate) fn try_acquire_for_path(path: PathBuf, label: &str) -> Result<Self> {
+        let key = path.display().to_string();
+        if RENDER_LOCK_HELD.with(|held| held.borrow().iter().any(|candidate| candidate == &key)) {
+            RENDER_LOCK_HELD.with(|held| held.borrow_mut().push(key.clone()));
+            return Ok(RenderLock {
+                _lease: None,
+                reentrant_key: Some(key),
+            });
+        }
+        let lease = try_acquire_lock_file(path, label)?;
+        RENDER_LOCK_HELD.with(|held| held.borrow_mut().push(key.clone()));
+        Ok(RenderLock {
+            _lease: Some(lease),
+            reentrant_key: Some(key),
+        })
+    }
 }
 
 struct LockLease {
@@ -890,11 +966,18 @@ impl Workflow {
 
     pub fn acquire_render_lock(&self, job: &Path) -> Result<RenderLock> {
         let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
-        let lease = acquire_lock_file(
+        RenderLock::acquire_for_path(
             job.join(".fukidashi-render.lock"),
             &format!("render job {}", job.display()),
-        )?;
-        Ok(RenderLock { _lease: lease })
+        )
+    }
+
+    pub fn try_acquire_render_lock(&self, job: &Path) -> Result<RenderLock> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        RenderLock::try_acquire_for_path(
+            job.join(".fukidashi-render.lock"),
+            &format!("render job {}", job.display()),
+        )
     }
 
     /// Allocate a readable, collision-safe layout for a new source folder.
@@ -1172,6 +1255,45 @@ impl Workflow {
         } else {
             Ok(manifest.expected_pages.len())
         }
+    }
+
+    /// Persist a server-owned bulk routing manifest.  The manifest is a
+    /// derived cache; page analysis checkpoints remain the authoritative
+    /// source for translation and are validated independently on resume.
+    pub fn write_preflight_manifest(
+        &self,
+        job: &Path,
+        value: &serde_json::Value,
+    ) -> Result<PathBuf> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let path = job.join("preflight.json");
+        atomic_json(&path, value)?;
+        Ok(path)
+    }
+
+    /// Read a bounded server-owned bulk routing manifest when present.
+    pub fn read_preflight_manifest(&self, job: &Path) -> Result<Option<serde_json::Value>> {
+        let job = self.resolve_managed_job_path(&job.to_string_lossy())?;
+        let path = job.join("preflight.json");
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let metadata = fs::metadata(&path)?;
+        if metadata.len() > 16 * 1024 * 1024 {
+            bail!("preflight manifest exceeds 16 MiB");
+        }
+        Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+    }
+
+    /// Hash a source page after the caller has selected it through the
+    /// managed inventory.  This lets derived preflight caches detect source
+    /// replacement without exposing or trusting a client-provided path.
+    pub fn source_file_sha256(&self, source: &Path) -> Result<String> {
+        let source = canonical_path(source)?;
+        if !source.is_file() {
+            bail!("source page does not exist: {}", source.display());
+        }
+        sha256_file(&source)
     }
 
     pub fn next_pending_page(&self, job: &Path) -> Result<Option<PendingPage>> {
@@ -1920,7 +2042,7 @@ impl Workflow {
                 );
             }
         }
-        validate_typeset_completeness(&output_job, &source, &typeset)?;
+        validate_typeset_completeness_with_editor_context(&output_job, &source, &typeset, &qa)?;
         let sidecar = render_sidecar(&output);
         let artifact = RenderArtifact {
             stage: "rendered".into(),
@@ -1989,7 +2111,6 @@ impl Workflow {
             bail!("managed job has no expected pages");
         }
         let mut pages = Vec::with_capacity(sources.len());
-        let mut global_font_path = None;
         for source in sources {
             let entry = manifest
                 .pages
@@ -2008,13 +2129,13 @@ impl Workflow {
                 .ok_or_else(|| anyhow!("rendered page has no render artifact"))?;
             let artifact = self.validate_render_input(rendered_page)?;
             let bubbles = editor_bubbles(&artifact.typeset, &page_key(&source));
-            if global_font_path.is_none() {
-                global_font_path = artifact
-                    .qa
-                    .get("global_font_path")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned);
-            }
+            let cached_global_font = artifact
+                .qa
+                .get("global_font_path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .map(|path| serde_json::Value::String(path.to_owned()))
+                .unwrap_or(serde_json::Value::Null);
             let removed_bubbles = artifact
                 .qa
                 .get("removed_bubbles")
@@ -2038,15 +2159,16 @@ impl Workflow {
                 "bubbles": bubbles,
                 "removed_bubbles": removed_bubbles,
                 "correction_strokes": correction_strokes,
+                "_editor_cached_global_font_path": cached_global_font,
                 "render_dirty": false,
                 "rendered_state_revision": 0,
             }));
         }
-        let mut state = json!({"schema_version": 1, "pages": pages});
-        if let Some(font_path) = global_font_path {
-            state["font_path"] = serde_json::Value::String(font_path.clone());
-            state["_editor_requested_global_font_path"] = serde_json::Value::String(font_path);
-        }
+        let mut state = json!({
+            "schema_version": 1,
+            "pages": pages,
+            "font_path": serde_json::Value::Null
+        });
         if let Some(object) = supplied.and_then(serde_json::Value::as_object) {
             for key in ["title", "source_language", "target_language", "metadata"] {
                 if let Some(value) = object.get(key) {
@@ -2054,28 +2176,48 @@ impl Workflow {
                 }
             }
             if let Some(font_path) = object.get("font_path") {
-                state["font_path"] = font_path.clone();
-                if font_path
+                let supplied_explicit = object
+                    .get("_editor_global_font_explicit")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let has_marker_key = object.contains_key("_editor_requested_global_font_path");
+                let non_empty = font_path
                     .as_str()
-                    .is_some_and(|path| !path.trim().is_empty())
-                {
-                    // The public value is the current operator input. Refresh
-                    // the private marker with it so a stale marker cannot
-                    // suppress a global font change.
-                    state["_editor_requested_global_font_path"] = font_path.clone();
-                } else {
-                    state
-                        .as_object_mut()
-                        .expect("editor state object")
-                        .remove("_editor_requested_global_font_path");
+                    .is_some_and(|path| !path.trim().is_empty());
+                if non_empty || supplied_explicit || has_marker_key {
+                    state["font_path"] = font_path.clone();
+                    state["_editor_global_font_explicit"] = serde_json::Value::Bool(true);
+                    if non_empty {
+                        // The public value is the current operator input. Refresh
+                        // the private marker with it so a stale marker cannot
+                        // suppress a global font change.
+                        state["_editor_requested_global_font_path"] = font_path.clone();
+                    } else {
+                        // An explicit clear is real operator intent and must
+                        // survive save/reopen as a null marker, distinct from
+                        // "no global edit exists" (absent explicit flag).
+                        // A legacy null without explicit provenance is handled
+                        // by skipping this branch via the guard above.
+                        state["_editor_requested_global_font_path"] = serde_json::Value::Null;
+                    }
+                }
+            } else if object
+                .get("_editor_global_font_explicit")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                state["_editor_global_font_explicit"] = serde_json::Value::Bool(true);
+                if let Some(marker) = object.get("_editor_requested_global_font_path") {
+                    state["_editor_requested_global_font_path"] = marker.clone();
                 }
             } else if let Some(marker) = object.get("_editor_requested_global_font_path")
-                && state
-                    .get("font_path")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|path| !path.trim().is_empty())
+                && let Some(raw) = object.get("font_path").and_then(serde_json::Value::as_str)
+                && marker.as_str() != Some(raw)
             {
-                state["_editor_requested_global_font_path"] = marker.clone();
+                state["font_path"] = serde_json::Value::String(raw.to_owned());
+                state["_editor_requested_global_font_path"] =
+                    serde_json::Value::String(raw.to_owned());
+                state["_editor_global_font_explicit"] = serde_json::Value::Bool(true);
             }
         }
         Ok(state)
@@ -2189,7 +2331,12 @@ impl Workflow {
                     anyhow!("expected page is not rendered: {}", source.display())
                 })?;
                 let artifact = self.validate_render_input(rendered)?;
-                validate_typeset_completeness(&job, &source, &artifact.typeset)
+                validate_typeset_completeness_with_editor_context(
+                    &job,
+                    &source,
+                    &artifact.typeset,
+                    &artifact.qa,
+                )
             })()
             .with_context(|| {
                 format!(
@@ -2210,6 +2357,87 @@ impl Workflow {
             );
         }
         Ok(())
+    }
+
+    /// Recover request markers for a legacy saved bubble while comparing it to
+    /// its verified renderer artifact. Older project snapshots retained
+    /// renderer report fields but lost the private markers that distinguish
+    /// operator inputs from fitted values. A bubble with report provenance is
+    /// therefore reconciled from the cached request only when its marker is
+    /// absent; explicit markers remain authoritative evidence of an edit.
+    /// The persisted editor state is never mutated here.
+    fn carry_legacy_bubble_request_markers(
+        saved_page: &mut serde_json::Value,
+        cached_page: &serde_json::Value,
+    ) {
+        const MARKER_FIELDS: &[&str] = &[
+            "_editor_requested_font_path",
+            "_editor_requested_fallback_font_paths",
+            "_editor_requested_min_font_size",
+            "_editor_requested_max_font_size",
+            "_editor_requested_padding",
+            "_editor_padding_override",
+            "_editor_font_size_override",
+        ];
+
+        let Some(saved_bubbles) = saved_page
+            .get_mut("bubbles")
+            .and_then(serde_json::Value::as_array_mut)
+        else {
+            return;
+        };
+        let Some(cached_bubbles) = cached_page
+            .get("bubbles")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return;
+        };
+
+        let mut cached_by_id = std::collections::HashMap::<String, Option<usize>>::new();
+        for (index, bubble) in cached_bubbles.iter().enumerate() {
+            let Some(id) = bubble.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            match cached_by_id.entry(id.to_owned()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(Some(index));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.insert(None);
+                }
+            }
+        }
+
+        for saved_bubble in saved_bubbles {
+            let Some(id) = saved_bubble.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(Some(cached_index)) = cached_by_id.get(id) else {
+                continue;
+            };
+            let cached_bubble = &cached_bubbles[*cached_index];
+            if !crate::editor::bubble_has_renderer_report(cached_bubble) {
+                continue;
+            }
+            let Some(saved_object) = saved_bubble.as_object_mut() else {
+                continue;
+            };
+            for marker in MARKER_FIELDS {
+                if saved_object.contains_key(*marker) {
+                    continue;
+                }
+                let Some(marker_value) =
+                    cached_bubble.get(*marker).filter(|value| !value.is_null())
+                else {
+                    continue;
+                };
+                // Public font and layout fields in this legacy shape are
+                // renderer products. The cached request marker is the only
+                // reliable provenance, so recover it even when an old
+                // renderer expanded, reordered, or omitted the public value.
+                saved_object.insert((*marker).to_owned(), marker_value.clone());
+            }
+        }
     }
 
     /// Return the pages that must be rendered before a managed approval.
@@ -2283,12 +2511,32 @@ impl Workflow {
                 continue;
             };
 
+            let expected_semantic = crate::editor::post_render_page_signature(state, state_page);
+            let semantic_matches = artifact
+                .qa
+                .get("semantic_render_signature")
+                .and_then(serde_json::Value::as_str)
+                .map(|signature| {
+                    crate::approval::semantic_render_signatures_equal(signature, &expected_semantic)
+                })
+                // Sidecars predating semantic signatures are still checked
+                // against the cached render payload below for compatibility.
+                .unwrap_or(true);
+            if !semantic_matches {
+                rerender.push(page_index);
+                continue;
+            }
+
+            let cached_global_font = artifact
+                .qa
+                .get("global_font_path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|path| !path.trim().is_empty())
+                .map(|path| serde_json::Value::String(path.to_owned()))
+                .unwrap_or(serde_json::Value::Null);
             let cached_page = serde_json::json!({
-                "font_path": artifact
-                    .qa
-                    .get("global_font_path")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
+                "font_path": serde_json::Value::Null,
+                "_editor_cached_global_font_path": cached_global_font,
                 "bubbles": editor_bubbles(&artifact.typeset, &page_key(&source)),
                 "removed_bubbles": artifact
                     .qa
@@ -2304,21 +2552,20 @@ impl Workflow {
                     .unwrap_or_else(|| serde_json::Value::Array(Vec::new())),
             });
             let mut state_page_for_signature = state_page.clone();
-            if let Some(object) = state_page_for_signature.as_object_mut() {
-                if let Some(font_path) = state.get("font_path") {
-                    object.insert("font_path".to_owned(), font_path.clone());
-                }
-                if let Some(font_path) = state.get("_editor_requested_global_font_path") {
-                    object.insert(
-                        "_editor_requested_global_font_path".to_owned(),
-                        font_path.clone(),
-                    );
-                }
-            }
-            let content_changed = crate::editor::page_render_signature(&state_page_for_signature)
-                != crate::editor::page_render_signature(&cached_page);
-            let complete = validate_typeset_completeness(&job, &source, &artifact.typeset).is_ok();
-            if content_changed || !complete {
+            state_page_for_signature["_editor_cached_global_font_path"] =
+                cached_page["_editor_cached_global_font_path"].clone();
+            Self::carry_legacy_bubble_request_markers(&mut state_page_for_signature, &cached_page);
+            let state_signature =
+                crate::editor::editor_page_render_signature(state, &state_page_for_signature);
+            let cached_signature = crate::editor::page_render_signature(&cached_page);
+            let content_changed = state_signature != cached_signature;
+            // Completeness is an approval/export gate, not a cache identity
+            // check. A valid cached render can correspond exactly to the
+            // current editor inputs even when a later OCR audit discovers an
+            // untranslated or otherwise incomplete source region. Keep the
+            // render reusable here; approval validation will still report the
+            // page-specific completeness error before export.
+            if content_changed {
                 rerender.push(page_index);
             }
         }
@@ -2537,6 +2784,42 @@ fn normalized_source_text(text: &str) -> String {
         .collect()
 }
 
+// OCR prose lines can be wider than their detector bubble and can lose a
+// short word or several characters while the detector still identifies the
+// same item.  Keep this fallback deliberately narrow: it is only used for a
+// request whose stable ID is present in both the detector bubbles and the
+// translation handoff, and it requires at least 70% of the OCR line area to
+// be covered plus 60% character-level similarity.  The length cap keeps the
+// bounded edit-distance check from becoming an approval-time hot path for
+// arbitrarily long OCR blobs.
+const LINKED_LINE_COVERAGE_MIN: f32 = 0.70;
+const LINKED_OCR_SIMILARITY_MIN: f32 = 0.60;
+const LINKED_OCR_MAX_CHARS: usize = 512;
+
+fn normalized_ocr_similarity(left: &str, right: &str) -> Option<f32> {
+    let left = normalized_source_text(left).chars().collect::<Vec<_>>();
+    let right = normalized_source_text(right).chars().collect::<Vec<_>>();
+    if left.is_empty() || right.is_empty() || left.len() > LINKED_OCR_MAX_CHARS {
+        return None;
+    }
+    if right.len() > LINKED_OCR_MAX_CHARS {
+        return None;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.iter().enumerate() {
+        let mut current = vec![left_index + 1; right.len() + 1];
+        for (right_index, right_char) in right.iter().enumerate() {
+            let substitution = usize::from(left_char != right_char);
+            current[right_index + 1] = (current[right_index] + 1)
+                .min(previous[right_index + 1] + 1)
+                .min(previous[right_index] + substitution);
+        }
+        previous = current;
+    }
+    let distance = previous[right.len()] as f32;
+    Some(1.0 - distance / left.len().max(right.len()) as f32)
+}
+
 fn source_text_covers_line(source: &str, line: &str, source_language: &str) -> bool {
     if source.trim().is_empty() || line.trim().is_empty() {
         return false;
@@ -2638,11 +2921,178 @@ fn request_source_anchor_covers_line(
     })
 }
 
+fn request_source_anchor_line_coverage(
+    request: &serde_json::Value,
+    line_bbox: Option<crate::domain::Rect>,
+) -> Option<f32> {
+    let line_bbox = line_bbox.and_then(|bbox| bbox.validate().ok())?;
+    let line_area = (line_bbox.x2 - line_bbox.x1) * (line_bbox.y2 - line_bbox.y1);
+    [
+        "source_anchor",
+        "source_bbox",
+        "bubble_bbox",
+        "bbox",
+        "text_bbox",
+    ]
+    .into_iter()
+    .filter_map(|key| request.get(key))
+    .filter_map(|value| serde_json::from_value::<crate::domain::Rect>(value.clone()).ok())
+    .filter_map(|bbox| bbox.validate().ok())
+    .map(|anchor| {
+        let x1 = line_bbox.x1.max(anchor.x1);
+        let y1 = line_bbox.y1.max(anchor.y1);
+        let x2 = line_bbox.x2.min(anchor.x2);
+        let y2 = line_bbox.y2.min(anchor.y2);
+        let intersection = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
+        intersection / line_area
+    })
+    .max_by(f32::total_cmp)
+}
+
+fn detector_handoff_linked_request(
+    request: &serde_json::Value,
+    analysis: &serde_json::Value,
+    handoff_items: &[serde_json::Value],
+) -> bool {
+    let Some(id) = request.get("id").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let in_handoff = handoff_items
+        .iter()
+        .any(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(id));
+    let in_detector_bubbles = analysis
+        .get("bubbles")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|bubbles| {
+            bubbles
+                .iter()
+                .any(|bubble| bubble.get("id").and_then(serde_json::Value::as_str) == Some(id))
+        });
+    in_handoff && in_detector_bubbles
+}
+
+fn linked_request_covers_ocr_line(
+    request: &serde_json::Value,
+    line_text: &str,
+    line_bbox: Option<crate::domain::Rect>,
+    analysis: &serde_json::Value,
+    handoff_items: &[serde_json::Value],
+) -> bool {
+    if !detector_handoff_linked_request(request, analysis, handoff_items) {
+        return false;
+    }
+    let Some(source_text) = request
+        .get("source_text")
+        .or_else(|| request.get("original_text"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    let Some(coverage) = request_source_anchor_line_coverage(request, line_bbox) else {
+        return false;
+    };
+    coverage >= LINKED_LINE_COVERAGE_MIN
+        && normalized_ocr_similarity(source_text, line_text)
+            .is_some_and(|similarity| similarity >= LINKED_OCR_SIMILARITY_MIN)
+}
+
+#[cfg(test)]
 fn validate_typeset_completeness(
     job: &Path,
     source: &Path,
     typeset: &serde_json::Value,
 ) -> Result<()> {
+    validate_typeset_completeness_with_editor_context(
+        job,
+        source,
+        typeset,
+        &serde_json::Value::Null,
+    )
+}
+
+fn editor_render_exempt_handoff_ids(qa: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    if qa.get("editor_render").and_then(serde_json::Value::as_bool) != Some(true) {
+        return std::collections::BTreeSet::new();
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for value in qa
+        .get("removed_bubbles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .chain(
+            qa.get("replaced_handoff_ids")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten(),
+        )
+    {
+        if let Some(id) = value
+            .as_str()
+            .or_else(|| value.get("id").and_then(serde_json::Value::as_str))
+            .filter(|id| !id.trim().is_empty())
+        {
+            ids.insert(id.to_owned());
+        }
+    }
+    ids
+}
+
+fn editor_missing_dialogue_regions(qa: &serde_json::Value) -> Vec<crate::domain::Rect> {
+    if qa.get("editor_render").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Vec::new();
+    }
+    qa.get("issues")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|issue| {
+            issue.get("origin").and_then(serde_json::Value::as_str) == Some("missing-dialogue-flag")
+                && issue.get("issue_type").and_then(serde_json::Value::as_str)
+                    == Some("wrong_or_missing_bubble")
+        })
+        .filter_map(|issue| {
+            issue
+                .get("bbox")
+                .cloned()
+                .and_then(|bbox| serde_json::from_value::<crate::domain::Rect>(bbox).ok())
+                .and_then(|bbox| bbox.validate().ok())
+        })
+        .collect()
+}
+
+fn missing_dialogue_flag_covers_item(
+    item: &serde_json::Value,
+    regions: &[crate::domain::Rect],
+) -> bool {
+    let Some(item_bbox) = item
+        .get("bbox")
+        .or_else(|| item.get("bubble_bbox"))
+        .cloned()
+        .and_then(|bbox| serde_json::from_value::<crate::domain::Rect>(bbox).ok())
+        .and_then(|bbox| bbox.validate().ok())
+    else {
+        return false;
+    };
+    regions.iter().any(|region| {
+        let region_area = (region.x2 - region.x1) * (region.y2 - region.y1);
+        if region_area <= 0.0 {
+            return false;
+        }
+        let intersection = (region.x2.min(item_bbox.x2) - region.x1.max(item_bbox.x1)).max(0.0)
+            * (region.y2.min(item_bbox.y2) - region.y1.max(item_bbox.y1)).max(0.0);
+        intersection / region_area >= 0.25
+    })
+}
+
+fn validate_typeset_completeness_with_editor_context(
+    job: &Path,
+    source: &Path,
+    typeset: &serde_json::Value,
+    editor_qa: &serde_json::Value,
+) -> Result<()> {
+    let editor_exempt_handoff_ids = editor_render_exempt_handoff_ids(editor_qa);
+    let missing_dialogue_regions = editor_missing_dialogue_regions(editor_qa);
     let manifest = load_manifest(job)?;
     let analysis = page_artifacts(job, &manifest, source)?.analysis;
     if !analysis.is_file() {
@@ -2676,6 +3126,80 @@ fn validate_typeset_completeness(
         .and_then(serde_json::Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    let report_bubbles = typeset
+        .get("report")
+        .and_then(|report| report.get("bubbles"))
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+
+    // A nonempty translation is not complete merely because it appeared in
+    // the request. Require the typesetter to have emitted measurable glyph
+    // bounds for that exact request before the render can enter the manifest.
+    // Explicit source-preserve decisions and empty requests remain valid.
+    for (index, request) in requests.iter().enumerate() {
+        let text = request
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        if text.trim().is_empty() || explicit_source_preserve(request) {
+            continue;
+        }
+        let id = request
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or("<missing-id>");
+        let report = report_bubbles
+            .iter()
+            .find(|bubble| {
+                bubble
+                    .get("index")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|report_index| report_index == index as u64)
+            })
+            .or_else(|| {
+                report_bubbles
+                    .get(index)
+                    .filter(|bubble| bubble.get("index").is_none())
+            });
+        let Some(report) = report else {
+            bail!(
+                "translated bubble {id:?} at index {index} has no typeset report entry (reason: missing_report_entry)"
+            );
+        };
+        if report
+            .get("skipped")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            let reason = report
+                .get("skip_reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("skipped");
+            bail!(
+                "translated bubble {id:?} at index {index} was skipped by typesetting (reason: {reason})"
+            );
+        }
+        let ink_bbox = report
+            .get("ink_bbox")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .and_then(|value| serde_json::from_value::<crate::domain::Rect>(value).ok());
+        let measurable_ink = ink_bbox.is_some_and(|bbox| {
+            bbox.x1.is_finite()
+                && bbox.y1.is_finite()
+                && bbox.x2.is_finite()
+                && bbox.y2.is_finite()
+                && bbox.x2 > bbox.x1
+                && bbox.y2 > bbox.y1
+        });
+        if !measurable_ink {
+            bail!(
+                "translated bubble {id:?} at index {index} has no measurable ink bounds (reason: missing_ink_bbox)"
+            );
+        }
+    }
 
     // A detector region must be represented by the persisted handoff before
     // it can be cleaned. This also catches the historical broad-bubble case
@@ -2701,6 +3225,9 @@ fn validate_typeset_completeness(
         let Some(id) = item.get("id").and_then(serde_json::Value::as_str) else {
             bail!("translation item without an id cannot be rendered");
         };
+        if editor_exempt_handoff_ids.contains(id) {
+            continue;
+        }
         let source_language = item
             .get("source_language")
             .and_then(serde_json::Value::as_str)
@@ -2718,6 +3245,9 @@ fn validate_typeset_completeness(
         let request = requests
             .iter()
             .find(|request| request.get("id").and_then(serde_json::Value::as_str) == Some(id));
+        if request.is_none() && missing_dialogue_flag_covers_item(item, &missing_dialogue_regions) {
+            continue;
+        }
         let Some(request) = request else {
             bail!("translation item {id:?} has no rendered bubble");
         };
@@ -2793,10 +3323,29 @@ fn validate_typeset_completeness(
                 let source_text_matches =
                     source_text_covers_line(source, line_text, request_language);
                 let source_anchor_matches = request_source_anchor_covers_line(request, line_bbox);
-                if !source_text_matches && !source_anchor_matches {
+                let preserved_request = explicit_or_default_source_preserve(request, replace_sfx);
+                // Detector-linked requests with OCR drift must still identify
+                // the same line.  Manual editor bubbles retain the existing
+                // full-containment path for legacy afterwords and other
+                // source-less anchors.
+                let linked_ocr_match = !source_text_matches
+                    && !preserved_request
+                    && linked_request_covers_ocr_line(
+                        request, line_text, line_bbox, &analysis, items,
+                    );
+                let source_or_linked_match = if source_text_matches {
+                    true
+                } else if detector_handoff_linked_request(request, &analysis, items)
+                    && !preserved_request
+                {
+                    linked_ocr_match
+                } else {
+                    source_anchor_matches
+                };
+                if !source_or_linked_match {
                     return false;
                 }
-                if explicit_or_default_source_preserve(request, replace_sfx) {
+                if preserved_request {
                     return true;
                 }
                 let text = request
@@ -2893,25 +3442,11 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                 }
             }
             bubble.insert("id".into(), serde_json::Value::String(bubble_id));
-            let is_editor_render_payload = bubble
-                .get("_editor_render_payload")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
             let requested_font_path = bubble
                 .get("_editor_requested_font_path")
-                .or_else(|| bubble.get("requested_font_path"))
                 .and_then(serde_json::Value::as_str)
                 .filter(|path| !path.trim().is_empty())
-                .map(str::to_owned)
-                .or_else(|| {
-                    (!is_editor_render_payload).then(|| {
-                        bubble
-                            .get("font_path")
-                            .and_then(serde_json::Value::as_str)
-                            .filter(|path| !path.trim().is_empty())
-                            .map(str::to_owned)
-                    })?
-                });
+                .map(str::to_owned);
             let requested_fallback_font_paths = bubble
                 .get("_editor_requested_fallback_font_paths")
                 .filter(|value| value.is_array())
@@ -2975,13 +3510,7 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                     );
                 }
             }
-            if let Some(path) = requested_font_path.or_else(|| {
-                bubble
-                    .get("requested_font_path")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|path| !path.trim().is_empty())
-                    .map(str::to_owned)
-            }) {
+            if let Some(path) = requested_font_path {
                 // Keep the requested face beside the resolved request/report
                 // fields so reopening an editor render retains user intent.
                 bubble.insert(
@@ -2989,6 +3518,13 @@ fn editor_bubbles(typeset: &serde_json::Value, page_key: &str) -> Vec<serde_json
                     serde_json::Value::String(path),
                 );
             }
+            bubble.insert(
+                "_editor_cached_font_path".into(),
+                bubble
+                    .get("font_path")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+            );
             if let Some(paths) = requested_fallback_font_paths {
                 bubble.insert("_editor_requested_fallback_font_paths".into(), paths);
             }
@@ -3707,7 +4243,48 @@ fn acquire_lock_file(path: PathBuf, label: &str) -> Result<LockLease> {
     }
 }
 
-fn lock_owner_is_alive(path: &Path) -> bool {
+fn try_acquire_lock_file(path: PathBuf, label: &str) -> Result<LockLease> {
+    loop {
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                let _ = writeln!(file, "pid={}", std::process::id());
+                let _ = file.sync_all();
+                let (stop, receiver) = mpsc::channel();
+                let heartbeat_path = path.clone();
+                let heartbeat = thread::spawn(move || {
+                    while receiver.recv_timeout(Duration::from_secs(30)).is_err() {
+                        let Ok(mut file) = OpenOptions::new().write(true).open(&heartbeat_path)
+                        else {
+                            break;
+                        };
+                        let _ = file.set_len(0);
+                        let _ = writeln!(file, "pid={}", std::process::id());
+                        let _ = file.sync_all();
+                    }
+                });
+                return Ok(LockLease {
+                    path,
+                    stop: Some(stop),
+                    heartbeat: Some(heartbeat),
+                });
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && lock_owner_is_dead(&path) =>
+            {
+                if fs::remove_file(&path).is_err() {
+                    bail!("busy: another process owns {}", label);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                bail!("busy: another process owns {}", label)
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+pub(crate) fn lock_owner_is_alive(path: &Path) -> bool {
     let Ok(contents) = fs::read_to_string(path) else {
         return false;
     };
@@ -4791,6 +5368,178 @@ mod tests {
     }
 
     #[test]
+    fn render_completeness_accepts_linked_ocr_drift_with_substantial_coverage() {
+        let dir = tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        let source = dir.path().join("page.png");
+        RgbImage::from_pixel(256, 256, image::Rgb([255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let workflow = Workflow::new(jobs).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+
+        let cases = [
+            (
+                "bubble-page-99",
+                "HIS HIP AOVEMENTS ARE TOO EROTIC...!",
+                "HIS HIP ARE TOO ROTIC...",
+                json!({"x1": 1168.0, "y1": 1156.0, "x2": 1273.0, "y2": 1307.0}),
+                json!({"x1": 1177.0, "y1": 1071.0, "x2": 1269.0, "y2": 1395.0}),
+            ),
+            (
+                "bubble-page-130",
+                "BEING IMPREGNATED DIRECTLY...",
+                "BEING MPREGNATEDIRECTLY...",
+                json!({"x1": 25.0, "y1": 537.0, "x2": 178.0, "y2": 623.0}),
+                json!({"x1": 47.0, "y1": 408.0, "x2": 161.0, "y2": 760.0}),
+            ),
+        ];
+
+        for (id, line_text, source_text, line_bbox, request_bbox) in cases {
+            workflow
+                .write_analysis_artifact(
+                    &source,
+                    &json!({
+                        "target_language": "vi",
+                        "bubbles": [{"id": id, "bbox": request_bbox.clone()}],
+                        "text_lines": [{
+                            "id": format!("line-{id}"),
+                            "text": line_text,
+                            "source_language": "en",
+                            "bbox": line_bbox
+                        }],
+                        "unmatched_text": [],
+                        "translation_handoff": {"items": [{
+                            "id": id,
+                            "kind": "dialogue",
+                            "source_text": source_text,
+                            "source_language": "en"
+                        }]}
+                    }),
+                )
+                .unwrap();
+            validate_typeset_completeness(
+                &registration.job_dir,
+                &source,
+                &json!({"request_bubbles": [{
+                    "id": id,
+                    "source_text": source_text,
+                    "text": "Bản dịch đã được kiểm tra.",
+                    "bbox": request_bbox
+                }]}),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn render_completeness_rejects_unrelated_or_weak_linked_ocr_and_unchanged_english() {
+        let dir = tempdir().unwrap();
+        let jobs = dir.path().join("jobs");
+        let source = dir.path().join("page.png");
+        RgbImage::from_pixel(256, 256, image::Rgb([255, 255, 255]))
+            .save(&source)
+            .unwrap();
+        let workflow = Workflow::new(jobs).unwrap();
+        let registration = workflow.register_analysis(&source, None).unwrap();
+
+        let cases = [
+            (
+                "unrelated",
+                "UNRELATED ENGLISH PROSE LINE HERE...",
+                "HIS HIP ARE TOO ROTIC...",
+                json!({"x1": 30.0, "y1": 0.0, "x2": 100.0, "y2": 100.0}),
+                "Bản dịch khác.",
+            ),
+            (
+                "weak-overlap",
+                "BEING IMPREGNATED DIRECTLY...",
+                "BEING MPREGNATEDIRECTLY...",
+                json!({"x1": 80.0, "y1": 0.0, "x2": 100.0, "y2": 100.0}),
+                "Bản dịch khác.",
+            ),
+        ];
+
+        for (id, line_text, source_text, request_bbox, translation) in cases {
+            workflow
+                .write_analysis_artifact(
+                    &source,
+                    &json!({
+                        "target_language": "vi",
+                        "bubbles": [{"id": id, "bbox": request_bbox.clone()}],
+                        "text_lines": [{
+                            "text": line_text,
+                            "source_language": "en",
+                            "bbox": {"x1": 0.0, "y1": 0.0, "x2": 100.0, "y2": 100.0}
+                        }],
+                        "unmatched_text": [],
+                        "translation_handoff": {"items": [{
+                            "id": id,
+                            "kind": "dialogue",
+                            "source_text": source_text,
+                            "source_language": "en"
+                        }]}
+                    }),
+                )
+                .unwrap();
+            let error = validate_typeset_completeness(
+                &registration.job_dir,
+                &source,
+                &json!({"request_bubbles": [{
+                    "id": id,
+                    "source_text": source_text,
+                    "text": translation,
+                    "bbox": request_bbox
+                }]}),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("detected English prose line 0"), "{error}");
+        }
+
+        workflow
+            .write_analysis_artifact(
+                &source,
+                &json!({
+                    "target_language": "vi",
+                    "bubbles": [{
+                        "id": "unchanged",
+                        "bbox": {"x1": 0.0, "y1": 0.0, "x2": 100.0, "y2": 100.0}
+                    }],
+                    "text_lines": [{
+                        "text": "THIS ENGLISH PROSE REMAINS UNCHANGED.",
+                        "source_language": "en",
+                        "bbox": {"x1": 0.0, "y1": 0.0, "x2": 100.0, "y2": 100.0}
+                    }],
+                    "unmatched_text": [],
+                    "translation_handoff": {"items": [{
+                        "id": "unchanged",
+                        "kind": "dialogue",
+                        "source_text": "THIS ENGLISH PROSE REMAINS UNCHANGED.",
+                        "source_language": "en"
+                    }]}
+                }),
+            )
+            .unwrap();
+        let error = validate_typeset_completeness(
+            &registration.job_dir,
+            &source,
+            &json!({"request_bubbles": [{
+                "id": "unchanged",
+                "source_text": "THIS ENGLISH PROSE REMAINS UNCHANGED.",
+                "text": "THIS ENGLISH PROSE REMAINS UNCHANGED.",
+                "bbox": {"x1": 0.0, "y1": 0.0, "x2": 100.0, "y2": 100.0}
+            }]}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("retained unchanged English prose"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn render_completeness_accepts_one_full_afterword_editor_anchor() {
         let dir = tempdir().unwrap();
         let jobs = dir.path().join("jobs");
@@ -5162,6 +5911,38 @@ mod tests {
                 .is_empty()
         );
 
+        // A later OCR/completeness audit may reject the old translation, but
+        // that does not make an otherwise valid cached PNG require a render.
+        // Approval still owns this gate and must reject the incomplete page.
+        let analysis_path = workflow.page_artifacts_for_source(&first_source).unwrap().0;
+        fs::write(
+            &analysis_path,
+            serde_json::to_vec(&json!({
+                "target_language": "vi",
+                "translation_handoff": {
+                    "target_language": "vi",
+                    "items": [{
+                        "id": "ocr-line-1",
+                        "source_language": "en",
+                        "source_text": "Untranslated prose"
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap(),
+            Vec::<usize>::new()
+        );
+        assert!(
+            workflow
+                .validate_editor_completeness(&registration.job_dir, &state)
+                .is_err()
+        );
+
         state["pages"][0]["correction_strokes"] = json!([{
             "mode": "cover",
             "size": 4,
@@ -5178,7 +5959,17 @@ mod tests {
             .page_artifacts_for_source(&second_source)
             .unwrap()
             .4;
-        fs::remove_file(second_rendered).unwrap();
+        fs::remove_file(&second_rendered).unwrap();
+        assert_eq!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap(),
+            vec![0, 1]
+        );
+
+        // A present but corrupt cached render is still a true dirty-plan
+        // page; a preflight must never clear its marker as reusable.
+        fs::write(&second_rendered, b"not a managed render").unwrap();
         assert_eq!(
             workflow
                 .editor_render_plan(&registration.job_dir, &state)
@@ -5188,7 +5979,7 @@ mod tests {
     }
 
     #[test]
-    fn editor_render_plan_ignores_legacy_report_layout_across_many_pages() {
+    fn editor_render_plan_reconciles_legacy_report_layout_without_masking_explicit_edits() {
         let dir = tempdir().unwrap();
         let source_dir = dir.path().join("comic");
         fs::create_dir_all(&source_dir).unwrap();
@@ -5235,8 +6026,10 @@ mod tests {
                 "bbox": {"x1": 1.0, "y1": 1.0, "x2": 14.0, "y2": 14.0},
                 "text": "Bản dịch",
                 "font_path": "fonts/requested.ttf",
+                "fallback_font_paths": ["fonts/resolved.ttf"],
                 "min_font_size": 8.0,
-                "max_font_size": 72.0,
+                "max_font_size": 23.5,
+                "padding": 6.0,
                 "shape": "ellipse"
             });
             let report_bubble = json!({
@@ -5256,7 +6049,7 @@ mod tests {
                 "requested_primary_font": "fonts/requested.ttf",
                 "font_path": "fonts/requested.ttf",
                 "resolved_font_path": "fonts/resolved.ttf",
-                "fallback_font_paths": ["fonts/resolved.ttf"],
+                "fallback_font_paths": ["fonts/report-fallback.ttf"],
                 "fallback_fonts_used": ["fonts/resolved.ttf"],
                 "font_runs": [{"font_index": 1, "text": "Bản dịch"}],
                 "resolved_text_color": "black",
@@ -5288,17 +6081,29 @@ mod tests {
         for page in state["pages"].as_array_mut().unwrap() {
             let bubble = page["bubbles"][0].as_object_mut().unwrap();
             // Model a legacy project snapshot: fitted values and report
-            // metadata were serialized with different renderer versions.
+            // metadata survived, but private request markers did not.
             bubble.insert("font_size".into(), json!(11.5));
-            bubble.insert("padding".into(), json!(2.0));
+            bubble.insert("padding".into(), json!(6.0));
             bubble.insert("font_path".into(), json!("fonts/legacy-resolved.ttf"));
             bubble.insert("rendered_font_path".into(), json!("fonts/resolved.ttf"));
             bubble.insert(
                 "resolved_font_path".into(),
                 json!("fonts/legacy-resolved.ttf"),
             );
-            bubble.insert("min_font_size".into(), json!(11.5));
-            bubble.insert("max_font_size".into(), json!(11.5));
+            bubble.insert("min_font_size".into(), json!(8.0));
+            bubble.insert("max_font_size".into(), json!(23.5));
+            bubble.insert("fallback_font_paths".into(), json!(["fonts/resolved.ttf"]));
+            for marker in [
+                "_editor_requested_font_path",
+                "_editor_requested_fallback_font_paths",
+                "_editor_requested_min_font_size",
+                "_editor_requested_max_font_size",
+                "_editor_requested_padding",
+                "_editor_padding_override",
+                "_editor_font_size_override",
+            ] {
+                bubble.remove(marker);
+            }
             bubble.insert(
                 "safe_bbox".into(),
                 json!({"x1": 99, "y1": 99, "x2": 100, "y2": 100}),
@@ -5306,12 +6111,60 @@ mod tests {
             page["render_dirty"] = json!(true);
             page["typeset_warnings"] = json!([{"reason": "legacy-report"}]);
         }
+        // Old snapshots may also serialize a null fitted range or padding
+        // while the render sidecar retains the original request values.
+        state["pages"][1]["bubbles"][0]["max_font_size"] = serde_json::Value::Null;
+        state["pages"][2]["bubbles"][0]["padding"] = serde_json::Value::Null;
         assert!(
             workflow
                 .editor_render_plan(&registration.job_dir, &state)
                 .unwrap()
                 .is_empty()
         );
+
+        // Modern editor edits carry an explicit request marker and remain a
+        // real render edit, even when legacy public fields vary.
+        state["pages"][3]["bubbles"][0]["max_font_size"] = json!(24.5);
+        state["pages"][3]["bubbles"][0]["_editor_requested_max_font_size"] = json!(24.5);
+        assert_eq!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap(),
+            vec![3]
+        );
+        state["pages"][3]["bubbles"][0]["max_font_size"] = json!(23.5);
+        state["pages"][3]["bubbles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("_editor_requested_max_font_size");
+        state["pages"][3]["bubbles"][0]["padding"] = json!(7.0);
+        state["pages"][3]["bubbles"][0]["_editor_requested_padding"] = json!(7.0);
+        assert_eq!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap(),
+            vec![3]
+        );
+        state["pages"][3]["bubbles"][0]["padding"] = json!(6.0);
+        state["pages"][3]["bubbles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("_editor_requested_padding");
+        state["pages"][3]["bubbles"][0]["fallback_font_paths"][0] =
+            json!("fonts/changed-fallback.ttf");
+        state["pages"][3]["bubbles"][0]["_editor_requested_fallback_font_paths"] =
+            json!(["fonts/changed-fallback.ttf"]);
+        assert_eq!(
+            workflow
+                .editor_render_plan(&registration.job_dir, &state)
+                .unwrap(),
+            vec![3]
+        );
+        state["pages"][3]["bubbles"][0]["fallback_font_paths"][0] = json!("fonts/resolved.ttf");
+        state["pages"][3]["bubbles"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("_editor_requested_fallback_font_paths");
 
         state["pages"][3]["bubbles"][0]["translation"] = json!("One real edit");
         assert_eq!(
@@ -5328,6 +6181,271 @@ mod tests {
                 .editor_render_plan(&registration.job_dir, &state)
                 .unwrap(),
             vec![3]
+        );
+    }
+
+    #[test]
+    fn font_provenance_regressions_scenarios_1_to_4_and_8_9() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("comic");
+        fs::create_dir_all(&source_dir).unwrap();
+        let p1 = source_dir.join("page-01.png");
+        let p2 = source_dir.join("page-02.png");
+        for source in [&p1, &p2] {
+            let mut img = RgbaImage::from_pixel(16, 16, Rgba([255, 255, 255, 255]));
+            img.put_pixel(3, 3, Rgba([0, 0, 0, 255]));
+            img.save(source).unwrap();
+        }
+
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let reg = workflow.register_analysis(&p1, None).unwrap();
+        workflow.register_analysis(&p2, None).unwrap();
+
+        for (source, font, has_bubble) in [
+            (&p1, "fonts/historical-a.ttf", true),
+            (&p2, "fonts/historical-b.ttf", false),
+        ] {
+            let cleaned = RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255]));
+            let mut mask = GrayImage::new(16, 16);
+            mask.put_pixel(3, 3, image::Luma([255]));
+            let (cleaned_path, _, _) = workflow
+                .write_clean_artifact(source, &cleaned, &mask, 1, "full")
+                .unwrap();
+            let rendered_path = workflow.page_artifacts_for_source(source).unwrap().4;
+            cleaned.save(&rendered_path).unwrap();
+            let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
+            let (request_bubbles, report_bubbles) = if has_bubble {
+                (
+                    vec![json!({
+                        "id": "bubble-1",
+                        "text": "Hello",
+                        "bbox": {"x1": 1.0, "y1": 1.0, "x2": 10.0, "y2": 10.0}
+                    })],
+                    vec![json!({
+                        "index": 0,
+                        "input_bbox": {"x1": 1.0, "y1": 1.0, "x2": 10.0, "y2": 10.0},
+                        "font_path": font,
+                        "requested_font_path": font,
+                        "resolved_font_path": font
+                    })],
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            workflow
+                .register_render(
+                    &rendered_path,
+                    &clean,
+                    json!({
+                        "request_bubbles": request_bubbles,
+                        "report": {
+                            "bubbles": report_bubbles,
+                            "global_font_path": font
+                        }
+                    }),
+                    json!({
+                        "status": "pass",
+                        "global_font_path": font
+                    }),
+                )
+                .unwrap();
+        }
+
+        let rendered1 = workflow.page_artifacts_for_source(&p1).unwrap().4;
+        let state = workflow.editor_state(&rendered1, None).unwrap();
+
+        // Scenario 8: Editor state reconstruction from report artifacts does not
+        // manufacture operator intent (no phantom _editor_global_font_explicit,
+        // no phantom _editor_requested_font_path).
+        assert_eq!(state.get("_editor_global_font_explicit"), None);
+        assert!(state["font_path"].is_null());
+        assert_eq!(
+            state["pages"][0]["bubbles"][0].get("_editor_requested_font_path"),
+            None
+        );
+
+        // Scenario 4: An inherited bubble does NOT become explicit on reopen.
+        assert_eq!(
+            state["pages"][0]["bubbles"][0].get("_editor_requested_font_path"),
+            None
+        );
+
+        // Scenario 1: Reopening a project whose pages were rendered with different
+        // historical global fonts reports 0 dirty pages when no edits were made.
+        assert_eq!(state["pages"][0]["render_dirty"], json!(false));
+        assert_eq!(state["pages"][1]["render_dirty"], json!(false));
+        assert_eq!(
+            workflow.editor_render_plan(&reg.job_dir, &state).unwrap(),
+            Vec::<usize>::new()
+        );
+
+        // Scenario 2: In that same project, an explicit brush edit to one page marks
+        // only that page dirty; other pages remain reusable.
+        let mut state_brush = state.clone();
+        state_brush["pages"][0]["correction_strokes"] = json!([{
+            "mode": "cover",
+            "size": 4,
+            "points": [{"x": 2, "y": 2}]
+        }]);
+        assert_eq!(
+            workflow
+                .editor_render_plan(&reg.job_dir, &state_brush)
+                .unwrap(),
+            vec![0]
+        );
+
+        // Scenario 3: Explicitly changing global font in editor marks pages with text dirty,
+        // but an explicit clean/brush-only page without text stays reusable according to rules.
+        let mut state_font = state.clone();
+        state_font["font_path"] = json!("fonts/brand-new-global.ttf");
+        state_font["_editor_requested_global_font_path"] = json!("fonts/brand-new-global.ttf");
+        state_font["_editor_global_font_explicit"] = json!(true);
+        assert_eq!(
+            workflow
+                .editor_render_plan(&reg.job_dir, &state_font)
+                .unwrap(),
+            vec![0]
+        );
+
+        // Scenario 9: Missing or corrupt render artifacts force that page to rerender
+        // even if inputs match.
+        let rendered2 = workflow.page_artifacts_for_source(&p2).unwrap().4;
+        fs::remove_file(&rendered2).unwrap();
+        assert_eq!(
+            workflow.editor_render_plan(&reg.job_dir, &state).unwrap(),
+            vec![1]
+        );
+        fs::write(&rendered2, b"not a real png").unwrap();
+        assert_eq!(
+            workflow.editor_render_plan(&reg.job_dir, &state).unwrap(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn font_provenance_mixed_history_five_pages_and_explicit_clear() {
+        let dir = tempdir().unwrap();
+        let source_dir = dir.path().join("comic");
+        fs::create_dir_all(&source_dir).unwrap();
+        let sources: Vec<PathBuf> = (1..=5)
+            .map(|index| source_dir.join(format!("page-{index:02}.png")))
+            .collect();
+        for source in &sources {
+            let mut img = RgbaImage::from_pixel(16, 16, Rgba([255, 255, 255, 255]));
+            img.put_pixel(3, 3, Rgba([0, 0, 0, 255]));
+            img.save(source).unwrap();
+        }
+        let workflow = Workflow::new(dir.path().join("jobs")).unwrap();
+        let reg = workflow.register_analysis(&sources[0], None).unwrap();
+        for source in sources.iter().skip(1) {
+            workflow.register_analysis(source, None).unwrap();
+        }
+        // Pages 1..4 carry translated text with historical globals
+        // A, B, null/default, A. Page 5 is preserved/source-only.
+        let historical: [Option<&str>; 5] = [
+            Some("fonts/historical-a.ttf"),
+            Some("fonts/historical-b.ttf"),
+            None,
+            Some("fonts/historical-a.ttf"),
+            None,
+        ];
+        for (source, font) in sources.iter().zip(historical.iter()) {
+            let cleaned = RgbImage::from_pixel(16, 16, image::Rgb([255, 255, 255]));
+            let mut mask = GrayImage::new(16, 16);
+            mask.put_pixel(3, 3, image::Luma([255]));
+            let (cleaned_path, _, _) = workflow
+                .write_clean_artifact(source, &cleaned, &mask, 1, "full")
+                .unwrap();
+            let rendered_path = workflow.page_artifacts_for_source(source).unwrap().4;
+            cleaned.save(&rendered_path).unwrap();
+            let clean = workflow.validate_clean_input(&cleaned_path).unwrap();
+            let is_text_page = !matches!(
+                source.file_name().and_then(|name| name.to_str()),
+                Some("page-05.png")
+            );
+            let (request_bubbles, report_bubbles) = if is_text_page {
+                (
+                    vec![json!({
+                        "id": "bubble-1",
+                        "text": "Hello",
+                        "bbox": {"x1": 1.0, "y1": 1.0, "x2": 10.0, "y2": 10.0}
+                    })],
+                    vec![json!({
+                        "index": 0,
+                        "input_bbox": {"x1": 1.0, "y1": 1.0, "x2": 10.0, "y2": 10.0},
+                        "font_path": font.unwrap_or("fonts/resolved-default.ttf"),
+                        "requested_font_path": font.unwrap_or("fonts/resolved-default.ttf"),
+                        "resolved_font_path": font.unwrap_or("fonts/resolved-default.ttf")
+                    })],
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            let global = font
+                .map(serde_json::Value::from)
+                .unwrap_or(serde_json::Value::Null);
+            workflow
+                .register_render(
+                    &rendered_path,
+                    &clean,
+                    json!({
+                        "request_bubbles": request_bubbles,
+                        "report": {
+                            "bubbles": report_bubbles,
+                            "global_font_path": global,
+                        }
+                    }),
+                    json!({
+                        "status": "pass",
+                        "global_font_path": global,
+                    }),
+                )
+                .unwrap();
+        }
+        let rendered1 = workflow.page_artifacts_for_source(&sources[0]).unwrap().4;
+        let state = workflow.editor_state(&rendered1, None).unwrap();
+        // Unchanged reopen reuses every verified page despite mixed history.
+        assert!(state["font_path"].is_null());
+        assert_eq!(state.get("_editor_global_font_explicit"), None);
+        assert_eq!(
+            workflow.editor_render_plan(&reg.job_dir, &state).unwrap(),
+            Vec::<usize>::new()
+        );
+        // Explicit global C invalidates applicable text pages only.
+        let mut state_font = state.clone();
+        state_font["font_path"] = json!("fonts/brand-new-global.ttf");
+        state_font["_editor_requested_global_font_path"] = json!("fonts/brand-new-global.ttf");
+        state_font["_editor_global_font_explicit"] = json!(true);
+        assert_eq!(
+            workflow
+                .editor_render_plan(&reg.job_dir, &state_font)
+                .unwrap(),
+            vec![0, 1, 2, 3]
+        );
+        // Explicit clear survives save/reopen and dirties pages rendered with A.
+        let mut cleared = state.clone();
+        cleared["font_path"] = serde_json::Value::Null;
+        cleared["_editor_requested_global_font_path"] = serde_json::Value::Null;
+        cleared["_editor_global_font_explicit"] = json!(true);
+        let mut reopened = workflow.editor_state(&rendered1, None).unwrap();
+        crate::editor::merge_saved_edits(&mut reopened, &cleared);
+        assert_eq!(
+            reopened.get("_editor_global_font_explicit"),
+            Some(&json!(true))
+        );
+        assert!(reopened["font_path"].is_null());
+        let plan = workflow
+            .editor_render_plan(&reg.job_dir, &reopened)
+            .unwrap();
+        assert!(plan.contains(&0));
+        assert!(plan.contains(&3));
+        assert!(!plan.contains(&4));
+        // Inherited global font is not a bubble override; explicit X survives.
+        let bubble = &state["pages"][0]["bubbles"][0];
+        assert_eq!(bubble.get("_editor_requested_font_path"), None);
+        assert_eq!(
+            crate::editor::editor_page_font_path(&state, &state["pages"][0]),
+            Some("fonts/historical-a.ttf")
         );
     }
 }

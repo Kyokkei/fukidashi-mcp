@@ -188,6 +188,15 @@ pub struct ConcurrentPageAnalysis {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ThumbnailRoute {
+    pub classification: String,
+    pub bubble_count: usize,
+    pub line_count: usize,
+    pub image_width: u32,
+    pub image_height: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct InpaintExecution {
     pub provider: &'static str,
     pub fallback: bool,
@@ -320,6 +329,90 @@ impl OcrEngine {
             slot.set(previous);
             result
         })
+    }
+
+    /// Run only the detector on a bounded thumbnail.  This is intentionally
+    /// cheaper than OCR and is used by bulk preflight to route pages before
+    /// the strict page loop decides whether full recognition is needed.
+    #[cfg(feature = "onnx")]
+    pub fn thumbnail_route(
+        &mut self,
+        config: &Config,
+        image_path: &Path,
+    ) -> Result<ThumbnailRoute> {
+        if !image_path.is_file() {
+            return Err(FukidashiError::MissingAsset {
+                path: image_path.to_path_buf(),
+            });
+        }
+        let source = image::open(image_path)?.to_rgb8();
+        let thumbnail = DynamicImage::ImageRgb8(source)
+            .resize(1280, 1280, FilterType::Triangle)
+            .to_rgb8();
+        let pipeline = self.pipeline.get_or_insert_with(Pipeline::default);
+        let policy = SESSION_POLICY_OVERRIDE.with(Cell::get).unwrap_or_else(|| {
+            if config.prefer_gpu() {
+                SessionPolicy::Cuda
+            } else {
+                SessionPolicy::Cpu
+            }
+        });
+        let result = SESSION_POLICY.with(|slot| {
+            let previous = slot.replace(policy);
+            SESSION_FELL_BACK.with(|fallback| fallback.set(false));
+            let result = (|| {
+                pipeline.initialize(config)?;
+                let mut detections = pipeline.detect_rtdetr(&thumbnail)?;
+                if detections.is_empty() {
+                    detections = pipeline
+                        .detect_text(&thumbnail)?
+                        .into_iter()
+                        .map(|(bbox, score)| Detection {
+                            label: 1,
+                            bbox,
+                            score,
+                        })
+                        .collect();
+                }
+                Ok::<_, FukidashiError>(detections)
+            })();
+            slot.set(previous);
+            result
+        })?;
+        let detections = result;
+        let bubble_count = detections.iter().filter(|d| d.label == 0).count();
+        let line_count = detections
+            .iter()
+            .filter(|d| d.label == 1 || d.label == 2)
+            .count();
+        let classification = if bubble_count == 0 && line_count >= 2 {
+            "prose"
+        } else if bubble_count == 0 && line_count == 0 {
+            // A thumbnail detector miss is inconclusive. Let preflight run
+            // full OCR before deciding that a page is truly blank.
+            "uncertain"
+        } else {
+            "bubble"
+        };
+        Ok(ThumbnailRoute {
+            classification: classification.into(),
+            bubble_count,
+            line_count,
+            image_width: thumbnail.width(),
+            image_height: thumbnail.height(),
+        })
+    }
+
+    #[cfg(not(feature = "onnx"))]
+    pub fn thumbnail_route(
+        &mut self,
+        _config: &Config,
+        image_path: &Path,
+    ) -> Result<ThumbnailRoute> {
+        Err(FukidashiError::RuntimeUnavailable(format!(
+            "ONNX inference is disabled; rebuild with feature onnx for {}",
+            image_path.display()
+        )))
     }
 
     #[cfg(feature = "onnx")]
@@ -1554,10 +1647,54 @@ impl Pipeline {
             .copied()
             .filter(|d| d.label == 0)
             .collect::<Vec<_>>();
-        let line_detections = detections
+        let mut line_detections = detections
             .into_iter()
             .filter(|d| d.label == 1 || d.label == 2)
             .collect::<Vec<_>>();
+        // RT-DETR can collapse a dense afterword into one page-spanning
+        // label-2 region.  Spend one DB detector pass only for that shape so
+        // prose OCR receives real line boxes and can form editable groups.
+        if dense_prose_line_fallback_needed(&line_detections, image.width(), image.height()) {
+            let mut extra_lines = self
+                .detect_text(image)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(bbox, score)| Detection {
+                    label: 1,
+                    bbox,
+                    score,
+                })
+                .collect::<Vec<_>>();
+            if extra_lines.len() < 3 {
+                extra_lines = line_detections
+                    .iter()
+                    .filter(|line| {
+                        line.label == 2
+                            && ((line.bbox.x2 - line.bbox.x1).max(0.0)
+                                * (line.bbox.y2 - line.bbox.y1).max(0.0))
+                                / (image.width() as f32 * image.height() as f32).max(1.0)
+                                >= 0.30
+                    })
+                    .flat_map(|line| split_dense_prose_lines(image, line.bbox))
+                    .map(|bbox| Detection {
+                        label: 1,
+                        bbox,
+                        score: 0.80,
+                    })
+                    .collect();
+            }
+            if extra_lines.len() >= 3 {
+                line_detections.retain(|line| {
+                    line.label != 2
+                        || ((line.bbox.x2 - line.bbox.x1).max(0.0)
+                            * (line.bbox.y2 - line.bbox.y1).max(0.0))
+                            / (image.width() as f32 * image.height() as f32).max(1.0)
+                            < 0.30
+                });
+                line_detections.extend(extra_lines);
+                line_detections = dedup_detections(line_detections)?;
+            }
+        }
         let page_prior = self.page_route_prior(config, image, &line_detections)?;
         bubble_detections.sort_by(|a, b| {
             a.bbox
@@ -1655,35 +1792,32 @@ impl Pipeline {
             } else {
                 "mixed".into()
             };
-            let rec_conf =
-                line_regions.iter().map(|r| r.confidence).sum::<f32>() / line_regions.len() as f32;
+            // Region confidence already includes its detector score. Recover
+            // the recognizer confidence before applying the enclosing bubble
+            // score, otherwise line detections get penalized twice and a
+            // lower-quality whole-bubble OCR result can win by accident.
+            let rec_conf = line_regions
+                .iter()
+                .map(|region| {
+                    if region.detector_confidence > f32::EPSILON {
+                        (region.confidence / region.detector_confidence).clamp(0.0, 1.0)
+                    } else {
+                        region.confidence.clamp(0.0, 1.0)
+                    }
+                })
+                .sum::<f32>()
+                / line_regions.len() as f32;
+            let line_confidence = (bubble_detection.score * rec_conf).clamp(0.0, 1.0);
             let uncertainty = line_regions
                 .iter()
                 .map(|r| r.uncertainty)
                 .fold(0.0, f32::max);
+            let bubble_ocr = bubble_ocr.filter(|region| {
+                region.recognizer == RecognizerKind::Baberu.as_str()
+                    && region.confidence >= line_confidence
+            });
             bubbles.push(if let Some(region) = bubble_ocr {
-                if region.recognizer == RecognizerKind::Baberu.as_str() {
-                    region
-                } else {
-                    OcrRegion {
-                        id: format!("bubble-tmp-{}", index + 1),
-                        bbox: bubble_detection.bbox,
-                        text,
-                        source_language,
-                        script,
-                        recognizer,
-                        confidence: (bubble_detection.score * rec_conf).clamp(0.0, 1.0),
-                        uncertainty,
-                        detector_label: 0,
-                        detector_confidence: bubble_detection.score,
-                        reading_order: 0,
-                        vision_correction: VisionCorrection {
-                            image_path: image_path.display().to_string(),
-                            bbox: bubble_detection.bbox,
-                            contract: "source-image-bbox",
-                        },
-                    }
-                }
+                region
             } else {
                 OcrRegion {
                     id: format!("bubble-tmp-{}", index + 1),
@@ -1692,7 +1826,7 @@ impl Pipeline {
                     source_language,
                     script,
                     recognizer,
-                    confidence: (bubble_detection.score * rec_conf).clamp(0.0, 1.0),
+                    confidence: line_confidence,
                     uncertainty,
                     detector_label: 0,
                     detector_confidence: bubble_detection.score,
@@ -1732,6 +1866,21 @@ impl Pipeline {
                 }
             }
         }
+        deduplicate_prose_regions(&mut text_lines);
+        deduplicate_prose_regions(&mut unmatched_text);
+        // Pages such as afterwords, introductions, and credit sheets often
+        // have no detector bubble at all.  Promote only substantial prose and
+        // keep metadata-like lines explicitly preserved.  Sparse cover/title
+        // pages therefore stay pass-through pages.
+        promote_prose_regions(
+            &mut bubbles,
+            &mut unmatched_text,
+            image.width(),
+            image.height(),
+        );
+        // Bubble OCR and line OCR can independently emit the same card text.
+        // Reconcile them before they become separate required translations.
+        deduplicate_prose_regions(&mut bubbles);
         // A single page-wide direction keeps the comparator total for mixed
         // script pages (a comparator that chooses direction from only `a` can
         // violate antisymmetry for Han/Latin pairs).
@@ -1823,34 +1972,52 @@ impl Pipeline {
         } else {
             hinted
         };
+        // Manga OCR letterboxes the whole crop into 224x224. Long, shallow
+        // Japanese line regions lose nearly all character detail at that size;
+        // PP-OCR's variable-width line tensor preserves it. Keep manga routing
+        // for bubbles and compact text, where its model is a better fit.
+        let long_shallow_line = detection.label != 0
+            && (detection.bbox.x2 - detection.bbox.x1).max(0.0)
+                >= (detection.bbox.y2 - detection.bbox.y1).max(1.0) * 8.0;
+        let long_japanese_line = long_shallow_line && is_japanese_script(&script);
         let (text, rec_conf, route) = if let Some(explicit) = source {
-            let requested = route_override(explicit)?;
-            let route = preferred_explicit_route(config, requested);
-            let (text, confidence, effective_route) = match route {
-                RecognizerKind::Manga => {
-                    let (text, confidence) = self.recognize_manga(config, &crop)?;
-                    (text, confidence, route)
-                }
-                RecognizerKind::Baberu => match self.recognize_baberu(config, &crop) {
-                    Ok((text, confidence)) if !text.trim().is_empty() => (text, confidence, route),
-                    _ => {
-                        let fallback = if requested == RecognizerKind::Manga
-                            && !Self::manga_assets_available(config)
-                        {
-                            RecognizerKind::Han
-                        } else {
-                            requested
-                        };
-                        let (text, confidence) = self.recognize(config, fallback, &crop)?;
-                        (text, confidence, fallback)
+            if long_shallow_line && normalize_language(explicit) == "ja" {
+                let (text, confidence) = self.recognize(config, RecognizerKind::Han, &crop)?;
+                (text, confidence, RecognizerKind::Han)
+            } else {
+                let requested = route_override(explicit)?;
+                let route = preferred_explicit_route(config, requested);
+                let (text, confidence, effective_route) = match route {
+                    RecognizerKind::Manga => {
+                        let (text, confidence) = self.recognize_manga(config, &crop)?;
+                        (text, confidence, route)
                     }
-                },
-                _ => {
-                    let (text, confidence) = self.recognize(config, route, &crop)?;
-                    (text, confidence, route)
-                }
-            };
-            (text, confidence, effective_route)
+                    RecognizerKind::Baberu => match self.recognize_baberu(config, &crop) {
+                        Ok((text, confidence)) if !text.trim().is_empty() => {
+                            (text, confidence, route)
+                        }
+                        _ => {
+                            let fallback = if requested == RecognizerKind::Manga
+                                && !Self::manga_assets_available(config)
+                            {
+                                RecognizerKind::Han
+                            } else {
+                                requested
+                            };
+                            let (text, confidence) = self.recognize(config, fallback, &crop)?;
+                            (text, confidence, fallback)
+                        }
+                    },
+                    _ => {
+                        let (text, confidence) = self.recognize(config, route, &crop)?;
+                        (text, confidence, route)
+                    }
+                };
+                (text, confidence, effective_route)
+            }
+        } else if long_japanese_line {
+            let (text, confidence) = self.recognize(config, RecognizerKind::Han, &crop)?;
+            (text, confidence, RecognizerKind::Han)
         } else {
             let automatic = self.recognize_auto(
                 config,
@@ -3322,6 +3489,566 @@ fn sort_regions(bubbles: &mut [OcrRegion]) {
 }
 
 #[cfg(feature = "onnx")]
+fn promote_prose_regions(
+    bubbles: &mut Vec<OcrRegion>,
+    unmatched: &mut Vec<OcrRegion>,
+    page_width: u32,
+    page_height: u32,
+) {
+    if unmatched.is_empty() {
+        return;
+    }
+    // A lone Japanese footnote near the page edge is commonly much shorter
+    // than body prose. Promote only the matching region as its own item so it
+    // cannot cause unrelated chart labels to be grouped into a large overlay.
+    let mut footnotes = Vec::new();
+    unmatched.retain(|region| {
+        let is_footnote = region.confidence >= 0.55
+            && meaningful_prose_chars(&region.text) >= 8
+            && has_japanese_script(&region.text)
+            && region.bbox.y2 / page_height.max(1) as f32 >= 0.78
+            && !is_credit_or_metadata(&region.text);
+        if is_footnote {
+            footnotes.push(region.clone());
+        }
+        !is_footnote
+    });
+    for footnote in footnotes {
+        bubbles.push(prose_group(vec![footnote]));
+    }
+    if unmatched.is_empty() {
+        return;
+    }
+
+    let prose_chars = unmatched
+        .iter()
+        .map(|region| meaningful_prose_chars(&region.text))
+        .sum::<usize>();
+    let has_readable_script = unmatched
+        .iter()
+        .any(|region| has_japanese_script(&region.text) || is_sentence_like_latin_ocr(region));
+    // The thresholds are deliberately conservative: a short logo, title, or
+    // isolated SFX must not become a giant translated box.
+    if !has_readable_script || prose_chars < 28 || (unmatched.len() < 2 && prose_chars < 56) {
+        return;
+    }
+
+    let mut regions = std::mem::take(unmatched);
+    sort_regions(&mut regions);
+    deduplicate_prose_regions(&mut regions);
+    let first_y = regions.first().map(|region| region.bbox.y1).unwrap_or(0.0);
+    let first_height = regions
+        .first()
+        .map(|region| (region.bbox.y2 - region.bbox.y1).max(1.0))
+        .unwrap_or(1.0);
+    let heading_index = regions.iter().position(|region| {
+        region.bbox.y1 <= first_y + first_height * 2.5
+            && meaningful_prose_chars(&region.text) <= 24
+            && !region.text.chars().any(|ch| ".!?。！？".contains(ch))
+    });
+    let heading = heading_index.map(|index| regions.remove(index));
+    let mut credits = Vec::new();
+    let mut collapsed = Vec::new();
+    let mut body = Vec::new();
+    for region in regions {
+        if is_credit_or_metadata(&region.text)
+            || region.confidence < 0.30
+            || (meaningful_prose_chars(&region.text) <= 3 && region.uncertainty >= 0.50)
+        {
+            credits.push(region);
+        } else if prose_region_is_implausibly_collapsed(&region, page_width, page_height) {
+            // A page-spanning detector component with only a few OCR
+            // characters is unsafe to clean. Keep it outside the translated
+            // prose groups so strict-v1 preserves its source pixels.
+            collapsed.push(region);
+        } else {
+            body.push(region);
+        }
+    }
+    let mut body_without_metadata_overlap = Vec::with_capacity(body.len());
+    for region in body {
+        if credits
+            .iter()
+            .any(|credit| overlap_over_smaller(region.bbox, credit.bbox) >= 0.80)
+        {
+            credits.push(region);
+        } else {
+            body_without_metadata_overlap.push(region);
+        }
+    }
+    body = body_without_metadata_overlap;
+    if let Some(region) = heading {
+        bubbles.push(prose_group(vec![region]));
+    }
+    let body_lines = body.clone();
+    for group in group_prose_lines(body, page_width, page_height) {
+        bubbles.push(prose_group(group));
+    }
+    // Credits are retained in the analysis/handoff for auditability but are
+    // marked preserve-by-default, so emails, dates, and author contact lines
+    // are never sent through translation or destructive cleaning.
+    // When DB supplied the real lines, discard the stale page-spanning
+    // low-text detector component that those lines explain.  Keeping it
+    // would make strict cleaning reject every otherwise valid prose group.
+    collapsed.retain(|region| {
+        !prose_region_is_implausibly_collapsed(region, page_width, page_height)
+            || body_lines
+                .iter()
+                .filter(|candidate| overlap_over_smaller(region.bbox, candidate.bbox) >= 0.80)
+                .count()
+                < 3
+    });
+    collapsed.extend(credits);
+    *unmatched = collapsed;
+}
+
+#[cfg(feature = "onnx")]
+fn meaningful_prose_chars(text: &str) -> usize {
+    text.chars().filter(|ch| !ch.is_whitespace()).count()
+}
+
+#[cfg(feature = "onnx")]
+fn prose_region_is_implausibly_collapsed(
+    region: &OcrRegion,
+    page_width: u32,
+    page_height: u32,
+) -> bool {
+    let page_area = (page_width as f32 * page_height as f32).max(1.0);
+    let page_width = page_width as f32;
+    let page_height = page_height as f32;
+    let width = (region.bbox.x2 - region.bbox.x1).max(0.0);
+    let height = (region.bbox.y2 - region.bbox.y1).max(0.0);
+    let area = width * height / page_area;
+    let chars = meaningful_prose_chars(&region.text);
+    let chars_per_percent_of_page = chars as f32 / (area * 100.0).max(1.0);
+
+    // DB occasionally returns a single component spanning a chart row or
+    // several character cards. Large, text-sparse components are kept in
+    // unmatched diagnostics instead of becoming destructive cleaning regions.
+    // Genuine dense afterword lines occupy little page area, so their text
+    // density remains high even when they run across most of the page width.
+    (area >= 0.30 && chars < 80)
+        || (area >= 0.08 && chars_per_percent_of_page < 6.0)
+        // A very wide, one-line chart OCR false positive can bridge otherwise
+        // separate profile-card columns despite occupying little page area.
+        || (width / page_width >= 0.70 && height / page_height <= 0.035 && chars < 80)
+        || (height / page_height >= 0.48 && width / page_width <= 0.22 && chars < 160)
+}
+
+#[cfg(feature = "onnx")]
+fn dense_prose_line_fallback_needed(
+    lines: &[Detection],
+    page_width: u32,
+    page_height: u32,
+) -> bool {
+    let page_area = (page_width as f32 * page_height as f32).max(1.0);
+    lines.iter().any(|line| {
+        line.label == 2
+            && ((line.bbox.x2 - line.bbox.x1).max(0.0) * (line.bbox.y2 - line.bbox.y1).max(0.0))
+                / page_area
+                >= 0.30
+    })
+}
+
+#[cfg(feature = "onnx")]
+fn split_dense_prose_lines(image: &RgbImage, bbox: Rect) -> Vec<Rect> {
+    let x1 = bbox.x1.max(0.0).floor() as u32;
+    let y1 = bbox.y1.max(0.0).floor() as u32;
+    let x2 = bbox.x2.min(image.width() as f32).ceil() as u32;
+    let y2 = bbox.y2.min(image.height() as f32).ceil() as u32;
+    if x2 <= x1 || y2 <= y1 {
+        return Vec::new();
+    }
+    let width = (x2 - x1) as usize;
+    let mut active = vec![false; (y2 - y1) as usize];
+    for (row, is_active) in active.iter_mut().enumerate() {
+        let y = y1 + row as u32;
+        let dark = (x1..x2)
+            .filter(|x| {
+                let pixel = image.get_pixel(*x, y);
+                pixel[0] < 210 && pixel[1] < 210 && pixel[2] < 210
+            })
+            .count();
+        *is_active = dark >= 3 && (dark as f32 / width.max(1) as f32) >= 0.002;
+    }
+    let mut lines = Vec::new();
+    let mut start = None;
+    let mut gap = 0usize;
+    for (index, on) in active.iter().copied().enumerate() {
+        if on {
+            if start.is_none() {
+                start = Some(index.saturating_sub(gap.min(2)));
+            }
+            gap = 0;
+        } else if let Some(begin) = start {
+            gap += 1;
+            if gap > 2 {
+                let end = index.saturating_sub(gap).saturating_add(1);
+                if end.saturating_sub(begin) >= 4 {
+                    lines.push(Rect {
+                        x1: x1 as f32,
+                        y1: (y1 + begin as u32).saturating_sub(2) as f32,
+                        x2: x2 as f32,
+                        y2: (y1 + end as u32 + 2).min(y2) as f32,
+                    });
+                }
+                start = None;
+                gap = 0;
+            }
+        }
+    }
+    if let Some(begin) = start {
+        let end = active.len();
+        if end.saturating_sub(begin) >= 4 {
+            lines.push(Rect {
+                x1: x1 as f32,
+                y1: (y1 + begin as u32).saturating_sub(2) as f32,
+                x2: x2 as f32,
+                y2: (y1 + end as u32).min(y2) as f32,
+            });
+        }
+    }
+    lines
+}
+
+#[cfg(feature = "onnx")]
+fn normalized_prose_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+#[cfg(feature = "onnx")]
+fn overlap_over_smaller(a: Rect, b: Rect) -> f32 {
+    let x1 = a.x1.max(b.x1);
+    let y1 = a.y1.max(b.y1);
+    let x2 = a.x2.min(b.x2);
+    let y2 = a.y2.min(b.y2);
+    let overlap = (x2 - x1).max(0.0) * (y2 - y1).max(0.0);
+    let smaller = ((a.x2 - a.x1).max(0.0) * (a.y2 - a.y1).max(0.0))
+        .min((b.x2 - b.x1).max(0.0) * (b.y2 - b.y1).max(0.0));
+    if smaller <= 0.0 {
+        0.0
+    } else {
+        overlap / smaller
+    }
+}
+
+#[cfg(feature = "onnx")]
+fn deduplicate_prose_regions(regions: &mut Vec<OcrRegion>) {
+    let mut kept = Vec::with_capacity(regions.len());
+    for region in std::mem::take(regions) {
+        let normalized = normalized_prose_text(&region.text);
+        let duplicate = kept.iter().position(|existing: &OcrRegion| {
+            let existing_normalized = normalized_prose_text(&existing.text);
+            let same_text = overlap_over_smaller(region.bbox, existing.bbox) >= 0.80
+                && !normalized.is_empty()
+                && normalized == existing_normalized;
+            let cross_script_overlap = overlap_over_smaller(region.bbox, existing.bbox) >= 0.80
+                && region.text.chars().any(|ch| ch.is_ascii_alphabetic())
+                    != existing.text.chars().any(|ch| ch.is_ascii_alphabetic());
+            let existing_area =
+                (existing.bbox.x2 - existing.bbox.x1) * (existing.bbox.y2 - existing.bbox.y1);
+            let region_area = (region.bbox.x2 - region.bbox.x1) * (region.bbox.y2 - region.bbox.y1);
+            let similar_shape = existing_area > 0.0
+                && region_area > 0.0
+                && (existing_area.min(region_area) / existing_area.max(region_area)) >= 0.55
+                && overlap_over_smaller(region.bbox, existing.bbox) >= 0.80;
+            let overlapping_heading = region.bbox.y1.min(existing.bbox.y1) < 180.0
+                && meaningful_prose_chars(&region.text) <= 24
+                && meaningful_prose_chars(&existing.text) <= 24
+                && overlap_over_smaller(region.bbox, existing.bbox) >= 0.80;
+            let overlapping_metadata = is_credit_or_metadata(&region.text)
+                && is_credit_or_metadata(&existing.text)
+                && overlap_over_smaller(region.bbox, existing.bbox) >= 0.50;
+            let overlapping_text = overlap_over_smaller(region.bbox, existing.bbox) >= 0.80
+                && prose_text_has_shared_span(&normalized, &existing_normalized, 8);
+            let embedded_top_label =
+                embedded_top_label(&region, existing, &normalized, &existing_normalized)
+                    || embedded_top_label(existing, &region, &existing_normalized, &normalized);
+            same_text
+                || cross_script_overlap
+                || similar_shape
+                || overlapping_heading
+                || overlapping_metadata
+                || overlapping_text
+                || embedded_top_label
+        });
+        if let Some(index) = duplicate {
+            let existing = &kept[index];
+            let existing_area =
+                (existing.bbox.x2 - existing.bbox.x1) * (existing.bbox.y2 - existing.bbox.y1);
+            let region_area = (region.bbox.x2 - region.bbox.x1) * (region.bbox.y2 - region.bbox.y1);
+            if region_area > existing_area
+                || (region_area == existing_area && region.confidence > existing.confidence)
+            {
+                kept[index] = region;
+            }
+        } else {
+            kept.push(region);
+        }
+    }
+    *regions = kept;
+}
+
+#[cfg(feature = "onnx")]
+fn prose_text_has_shared_span(left: &str, right: &str, min_chars: usize) -> bool {
+    let left = left.chars().take(512).collect::<Vec<_>>();
+    let right = right.chars().take(512).collect::<Vec<_>>();
+    if left.len() < min_chars || right.len() < min_chars {
+        return false;
+    }
+    let mut previous = vec![0usize; right.len() + 1];
+    for left_char in left {
+        let mut current = vec![0usize; right.len() + 1];
+        for (index, right_char) in right.iter().enumerate() {
+            if left_char == *right_char {
+                current[index + 1] = previous[index] + 1;
+                if current[index + 1] >= min_chars {
+                    return true;
+                }
+            }
+        }
+        previous = current;
+    }
+    false
+}
+
+#[cfg(feature = "onnx")]
+fn embedded_top_label(
+    label: &OcrRegion,
+    body: &OcrRegion,
+    label_text: &str,
+    body_text: &str,
+) -> bool {
+    let label_area = ((label.bbox.x2 - label.bbox.x1).max(0.0)
+        * (label.bbox.y2 - label.bbox.y1).max(0.0))
+    .max(1.0);
+    let body_area =
+        ((body.bbox.x2 - body.bbox.x1).max(0.0) * (body.bbox.y2 - body.bbox.y1).max(0.0)).max(1.0);
+    let top_delta = (label.bbox.y1 - body.bbox.y1).abs();
+    let body_height = (body.bbox.y2 - body.bbox.y1).max(1.0);
+    let contained = overlap_over_smaller(label.bbox, body.bbox) >= 0.80;
+    let short_label = meaningful_prose_chars(&label.text) <= 12;
+    let much_smaller = label_area / body_area <= 0.55;
+    contained
+        && short_label
+        && much_smaller
+        && top_delta <= body_height.min(52.0) * 0.20
+        && label_matches_body_prefix(label_text, body_text)
+}
+
+#[cfg(feature = "onnx")]
+fn label_matches_body_prefix(label: &str, body: &str) -> bool {
+    let label = label.chars().take(12).collect::<Vec<_>>();
+    let body = body.chars().take(16).collect::<Vec<_>>();
+    if label.len() < 4 || body.len() < label.len().saturating_sub(1) {
+        return false;
+    }
+    // Permit at most two OCR substitutions for names of six or more
+    // characters, and one for shorter labels. This admits small OCR variants
+    // such as Susuki/Takahashi while retaining the Maki pair whose only shared
+    // suffix is not enough to establish that the body contains the label.
+    let max_distance = if label.len() >= 6 { 2 } else { 1 };
+    let min_prefix_len = label.len().saturating_sub(1);
+    let max_prefix_len = (label.len() + 1).min(body.len());
+    (min_prefix_len..=max_prefix_len).any(|prefix_len| {
+        bounded_edit_distance(&label, &body[..prefix_len], max_distance) <= max_distance
+    })
+}
+
+#[cfg(feature = "onnx")]
+fn bounded_edit_distance(left: &[char], right: &[char], limit: usize) -> usize {
+    if left.len().abs_diff(right.len()) > limit {
+        return limit + 1;
+    }
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.iter().enumerate() {
+        let mut current = vec![left_index + 1; right.len() + 1];
+        for (right_index, right_char) in right.iter().enumerate() {
+            current[right_index + 1] = (previous[right_index + 1] + 1)
+                .min(current[right_index] + 1)
+                .min(previous[right_index] + if left_char == right_char { 0 } else { 1 });
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+#[cfg(feature = "onnx")]
+fn has_japanese_script(text: &str) -> bool {
+    text.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{3040}'..='\u{30ff}' | '\u{3400}'..='\u{4dbf}' | '\u{4e00}'..='\u{9fff}'
+        )
+    })
+}
+
+#[cfg(feature = "onnx")]
+fn is_credit_or_metadata(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    let has_email = text.contains('@') && text.contains('.');
+    let digit_count = text.chars().filter(|ch| ch.is_ascii_digit()).count();
+    let has_date_separator = text.chars().any(|ch| "/.-年年月日".contains(ch));
+    let compact = text
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .collect::<String>();
+    let page_number = !compact.is_empty()
+        && compact.chars().all(|ch| ch.is_numeric())
+        && compact.chars().count() <= 4;
+    let punctuation_or_art = compact.is_empty();
+    has_email
+        || (digit_count >= 2 && has_date_separator)
+        || page_number
+        || punctuation_or_art
+        || [
+            "発行",
+            "発行日",
+            "印刷",
+            "連絡先",
+            "著者",
+            "contact",
+            "published",
+            "email",
+            "date",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+#[cfg(feature = "onnx")]
+fn group_prose_lines(
+    mut regions: Vec<OcrRegion>,
+    page_width: u32,
+    page_height: u32,
+) -> Vec<Vec<OcrRegion>> {
+    if regions.is_empty() {
+        return Vec::new();
+    }
+    sort_regions(&mut regions);
+    let average_height = regions
+        .iter()
+        .map(|region| (region.bbox.y2 - region.bbox.y1).max(1.0))
+        .sum::<f32>()
+        / regions.len() as f32;
+    let gap_limit = (average_height * 0.55)
+        .max(8.0)
+        .min(((page_width as f32 * page_height as f32).sqrt() * 0.08).max(10.0));
+    let mut groups: Vec<Vec<OcrRegion>> = Vec::new();
+    for region in regions {
+        // Consider the most recent line in every group. A two-column page is
+        // sorted by y first, so the immediately previous detection is often in
+        // the other column even when the current line continues a paragraph.
+        // Requiring a shared horizontal lane prevents that alternate-column
+        // detection from bridging the two cards.
+        let candidate = groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| {
+                let last = group.last()?;
+                let gap = region.bbox.y1 - last.bbox.y2;
+                let last_height = (last.bbox.y2 - last.bbox.y1).max(1.0);
+                let region_height = (region.bbox.y2 - region.bbox.y1).max(1.0);
+                // Use the local text boxes as well as the page average. This
+                // stops a 50+ px gap from joining the next profile-card row,
+                // while split afterword lines (small boxes with small gaps)
+                // remain connected.
+                let local_gap_limit = (last_height.min(region_height) * 0.75).max(8.0);
+                if gap < -(average_height * 0.5) || gap > gap_limit.min(local_gap_limit) {
+                    return None;
+                }
+                let last_width = (last.bbox.x2 - last.bbox.x1).max(1.0);
+                let region_width = (region.bbox.x2 - region.bbox.x1).max(1.0);
+                let shared_width =
+                    (region.bbox.x2.min(last.bbox.x2) - region.bbox.x1.max(last.bbox.x1)).max(0.0);
+                let aligned_left = (region.bbox.x1 - last.bbox.x1).abs()
+                    <= (average_height * 2.0).max(last_width.min(region_width) * 0.15);
+                let aligned_center =
+                    ((region.bbox.x1 + region.bbox.x2) - (last.bbox.x1 + last.bbox.x2)).abs() * 0.5
+                        <= average_height * 1.5;
+                let overlaps_lane = shared_width / last_width.min(region_width) >= 0.35;
+                (aligned_left || aligned_center || overlaps_lane).then_some((index, gap.abs()))
+            })
+            .min_by(|left, right| left.1.total_cmp(&right.1));
+        if let Some((index, _)) = candidate {
+            groups[index].push(region);
+        } else {
+            groups.push(vec![region]);
+        }
+    }
+    groups
+}
+
+#[cfg(feature = "onnx")]
+fn prose_group(mut regions: Vec<OcrRegion>) -> OcrRegion {
+    sort_regions(&mut regions);
+    let first = regions.first().expect("prose group is non-empty");
+    let bbox = regions.iter().skip(1).fold(first.bbox, |acc, region| Rect {
+        x1: acc.x1.min(region.bbox.x1),
+        y1: acc.y1.min(region.bbox.y1),
+        x2: acc.x2.max(region.bbox.x2),
+        y2: acc.y2.max(region.bbox.y2),
+    });
+    let joiner = if first.recognizer == "prose-group" {
+        "\n"
+    } else if regions.iter().all(|region| {
+        region.recognizer == RecognizerKind::Han.as_str()
+            || region.recognizer == RecognizerKind::Manga.as_str()
+    }) {
+        ""
+    } else {
+        " "
+    };
+    let text = regions
+        .iter()
+        .map(|region| region.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(joiner);
+    let confidence = regions
+        .iter()
+        .map(|region| region.confidence)
+        .fold(1.0, f32::min);
+    let uncertainty = regions
+        .iter()
+        .map(|region| region.uncertainty)
+        .fold(0.0, f32::max);
+    let source_language = aggregate_source(&regions);
+    let script = if regions
+        .iter()
+        .map(|region| region.script.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        == 1
+    {
+        first.script.clone()
+    } else {
+        "mixed".into()
+    };
+    OcrRegion {
+        id: String::new(),
+        bbox,
+        text,
+        source_language,
+        script,
+        recognizer: "prose-group".into(),
+        confidence,
+        uncertainty,
+        detector_label: 2,
+        detector_confidence: confidence,
+        reading_order: 0,
+        vision_correction: VisionCorrection {
+            image_path: first.vision_correction.image_path.clone(),
+            bbox,
+            contract: "source-image-bbox",
+        },
+    }
+}
+
+#[cfg(feature = "onnx")]
 fn script_match(kind: RecognizerKind, text: &str) -> u8 {
     let (matched, total) = text.chars().fold((0u8, 0u8), |(matched, total), c| {
         let is_match = match kind {
@@ -3473,6 +4200,306 @@ mod tests {
         assert!(!engine.finish_heavy_call(2));
         engine.release_sessions();
         assert!(!engine.finish_heavy_call(2));
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn prose_fallback_promotes_body_and_preserves_credit_lines() {
+        let region = |text: &str, y: f32| OcrRegion {
+            id: String::new(),
+            bbox: Rect {
+                x1: 100.0,
+                y1: y,
+                x2: 900.0,
+                y2: y + 24.0,
+            },
+            text: text.into(),
+            source_language: "ja".into(),
+            script: "Japanese_vert".into(),
+            recognizer: RecognizerKind::Manga.as_str().into(),
+            confidence: 0.9,
+            uncertainty: 0.1,
+            detector_label: 2,
+            detector_confidence: 0.9,
+            reading_order: 0,
+            vision_correction: VisionCorrection {
+                image_path: "page.png".into(),
+                bbox: Rect {
+                    x1: 100.0,
+                    y1: y,
+                    x2: 900.0,
+                    y2: y + 24.0,
+                },
+                contract: "source-image-bbox",
+            },
+        };
+        let mut bubbles = Vec::new();
+        let mut unmatched = vec![
+            region("あとがき", 40.0),
+            region("長い本文がここに続いて読者への感謝を伝えます", 100.0),
+            region("これからもよろしくお願いします", 140.0),
+            region("連絡先 author@example.com", 220.0),
+        ];
+        promote_prose_regions(&mut bubbles, &mut unmatched, 1000, 1400);
+        assert!(bubbles.len() >= 2);
+        assert!(bubbles.iter().any(|item| item.text == "あとがき"));
+        assert_eq!(unmatched.len(), 1);
+        assert!(is_credit_or_metadata(&unmatched[0].text));
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn prose_fallback_does_not_promote_sparse_title() {
+        let mut bubbles = Vec::new();
+        let mut unmatched = vec![OcrRegion {
+            id: String::new(),
+            bbox: Rect {
+                x1: 100.0,
+                y1: 40.0,
+                x2: 900.0,
+                y2: 70.0,
+            },
+            text: "あとがき".into(),
+            source_language: "ja".into(),
+            script: "Japanese_vert".into(),
+            recognizer: RecognizerKind::Manga.as_str().into(),
+            confidence: 0.9,
+            uncertainty: 0.1,
+            detector_label: 2,
+            detector_confidence: 0.9,
+            reading_order: 0,
+            vision_correction: VisionCorrection {
+                image_path: "cover.png".into(),
+                bbox: Rect {
+                    x1: 100.0,
+                    y1: 40.0,
+                    x2: 900.0,
+                    y2: 70.0,
+                },
+                contract: "source-image-bbox",
+            },
+        }];
+        promote_prose_regions(&mut bubbles, &mut unmatched, 1000, 1400);
+        assert!(bubbles.is_empty());
+        assert_eq!(unmatched.len(), 1);
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn prose_fallback_keeps_page_spanning_collapsed_ocr_source() {
+        let mut bubbles = Vec::new();
+        let mut unmatched = vec![
+            OcrRegion {
+                id: String::new(),
+                bbox: Rect {
+                    x1: 400.0,
+                    y1: 20.0,
+                    x2: 600.0,
+                    y2: 70.0,
+                },
+                text: "あとがき".into(),
+                source_language: "ja".into(),
+                script: "Japanese_vert".into(),
+                recognizer: RecognizerKind::Manga.as_str().into(),
+                confidence: 0.9,
+                uncertainty: 0.1,
+                detector_label: 2,
+                detector_confidence: 0.9,
+                reading_order: 0,
+                vision_correction: VisionCorrection {
+                    image_path: "page.png".into(),
+                    bbox: Rect {
+                        x1: 400.0,
+                        y1: 20.0,
+                        x2: 600.0,
+                        y2: 70.0,
+                    },
+                    contract: "source-image-bbox",
+                },
+            },
+            OcrRegion {
+                id: String::new(),
+                bbox: Rect {
+                    x1: 40.0,
+                    y1: 120.0,
+                    x2: 960.0,
+                    y2: 900.0,
+                },
+                text: "それでも本文の一部だけが認識された短い断片です読者への感謝".into(),
+                source_language: "ja".into(),
+                script: "Japanese_vert".into(),
+                recognizer: RecognizerKind::Manga.as_str().into(),
+                confidence: 0.4,
+                uncertainty: 0.6,
+                detector_label: 2,
+                detector_confidence: 0.9,
+                reading_order: 0,
+                vision_correction: VisionCorrection {
+                    image_path: "page.png".into(),
+                    bbox: Rect {
+                        x1: 40.0,
+                        y1: 120.0,
+                        x2: 960.0,
+                        y2: 900.0,
+                    },
+                    contract: "source-image-bbox",
+                },
+            },
+        ];
+        promote_prose_regions(&mut bubbles, &mut unmatched, 1000, 1000);
+        assert!(bubbles.iter().any(|item| item.text == "あとがき"));
+        assert!(unmatched.iter().any(|item| item.text.contains("本文")));
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn prose_fallback_deduplicates_overlapping_bilingual_regions() {
+        let region = |text: &str, bbox: Rect| OcrRegion {
+            id: String::new(),
+            bbox,
+            text: text.into(),
+            source_language: "auto".into(),
+            script: "mixed".into(),
+            recognizer: RecognizerKind::Manga.as_str().into(),
+            confidence: 0.9,
+            uncertainty: 0.1,
+            detector_label: 2,
+            detector_confidence: 0.9,
+            reading_order: 0,
+            vision_correction: VisionCorrection {
+                image_path: "cover.png".into(),
+                bbox,
+                contract: "source-image-bbox",
+            },
+        };
+        let bbox = Rect {
+            x1: 100.0,
+            y1: 100.0,
+            x2: 900.0,
+            y2: 900.0,
+        };
+        let mut regions = vec![
+            region("ようこそ", bbox),
+            region(
+                "welcome to cafe",
+                Rect {
+                    x1: 150.0,
+                    y1: 150.0,
+                    x2: 880.0,
+                    y2: 850.0,
+                },
+            ),
+        ];
+        deduplicate_prose_regions(&mut regions);
+        assert_eq!(regions.len(), 1);
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn dense_prose_requests_line_detector_fallback() {
+        let dense = Detection {
+            label: 2,
+            bbox: Rect {
+                x1: 40.0,
+                y1: 80.0,
+                x2: 960.0,
+                y2: 900.0,
+            },
+            score: 0.8,
+        };
+        assert!(dense_prose_line_fallback_needed(&[dense], 1000, 1000));
+        let sparse = Detection {
+            bbox: Rect {
+                x1: 40.0,
+                y1: 80.0,
+                x2: 400.0,
+                y2: 180.0,
+            },
+            ..dense
+        };
+        assert!(!dense_prose_line_fallback_needed(&[sparse], 1000, 1000));
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn dense_prose_fallback_splits_dark_horizontal_text_bands() {
+        let mut image = RgbImage::from_pixel(200, 120, image::Rgb([255, 255, 255]));
+        for y in 20..30 {
+            for x in 20..180 {
+                image.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+        for y in 60..70 {
+            for x in 20..180 {
+                image.put_pixel(x, y, image::Rgb([20, 20, 20]));
+            }
+        }
+        let lines = split_dense_prose_lines(
+            &image,
+            Rect {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 200.0,
+                y2: 120.0,
+            },
+        );
+        let repeat = split_dense_prose_lines(
+            &image,
+            Rect {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 200.0,
+                y2: 120.0,
+            },
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines, repeat);
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn prose_body_is_split_into_multiple_editable_groups() {
+        let region = |text: &str, y: f32| OcrRegion {
+            id: String::new(),
+            bbox: Rect {
+                x1: 100.0,
+                y1: y,
+                x2: 900.0,
+                y2: y + 24.0,
+            },
+            text: text.into(),
+            source_language: "ja".into(),
+            script: "Japanese_vert".into(),
+            recognizer: RecognizerKind::Manga.as_str().into(),
+            confidence: 0.9,
+            uncertainty: 0.1,
+            detector_label: 2,
+            detector_confidence: 0.9,
+            reading_order: 0,
+            vision_correction: VisionCorrection {
+                image_path: "page.png".into(),
+                bbox: Rect {
+                    x1: 100.0,
+                    y1: y,
+                    x2: 900.0,
+                    y2: y + 24.0,
+                },
+                contract: "source-image-bbox",
+            },
+        };
+        let mut bubbles = Vec::new();
+        let mut unmatched = vec![
+            region("あとがき", 40.0),
+            region("第一段落の本文がここにあります読者への感謝", 110.0),
+            region("第二段落は少し離れていますこれからもよろしく", 150.0),
+            region("第三段落も独立した翻訳対象として保持します", 300.0),
+            region("発行日 2002/5/1", 500.0),
+        ];
+        promote_prose_regions(&mut bubbles, &mut unmatched, 1000, 1000);
+        assert_eq!(bubbles.len(), 3);
+        assert!(bubbles.iter().all(|item| item.recognizer == "prose-group"));
+        assert_eq!(unmatched.len(), 1);
+        assert!(is_credit_or_metadata(&unmatched[0].text));
     }
     use std::collections::HashMap;
     #[test]

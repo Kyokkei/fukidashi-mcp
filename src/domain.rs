@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{FukidashiError, Result};
 
 /// A half-open rectangle in source-image pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Rect {
     pub x1: f32,
     pub y1: f32,
@@ -68,7 +68,7 @@ impl Bubble {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TypesetPayload {
     /// Stable editor/translation identity. Primitive clients may omit this;
     /// managed render sidecars preserve it when supplied by the server.
@@ -113,6 +113,9 @@ pub struct TypesetPayload {
     pub padding: Option<f32>,
     pub text: String,
     pub font_path: Option<String>,
+    #[serde(default, rename = "_editor_requested_font_path")]
+    #[schemars(skip)]
+    pub requested_font_path: Option<String>,
     pub min_font_size: Option<f32>,
     pub max_font_size: Option<f32>,
     /// Requested glyph ink. Missing/null selects contrast-aware auto ink.

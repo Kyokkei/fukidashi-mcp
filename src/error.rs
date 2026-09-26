@@ -7,6 +7,14 @@ use thiserror::Error;
 pub enum FukidashiError {
     #[error("invalid input: {0}")]
     InvalidInput(String),
+    /// An error that needs to survive a nested MCP tool call with structured
+    /// remediation details.  The display message remains stable for older
+    /// clients while the details are copied into the JSON error payload.
+    #[error("{message}")]
+    Diagnostic {
+        message: String,
+        details: serde_json::Value,
+    },
     #[error("missing model or runtime asset: {path}")]
     MissingAsset { path: PathBuf },
     #[error("runtime is unavailable: {0}")]

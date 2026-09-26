@@ -37,6 +37,9 @@ pub enum Client {
     Gemini,
     Cursor,
     VsCode,
+    Cline,
+    #[value(alias = "opencode")]
+    OpenCode,
 }
 
 impl Client {
@@ -48,6 +51,8 @@ impl Client {
             Client::Gemini,
             Client::Cursor,
             Client::VsCode,
+            Client::Cline,
+            Client::OpenCode,
         ]
     }
 
@@ -59,6 +64,8 @@ impl Client {
             Client::Gemini => "Gemini CLI",
             Client::Cursor => "Cursor",
             Client::VsCode => "VS Code/Copilot",
+            Client::Cline => "Cline IDE/CLI",
+            Client::OpenCode => "OpenCode",
         }
     }
 
@@ -159,9 +166,9 @@ struct InstallPaths {
 
 /// Install the native executable and configure selected clients.
 ///
-/// With an empty client list, only clients that appear installed are selected.
-/// `all` configures every supported client, creating stable user config paths
-/// where necessary.
+/// With an empty client list, every supported client is selected. This creates
+/// stable user config paths where necessary; pass explicit clients to limit a
+/// run to a subset. `all` remains an explicit spelling of the default.
 pub fn install(requested: &[Client], all: bool) -> Result<InstallReport> {
     let paths = install_paths()?;
     let source = env::current_exe()?;
@@ -315,7 +322,7 @@ pub fn install(requested: &[Client], all: bool) -> Result<InstallReport> {
                 .map(|(_, path)| path.clone());
         }
         // A targeted reinstall must retain ownership records for adapters
-        // installed by an earlier `--all`/auto-detect run.
+        // installed by an earlier `--all`/default run.
         if let Some(previous) = previous_manifest.as_ref() {
             for entry in &previous.clients {
                 if !installed
@@ -725,7 +732,16 @@ fn companion_binary_source(mcp_source: &Path) -> Result<PathBuf> {
 }
 
 fn config_path(client: Client) -> Result<PathBuf> {
-    config_path_for(client, &home_dir()?, &dirs::config_dir())
+    let home = home_dir()?;
+    if client == Client::Cline {
+        if let Some(path) = env::var_os("CLINE_MCP_SETTINGS_PATH") {
+            return Ok(PathBuf::from(path));
+        }
+        if let Some(path) = env::var_os("CLINE_DATA_DIR") {
+            return Ok(PathBuf::from(path).join("settings/cline_mcp_settings.json"));
+        }
+    }
+    config_path_for(client, &home, &dirs::config_dir())
 }
 
 fn config_path_for(client: Client, home: &Path, config_dir: &Option<PathBuf>) -> Result<PathBuf> {
@@ -739,6 +755,25 @@ fn config_path_for(client: Client, home: &Path, config_dir: &Option<PathBuf>) ->
             .clone()
             .unwrap_or_else(|| home.join(".config"))
             .join("Code/User/mcp.json"),
+        // Current Cline releases share this settings file between the IDE,
+        // CLI, and SDK. `config_path` applies the documented environment
+        // overrides before the installer writes it.
+        Client::Cline => home.join(".cline/data/settings/cline_mcp_settings.json"),
+        // OpenCode's documented global config is under ~/.config on every
+        // platform. Prefer the documented JSON file when both formats exist;
+        // otherwise use an existing JSONC file so it remains the active file.
+        Client::OpenCode => {
+            let directory = home.join(".config/opencode");
+            let json = directory.join("opencode.json");
+            let jsonc = directory.join("opencode.jsonc");
+            if json.is_file() {
+                json
+            } else if jsonc.is_file() {
+                jsonc
+            } else {
+                json
+            }
+        }
     })
 }
 
@@ -748,23 +783,15 @@ fn home_dir() -> Result<PathBuf> {
 }
 
 fn select_clients(requested: &[Client], all: bool) -> Vec<Client> {
-    if all {
+    if all || requested.is_empty() {
         return Client::all().to_vec();
     }
-    if !requested.is_empty() {
-        return requested.to_vec();
-    }
-    Client::all()
-        .iter()
-        .copied()
-        .filter(|client| detected(*client))
-        .collect()
+    requested.to_vec()
 }
 
 fn detected(client: Client) -> bool {
     let Ok(home) = home_dir() else { return false };
-    let config_dir = dirs::config_dir();
-    let Ok(path) = config_path_for(client, &home, &config_dir) else {
+    let Ok(path) = config_path(client) else {
         return false;
     };
     if path.exists()
@@ -779,6 +806,10 @@ fn detected(client: Client) -> bool {
             Client::Gemini => home.join(".gemini").exists() || command_exists("gemini"),
             Client::Cursor => home.join(".cursor").exists() || command_exists("cursor"),
             Client::VsCode => command_exists("code") || path.parent().is_some_and(Path::exists),
+            Client::Cline => home.join(".cline").exists() || command_exists("cline"),
+            Client::OpenCode => {
+                home.join(".config/opencode").exists() || command_exists("opencode")
+            }
         }
     {
         return true;
@@ -806,9 +837,7 @@ fn command_exists(command: &str) -> bool {
 }
 
 fn client_status(client: Client, executable: &Path) -> Result<ClientStatus> {
-    let home = home_dir()?;
-    let config_dir = dirs::config_dir();
-    let config_path = config_path_for(client, &home, &config_dir)?;
+    let config_path = config_path(client)?;
     let configured = fs::read(&config_path)
         .ok()
         .is_some_and(|bytes| config_contains(client, &bytes, executable));
@@ -830,25 +859,124 @@ fn patch_config(client: Client, input: &[u8], executable: &Path) -> Result<Vec<u
 }
 
 fn patch_json(client: Client, input: &[u8], executable: &Path) -> Result<Vec<u8>> {
-    let mut root: serde_json::Value = if input.is_empty() {
-        serde_json::json!({})
-    } else {
-        serde_json::from_slice(input).map_err(|error| {
-            FukidashiError::InvalidInput(format!("invalid client JSON: {error}"))
-        })?
-    };
-    let object = root
-        .as_object_mut()
-        .ok_or_else(|| FukidashiError::InvalidInput("client JSON root must be an object".into()))?;
-    let servers_key = json_servers_key(client);
-    let servers = object
-        .entry(servers_key)
-        .or_insert_with(|| serde_json::json!({}));
-    let servers = servers.as_object_mut().ok_or_else(|| {
-        FukidashiError::InvalidInput(format!("client {servers_key} must be an object"))
-    })?;
+    let mut root = parse_json_document(input)?;
+    if client == Client::OpenCode {
+        // OpenCode 1.x (including the desktop 1.18.x runtime) accepts the
+        // V1-compatible direct `mcp.<name>` form.  It also reads native V2
+        // `mcp.servers`, but a nested V2 timeout is explicitly ignored by
+        // that runtime.  Remove only our same-name legacy entry so the
+        // resulting config has one unambiguous Fukidashi server.
+        if let Some(mcp) = root
+            .get_mut("mcp")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            if let Some(servers) = mcp
+                .get_mut("servers")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                servers.remove("fukidashi");
+            }
+        }
+    }
+    let servers = json_servers_mut(&mut root, client)?;
     servers.insert("fukidashi".into(), server_json(client, executable));
     Ok(serde_json::to_vec_pretty(&root)?)
+}
+
+/// Parse the JSON and JSONC accepted by the supported clients. The installer
+/// writes canonical JSON after a patch, while the existing file is always
+/// backed up by the install journal before replacement.
+fn parse_json_document(input: &[u8]) -> Result<serde_json::Value> {
+    if input.is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let input = input.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(input);
+    serde_json::from_slice(&strip_jsonc(input)).map_err(|error| {
+        FukidashiError::InvalidInput(format!("invalid client JSON/JSONC: {error}"))
+    })
+}
+
+fn strip_jsonc(input: &[u8]) -> Vec<u8> {
+    let source = String::from_utf8_lossy(input);
+    let mut output = String::with_capacity(source.len());
+    let mut chars = source.chars().peekable();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some(character) = chars.next() {
+        if in_string {
+            output.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+            output.push(character);
+        } else if character == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            for comment_character in chars.by_ref() {
+                if comment_character == '\n' || comment_character == '\r' {
+                    output.push(comment_character);
+                    break;
+                }
+            }
+        } else if character == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut previous = '\0';
+            for comment_character in chars.by_ref() {
+                if comment_character == '\n' || comment_character == '\r' {
+                    output.push(comment_character);
+                }
+                if previous == '*' && comment_character == '/' {
+                    break;
+                }
+                previous = comment_character;
+            }
+        } else {
+            output.push(character);
+        }
+    }
+
+    // JSONC also permits a trailing comma. Remove only commas outside strings
+    // whose next non-whitespace token closes an array or object.
+    let chars = output.chars().collect::<Vec<_>>();
+    let mut without_trailing_commas = String::with_capacity(output.len());
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, character) in chars.iter().copied().enumerate() {
+        if in_string {
+            without_trailing_commas.push(character);
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if character == '"' {
+            in_string = true;
+            without_trailing_commas.push(character);
+            continue;
+        }
+        if character == ',' {
+            let next = chars[index + 1..]
+                .iter()
+                .copied()
+                .find(|candidate| !candidate.is_whitespace());
+            if matches!(next, Some(']' | '}')) {
+                continue;
+            }
+        }
+        without_trailing_commas.push(character);
+    }
+    without_trailing_commas.into_bytes()
 }
 
 fn patch_toml(input: &[u8], executable: &Path) -> Result<Vec<u8>> {
@@ -894,9 +1022,59 @@ fn json_servers_key(client: Client) -> &'static str {
     }
 }
 
+fn json_servers_mut(
+    root: &mut serde_json::Value,
+    client: Client,
+) -> Result<&mut serde_json::Map<String, serde_json::Value>> {
+    let object = root
+        .as_object_mut()
+        .ok_or_else(|| FukidashiError::InvalidInput("client JSON root must be an object".into()))?;
+    if client == Client::OpenCode {
+        let mcp = object.entry("mcp").or_insert_with(|| serde_json::json!({}));
+        let mcp = mcp
+            .as_object_mut()
+            .ok_or_else(|| FukidashiError::InvalidInput("OpenCode mcp must be an object".into()))?;
+        Ok(mcp)
+    } else {
+        let servers_key = json_servers_key(client);
+        let servers = object
+            .entry(servers_key)
+            .or_insert_with(|| serde_json::json!({}));
+        servers.as_object_mut().ok_or_else(|| {
+            FukidashiError::InvalidInput(format!("client {servers_key} must be an object"))
+        })
+    }
+}
+
+fn json_servers<'a>(
+    root: &'a serde_json::Value,
+    client: Client,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    if client == Client::OpenCode {
+        let mcp = root.get("mcp")?.as_object()?;
+        if mcp.get("fukidashi").is_some() {
+            Some(mcp)
+        } else {
+            mcp.get("servers")?.as_object()
+        }
+    } else {
+        root.get(json_servers_key(client))?.as_object()
+    }
+}
+
 fn server_json(client: Client, executable: &Path) -> serde_json::Value {
+    if client == Client::OpenCode {
+        return serde_json::json!({
+            "type": "local",
+            "command": [executable.to_string_lossy()],
+            // OpenCode 1.x uses the V1-compatible numeric timeout.  The
+            // native V2 nested timeout object is ignored by that runtime;
+            // this direct form remains supported by V2's migration layer.
+            "timeout": 600_000
+        });
+    }
     let mut server = serde_json::json!({
-        "command": executable,
+        "command": executable.to_string_lossy(),
         "args": []
     });
     if matches!(client, Client::VsCode) {
@@ -909,17 +1087,24 @@ fn config_contains(client: Client, bytes: &[u8], executable: &Path) -> bool {
     if matches!(client.config_kind(), ConfigKind::Toml) {
         toml_entry_command(bytes).is_some_and(|command| command == executable.to_string_lossy())
     } else {
-        serde_json::from_slice::<serde_json::Value>(bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get(json_servers_key(client))?
-                    .get("fukidashi")?
-                    .get("command")?
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .is_some_and(|command| command == executable.to_string_lossy())
+        let Ok(value) = parse_json_document(bytes) else {
+            return false;
+        };
+        let Some(server) =
+            json_servers(&value, client).and_then(|servers| servers.get("fukidashi"))
+        else {
+            return false;
+        };
+        let command = if client == Client::OpenCode {
+            server
+                .get("command")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|command| command.first())
+                .and_then(serde_json::Value::as_str)
+        } else {
+            server.get("command").and_then(serde_json::Value::as_str)
+        };
+        command.is_some_and(|command| command == executable.to_string_lossy())
     }
 }
 
@@ -932,13 +1117,11 @@ fn entry_present(client: Client, bytes: &[u8]) -> bool {
                     || section.starts_with("[mcp_servers.fukidashi.")
             })
     } else {
-        serde_json::from_slice::<serde_json::Value>(bytes)
+        parse_json_document(bytes)
             .ok()
             .map(|value| {
-                value
-                    .get(json_servers_key(client))
-                    .and_then(|servers| servers.get("fukidashi"))
-                    .is_some()
+                json_servers(&value, client)
+                    .is_some_and(|servers| servers.contains_key("fukidashi"))
             })
             .unwrap_or(false)
     }
@@ -988,10 +1171,47 @@ fn remove_entry(client: Client, bytes: &[u8]) -> Result<Vec<u8>> {
         }
         Ok(lines.join("\n").into_bytes())
     } else {
-        let mut root: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
-            FukidashiError::InvalidInput(format!("invalid client JSON: {error}"))
-        })?;
-        if let Some(servers) = root
+        let mut root = parse_json_document(bytes)?;
+        if client == Client::OpenCode {
+            let remove_direct = root
+                .get_mut("mcp")
+                .and_then(serde_json::Value::as_object_mut)
+                .map(|servers| {
+                    servers.remove("fukidashi");
+                    servers.is_empty()
+                })
+                .unwrap_or(false);
+            if remove_direct {
+                root.as_object_mut()
+                    .expect("JSON root object")
+                    .remove("mcp");
+            }
+            let remove_servers = root
+                .get_mut("mcp")
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|mcp| mcp.get_mut("servers"))
+                .and_then(serde_json::Value::as_object_mut)
+                .map(|servers| {
+                    servers.remove("fukidashi");
+                    servers.is_empty()
+                })
+                .unwrap_or(false);
+            if remove_servers {
+                let remove_mcp = root
+                    .get_mut("mcp")
+                    .and_then(serde_json::Value::as_object_mut)
+                    .map(|mcp| {
+                        mcp.remove("servers");
+                        mcp.is_empty()
+                    })
+                    .unwrap_or(false);
+                if remove_mcp {
+                    root.as_object_mut()
+                        .expect("JSON root object")
+                        .remove("mcp");
+                }
+            }
+        } else if let Some(servers) = root
             .get_mut(json_servers_key(client))
             .and_then(serde_json::Value::as_object_mut)
         {
@@ -1011,6 +1231,7 @@ fn supported_skill_path(client: Client) -> Result<Option<PathBuf>> {
     Ok(match client {
         Client::Codex => Some(home.join(".codex/skills/fukidashi-comic-translation/SKILL.md")),
         Client::Claude => Some(home.join(".claude/skills/fukidashi-comic-translation/SKILL.md")),
+        Client::Cline => Some(home.join(".cline/skills/fukidashi-comic-translation/SKILL.md")),
         _ => None,
     })
 }
@@ -1020,7 +1241,7 @@ fn skill_contents(_client: Client) -> String {
 }
 
 fn workflow_context() -> &'static str {
-    "# Fukidashi workflow\n\nFukidashi is a local MCP server for comic processing. Follow the complete strict-v1 sequence: fukidashi_translation_start -> read the returned lore template (or call fukidashi_get_lore) -> optionally write known names/pronouns/glossary with fukidashi_put_lore -> fukidashi_translation_submit for every page_ready page -> fukidashi_review_and_export after review_ready. A compact accepted lore example is {\u{22}schema\u{22}:1,\u{22}characters\u{22}:[\u{22}Fuyu\u{22}],\u{22}pronouns\u{22}:[],\u{22}glossary\u{22}:[{\u{22}source\u{22}:\u{22}proprietress\u{22},\u{22}target\u{22}:\u{22}b\u{00e0} ch\u{1ee7}\u{22}]}; character strings are canonicalized to stable {id,names,notes} entries and unknown top-level fields are retained. Flag unknown speakers with needs_review=true; lore is client-authored and the server never invokes an in-process LLM. The server owns page selection, analysis, clean, typeset, stage reuse, model release, and advancement. sfx_mode=preserve is the default: structurally unmatched text-* items are preserved and excluded from required translation, cleaning, and typesetting; preserve-mode covers and SFX-only pages receive an explicit pass-through clean/render stage; all required keep_source=true decisions use that same safe pass-through and advance automatically; use sfx_mode=replace only explicitly. Never shell-read managed state, import/search for the Fukidashi package, invent artifact paths, or pass artifact paths to strict submit. Never shell-copy rendered pages or zip managed job output; use the review/export tool. Use Comic Neue or another legitimate comic face as a primary and never pass generic Windows UI faces such as Arial, Calibri, Segoe UI, Tahoma, Verdana, Times, or DejaVu Sans as a primary; the server substitutes bundled Comic Neue and reports it. Patrick Hand covers Vietnamese and Noto Sans Symbols 2 is reserved for symbol graphemes. For acquisition, use fukidashi_search_manga for native MangaDex titles, then pass its exact manga_id to fukidashi_pull_chapter with latest=true for a vague latest request. Latest selects the highest chapter value including external releases and never silently downgrades to an older hosted chapter; source language is metadata that Fukidashi auto-translates. An external or unavailable result reports that exact release with imported=false. Direct mode is first-class: pass one explicit http(s) URL and optional bounded job_name to fukidashi_pull_chapter; it requires an already provisioned gallery-dl helper, uses bounded transactional staging, and never guesses a URL. If extraction fails, report that the explicit URL was not imported and supply another explicit supported http(s) URL; do not switch providers automatically. Imported jobs return the exact strict translation start step. After review-ready, call fukidashi_review_and_export with the exact returned job_id; the native editor is a manual hot-fix surface with Add Text/Add Bubble, delete, drag/resize, brush/eyedropper, Save & Render, and one job-level Approve & Export control; it keeps one MCP call pending until review and exports only after approval. fukidashi_serve_editor and fukidashi_wait_for_review remain compatibility tools.\n"
+    "# Fukidashi workflow\n\nFukidashi is a local MCP server for comic processing. Follow the complete strict-v1 sequence: fukidashi_translation_start -> read the returned lore template (or call fukidashi_get_lore) -> optionally write known names/pronouns/glossary with fukidashi_put_lore -> fukidashi_translation_submit for every page_ready page -> fukidashi_review_and_export after review_ready. A compact accepted lore example is {\u{22}schema\u{22}:1,\u{22}characters\u{22}:[\u{22}Fuyu\u{22}],\u{22}pronouns\u{22}:[],\u{22}glossary\u{22}:[{\u{22}source\u{22}:\u{22}proprietress\u{22},\u{22}target\u{22}:\u{22}b\u{00e0} ch\u{1ee7}\u{22}]}; character strings are canonicalized to stable {id,names,notes} entries and unknown top-level fields are retained. Flag unknown speakers with needs_review=true; lore is client-authored and the server never invokes an in-process LLM. The server owns page selection, analysis, clean, typeset, stage reuse, model release, and advancement. sfx_mode=preserve is the default: structurally unmatched text-* items are preserved and excluded from required translation, cleaning, and typesetting; preserve-mode covers and SFX-only pages receive an explicit pass-through clean/render stage; all required keep_source=true decisions use that same safe pass-through and advance automatically; use sfx_mode=replace only explicitly. Never shell-read managed state, import/search for the Fukidashi package, invent artifact paths, or pass artifact paths to strict submit. Never shell-copy rendered pages or zip managed job output; use the review/export tool. Use Comic Neue or another legitimate comic face as a primary and never pass generic Windows UI faces such as Arial, Calibri, Segoe UI, Tahoma, Verdana, Times, or DejaVu Sans as a primary; the server substitutes bundled Comic Neue and reports it. Patrick Hand covers Vietnamese and Noto Sans Symbols 2 is reserved for symbol graphemes. For acquisition, use fukidashi_search_manga for native MangaDex titles, then pass its exact manga_id to fukidashi_pull_chapter with latest=true for a vague latest request. Latest selects the highest chapter value including external releases and never silently downgrades to an older hosted chapter; source language is metadata that Fukidashi auto-translates. An external or unavailable result reports that exact release with imported=false. Direct mode is first-class: pass one explicit http(s) URL and optional bounded job_name to fukidashi_pull_chapter; it requires an already provisioned gallery-dl helper, uses bounded transactional staging, and never guesses a URL. If extraction fails, report that the explicit URL was not imported and supply another explicit supported http(s) URL; do not switch providers automatically. Imported jobs return the exact strict translation start step. After review-ready, call fukidashi_review_and_export with the exact returned job_id; the native editor is a manual hot-fix surface with Add Text/Add Bubble, Flag missing dialogue, delete, drag/resize, brush/eyedropper, Save & Render, and one job-level Approve & Export control; use its missing-dialogue rectangle to create feedback with exact bbox and source OCR. It keeps one MCP call pending until review and exports only after approval. When review returns fixes_requested, inspect each feedback item; for each item with origin=retranslate-flag, call fukidashi_retranslation_submit using the exact returned job_id, zero-based page, bubble_id, and current_translation as expected_current_translation, plus the fresh translation and state_revision if supplied. For each item with origin=missing-dialogue-flag and issue_type=wrong_or_missing_bubble, call fukidashi_retranslation_source with exact job_id, zero-based page, and bbox; do not route it to ordinary fukidashi_translation_submit or tell the operator to use Add Text; bbox accepts an object, a four-number array, or flat x1,y1,x2,y2 values; submit fills an overlapping empty bubble instead of leaving it to fail rendering; inspect its original-source image crop and use source_ocr when available, or read the crop and optionally correct source_text when OCR is empty/wrong. If status is ocr_empty, the crop is still available; if status is source_ocr_failed, report the error and verify page/bbox before retrying. Translate the missing dialogue, then call fukidashi_retranslation_submit with job_id, page, bbox, and translation, plus returned source_ocr, corrected source_text if needed, state_revision if returned, and originally requested format (default zip). Handle every retranslation and missing-dialogue item from the current feedback serially before opening another review. state_revision is optional; after a submission changes editor state, omit the stale revision for remaining items from that feedback round. Do not execute intermediate review next actions. After all submissions succeed, follow the final successful submit response's direct fukidashi_review_and_export next action once with its exact job_id and format; the combined tool reopens the editor and waits for operator review. Do not call fukidashi_serve_editor or fukidashi_wait_for_review separately unless the client cannot call the combined tool. fukidashi_serve_editor and fukidashi_wait_for_review remain compatibility tools.\n"
 }
 
 fn load_manifest(path: &Path) -> Result<Option<Manifest>> {
@@ -1226,6 +1447,94 @@ mod tests {
     }
 
     #[test]
+    fn cline_uses_string_command_and_cli_config_path() {
+        let home = Path::new(r"C:\Users\Yozora");
+        let path = config_path_for(Client::Cline, home, &None).unwrap();
+        assert_eq!(
+            path,
+            home.join(r".cline\data\settings\cline_mcp_settings.json")
+        );
+        let value = server_json(
+            Client::Cline,
+            Path::new(r"C:\Users\Yozora\AppData\Local\Fukidashi\bin\fukidashi-mcp.exe"),
+        );
+        assert!(value["command"].is_string());
+        assert_eq!(value["args"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn opencode_uses_v1_compatible_server_and_windows_command_array() {
+        let value = server_json(
+            Client::OpenCode,
+            Path::new(r"C:\Users\Yozora\AppData\Local\Fukidashi\bin\fukidashi-mcp.exe"),
+        );
+        assert_eq!(value["type"], "local");
+        assert_eq!(
+            value["command"][0],
+            r"C:\Users\Yozora\AppData\Local\Fukidashi\bin\fukidashi-mcp.exe"
+        );
+        assert_eq!(value["timeout"], 600_000);
+        let patched = patch_json(
+            Client::OpenCode,
+            br#"{"mcp":{"servers":{"other":{"type":"local","command":["other"]}}},"theme":"dark"}"#,
+            Path::new(r"C:\Fukidashi\fukidashi-mcp.exe"),
+        )
+        .unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&patched).unwrap();
+        assert_eq!(output["theme"], "dark");
+        assert_eq!(output["mcp"]["servers"]["other"]["command"][0], "other");
+        assert_eq!(output["mcp"]["fukidashi"]["type"], "local");
+        assert_eq!(
+            output["mcp"]["fukidashi"]["command"][0],
+            r"C:\Fukidashi\fukidashi-mcp.exe"
+        );
+        assert_eq!(output["mcp"]["fukidashi"]["timeout"], 600_000);
+    }
+
+    #[test]
+    fn opencode_jsonc_comments_and_trailing_commas_are_read_and_removed_safely() {
+        let input = br#"// keep this file JSONC
+        {
+          "mcp": {
+            "servers": {
+              "other": { "type": "local", "command": ["other",], },
+            },
+          },
+        }
+        "#;
+        let executable = Path::new(r"C:\Fukidashi\fukidashi-mcp.exe");
+        assert!(!entry_present(Client::OpenCode, input));
+        let patched = patch_json(Client::OpenCode, input, executable).unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&patched).unwrap();
+        assert_eq!(output["mcp"]["servers"]["other"]["command"][0], "other");
+        assert!(config_contains(Client::OpenCode, &patched, executable));
+        let removed = remove_entry(Client::OpenCode, &patched).unwrap();
+        let output: serde_json::Value = serde_json::from_slice(&removed).unwrap();
+        assert_eq!(output["mcp"]["servers"]["other"]["command"][0], "other");
+        assert!(output["mcp"]["servers"].get("fukidashi").is_none());
+        assert!(output["mcp"].get("fukidashi").is_none());
+    }
+
+    #[test]
+    fn opencode_prefers_existing_jsonc_global_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join(".config/opencode");
+        std::fs::create_dir_all(&directory).unwrap();
+        let jsonc = directory.join("opencode.jsonc");
+        std::fs::write(&jsonc, b"{}\n").unwrap();
+        assert_eq!(
+            config_path_for(Client::OpenCode, temp.path(), &None).unwrap(),
+            jsonc
+        );
+        let json = directory.join("opencode.json");
+        std::fs::write(&json, b"{}\n").unwrap();
+        assert_eq!(
+            config_path_for(Client::OpenCode, temp.path(), &None).unwrap(),
+            json
+        );
+    }
+
+    #[test]
     fn idempotent_reinstall_preserves_missing_prior_backup() {
         let before = br#"{"mcpServers":{"fukidashi":{"command":"/opt/fukidashi-mcp"}}}"#;
         let previous = ManifestClient {
@@ -1274,6 +1583,45 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn default_install_targets_all_clients_including_cline_and_opencode() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let config_dir = home.join(".config");
+        std::fs::create_dir_all(config_dir.join("opencode")).unwrap();
+        std::fs::write(
+            config_dir.join("opencode/opencode.jsonc"),
+            b"// existing OpenCode config\n{\n  \"$schema\": \"https://opencode.ai/config.json\"\n}\n",
+        )
+        .unwrap();
+        let config_dir = Some(config_dir);
+        let executable = home.join("bin/fukidashi-mcp.exe");
+
+        let clients = select_clients(&[], false);
+        assert_eq!(clients, Client::all());
+        for expected in [
+            Client::Codex,
+            Client::Claude,
+            Client::Antigravity,
+            Client::Gemini,
+            Client::Cursor,
+            Client::VsCode,
+            Client::Cline,
+            Client::OpenCode,
+        ] {
+            assert!(clients.contains(&expected));
+            let path = config_path_for(expected, &home, &config_dir).unwrap();
+            let before = std::fs::read(&path).unwrap_or_default();
+            let patched = patch_config(expected, &before, &executable).unwrap();
+            write_atomic(&path, &patched).unwrap();
+            let after = std::fs::read(&path).unwrap();
+            assert!(config_contains(expected, &after, &executable));
+        }
+
+        assert_eq!(select_clients(&[Client::Cline], false), vec![Client::Cline]);
+        assert_eq!(select_clients(&[], true), Client::all());
     }
 
     #[test]

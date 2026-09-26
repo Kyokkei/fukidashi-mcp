@@ -72,6 +72,19 @@ pub enum DragState {
         start_pos: Pos2,
         handle: Handle,
     },
+    TranslateIssue {
+        page_index: usize,
+        issue_index: usize,
+        start_bbox: DomainRect,
+        start_pos: Pos2,
+    },
+    ResizeIssue {
+        page_index: usize,
+        issue_index: usize,
+        start_bbox: DomainRect,
+        start_pos: Pos2,
+        handle: Handle,
+    },
     DrawIssue {
         page_index: usize,
         start_pos: Pos2,
@@ -99,6 +112,7 @@ pub struct CanvasState {
     pub selected: Option<(usize, usize)>,
     pub selected_issue: Option<usize>,
     pub draw_issue_mode: bool,
+    pub draw_issue_edit_target: Option<usize>,
     pub drag: DragState,
     /// Snapshot used to roll back a canceled bubble gesture.  `egui` can stop
     /// delivering pointer events when a window loses focus, so cleanup cannot
@@ -134,6 +148,7 @@ impl Default for CanvasState {
             selected: None,
             selected_issue: None,
             draw_issue_mode: false,
+            draw_issue_edit_target: None,
             drag: DragState::None,
             drag_snapshot: None,
             drag_page_dirty_before: None,
@@ -521,18 +536,37 @@ impl EditorApp {
             }
             let fill = if bubble.render_dirty {
                 egui::Color32::from_rgba_unmultiplied(255, 200, 80, 40)
+            } else if bubble.retranslate_requested {
+                egui::Color32::from_rgba_unmultiplied(255, 145, 40, 65)
             } else if bubble.flagged {
                 egui::Color32::from_rgba_unmultiplied(255, 90, 90, 40)
             } else {
                 egui::Color32::from_rgba_unmultiplied(80, 200, 255, 32)
             };
             painter.rect_filled(rect, 2.0, fill);
+            let is_error_target = self.error_target == Some((self.current_page, idx));
             painter.rect_stroke(
                 rect,
                 2.0_f32,
-                Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 200, 255)),
+                Stroke::new(
+                    if is_error_target { 3.5_f32 } else { 1.5_f32 },
+                    if is_error_target {
+                        egui::Color32::from_rgb(255, 95, 45)
+                    } else {
+                        egui::Color32::from_rgb(80, 200, 255)
+                    },
+                ),
                 StrokeKind::Middle,
             );
+            if bubble.retranslate_requested {
+                painter.text(
+                    rect.left_top() + egui::vec2(3.0, 2.0),
+                    egui::Align2::LEFT_TOP,
+                    "↻",
+                    egui::FontId::proportional(14.0),
+                    egui::Color32::from_rgb(255, 145, 40),
+                );
+            }
             if Some((self.current_page, idx)) == self.canvas.selected {
                 for (_h, pos) in self.canvas.handle_positions(rect) {
                     painter.rect_filled(
@@ -577,6 +611,21 @@ impl EditorApp {
                 ),
                 StrokeKind::Middle,
             );
+            if selected {
+                for (_handle, position) in self.canvas.handle_positions(rect) {
+                    painter.rect_filled(
+                        Rect::from_center_size(position, Vec2::splat(8.0)),
+                        1.0,
+                        egui::Color32::WHITE,
+                    );
+                    painter.rect_stroke(
+                        Rect::from_center_size(position, Vec2::splat(8.0)),
+                        1.0,
+                        Stroke::new(1.0_f32, egui::Color32::BLACK),
+                        StrokeKind::Middle,
+                    );
+                }
+            }
         }
 
         if let DragState::DrawIssue {
@@ -699,49 +748,86 @@ impl EditorApp {
 
         // Context cursor feedback — tool-aware.
         use ActiveTool;
-        match self.canvas.active_tool {
-            ActiveTool::Brush | ActiveTool::Eraser | ActiveTool::Eyedropper => {
-                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-            }
-            ActiveTool::DrawBubble => {
-                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
-            }
-            ActiveTool::AddText => {
-                ctx.set_cursor_icon(egui::CursorIcon::Text);
-            }
-            ActiveTool::Select => {
-                // existing select/bubble/handle cursor logic
-                if matches!(self.canvas.drag, DragState::Pan) {
-                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                } else if matches!(self.canvas.drag, DragState::TranslateBubble { .. }) {
-                    ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                } else if let DragState::ResizeBubble { handle, .. } = &self.canvas.drag {
-                    ctx.set_cursor_icon(match handle {
-                        Handle::Tl | Handle::Br => egui::CursorIcon::ResizeNwSe,
-                        Handle::Tr | Handle::Bl => egui::CursorIcon::ResizeNeSw,
-                        Handle::Tc | Handle::Bc => egui::CursorIcon::ResizeVertical,
-                        Handle::Ml | Handle::Mr => egui::CursorIcon::ResizeHorizontal,
-                    });
-                } else if let Some((pi, bi)) = self.canvas.selected {
-                    if pi == self.current_page {
-                        if let Some(bubble) = page.bubbles.get(bi) {
-                            let rect = self
-                                .canvas
-                                .screen_rect(bubble.bbox.as_ref().unwrap_or(&ZERO_RECT), origin);
-                            if let Some(handle) = self.canvas.hit_handle(pointer, rect) {
-                                ctx.set_cursor_icon(match handle {
-                                    Handle::Tl | Handle::Br => egui::CursorIcon::ResizeNwSe,
-                                    Handle::Tr | Handle::Bl => egui::CursorIcon::ResizeNeSw,
-                                    Handle::Tc | Handle::Bc => egui::CursorIcon::ResizeVertical,
-                                    Handle::Ml | Handle::Mr => egui::CursorIcon::ResizeHorizontal,
-                                });
-                            } else if self.canvas.hit_bubble(pointer, origin, page) == Some(bi) {
-                                ctx.set_cursor_icon(egui::CursorIcon::Grab);
+        if self.canvas.draw_issue_mode {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        } else {
+            match self.canvas.active_tool {
+                ActiveTool::Brush | ActiveTool::Eraser | ActiveTool::Eyedropper => {
+                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                ActiveTool::DrawBubble => {
+                    ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                ActiveTool::AddText => {
+                    ctx.set_cursor_icon(egui::CursorIcon::Text);
+                }
+                ActiveTool::Select => {
+                    // existing select/bubble/handle cursor logic
+                    if matches!(self.canvas.drag, DragState::Pan) {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    } else if matches!(self.canvas.drag, DragState::TranslateBubble { .. }) {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    } else if matches!(self.canvas.drag, DragState::TranslateIssue { .. }) {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                    } else if let DragState::ResizeBubble { handle, .. } = &self.canvas.drag {
+                        ctx.set_cursor_icon(match handle {
+                            Handle::Tl | Handle::Br => egui::CursorIcon::ResizeNwSe,
+                            Handle::Tr | Handle::Bl => egui::CursorIcon::ResizeNeSw,
+                            Handle::Tc | Handle::Bc => egui::CursorIcon::ResizeVertical,
+                            Handle::Ml | Handle::Mr => egui::CursorIcon::ResizeHorizontal,
+                        });
+                    } else if let DragState::ResizeIssue { handle, .. } = &self.canvas.drag {
+                        ctx.set_cursor_icon(match handle {
+                            Handle::Tl | Handle::Br => egui::CursorIcon::ResizeNwSe,
+                            Handle::Tr | Handle::Bl => egui::CursorIcon::ResizeNeSw,
+                            Handle::Tc | Handle::Bc => egui::CursorIcon::ResizeVertical,
+                            Handle::Ml | Handle::Mr => egui::CursorIcon::ResizeHorizontal,
+                        });
+                    } else if let Some(issue_index) = self.canvas.selected_issue {
+                        if let Some(issue) = page.issues.get(issue_index) {
+                            if let Some(bbox) = issue.bbox.as_ref() {
+                                let rect = self.canvas.screen_rect(bbox, origin);
+                                if let Some(handle) = self.canvas.hit_handle(pointer, rect) {
+                                    ctx.set_cursor_icon(match handle {
+                                        Handle::Tl | Handle::Br => egui::CursorIcon::ResizeNwSe,
+                                        Handle::Tr | Handle::Bl => egui::CursorIcon::ResizeNeSw,
+                                        Handle::Tc | Handle::Bc => egui::CursorIcon::ResizeVertical,
+                                        Handle::Ml | Handle::Mr => {
+                                            egui::CursorIcon::ResizeHorizontal
+                                        }
+                                    });
+                                } else if rect.contains(pointer) {
+                                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                                }
                             }
                         }
+                    } else if let Some((pi, bi)) = self.canvas.selected {
+                        if pi == self.current_page {
+                            if let Some(bubble) = page.bubbles.get(bi) {
+                                let rect = self.canvas.screen_rect(
+                                    bubble.bbox.as_ref().unwrap_or(&ZERO_RECT),
+                                    origin,
+                                );
+                                if let Some(handle) = self.canvas.hit_handle(pointer, rect) {
+                                    ctx.set_cursor_icon(match handle {
+                                        Handle::Tl | Handle::Br => egui::CursorIcon::ResizeNwSe,
+                                        Handle::Tr | Handle::Bl => egui::CursorIcon::ResizeNeSw,
+                                        Handle::Tc | Handle::Bc => egui::CursorIcon::ResizeVertical,
+                                        Handle::Ml | Handle::Mr => {
+                                            egui::CursorIcon::ResizeHorizontal
+                                        }
+                                    });
+                                } else if self.canvas.hit_bubble(pointer, origin, page) == Some(bi)
+                                {
+                                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                                }
+                            }
+                        }
+                    } else if self.canvas.hit_bubble(pointer, origin, page).is_some() {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                    } else if self.canvas.hit_issue(pointer, origin, page).is_some() {
+                        ctx.set_cursor_icon(egui::CursorIcon::Grab);
                     }
-                } else if self.canvas.hit_bubble(pointer, origin, page).is_some() {
-                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
                 }
             }
         }
@@ -854,6 +940,24 @@ impl EditorApp {
             return;
         }
 
+        // A missing-dialogue report is a single drag rectangle. Releasing it
+        // records the page issue; the operator sends it from the inspector.
+        if self.canvas.draw_issue_mode {
+            let image_point = self.canvas.screen_to_image(pointer, origin);
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                let press = ctx.input(|i| i.pointer.press_origin()).unwrap_or(pointer);
+                self.canvas.drag = DragState::DrawIssue {
+                    page_index: self.current_page,
+                    start_pos: self.canvas.screen_to_image(press, origin),
+                    current_pos: image_point,
+                    image_size,
+                };
+            } else if let DragState::DrawIssue { current_pos, .. } = &mut self.canvas.drag {
+                *current_pos = image_point;
+            }
+            return;
+        }
+
         // Tool-based primary input routing.
         match self.canvas.active_tool {
             ActiveTool::Eyedropper => {
@@ -933,15 +1037,55 @@ impl EditorApp {
                 }
             }
             ActiveTool::Select => {
-                // Selection / translate / resize while dragging a (possibly new) bubble.
+                // Selection / translate / resize for review flags and bubbles.
                 if response.drag_started_by(egui::PointerButton::Primary)
                     || response.dragged_by(egui::PointerButton::Primary)
                 {
                     if self.canvas.drag == DragState::None {
                         let press = ctx.input(|i| i.pointer.press_origin()).unwrap_or(pointer);
                         let mut started = false;
+                        if let Some(issue_index) = self.canvas.selected_issue {
+                            if let Some(issue) = page.issues.get(issue_index) {
+                                if let Some(start_bbox) = issue.bbox {
+                                    let rect = self.canvas.screen_rect(&start_bbox, origin);
+                                    if let Some(handle) = self.canvas.hit_handle(press, rect) {
+                                        self.canvas.drag = DragState::ResizeIssue {
+                                            page_index: self.current_page,
+                                            issue_index,
+                                            start_bbox,
+                                            start_pos: press,
+                                            handle,
+                                        };
+                                        started = true;
+                                    } else if rect.contains(press) {
+                                        self.canvas.drag = DragState::TranslateIssue {
+                                            page_index: self.current_page,
+                                            issue_index,
+                                            start_bbox,
+                                            start_pos: press,
+                                        };
+                                        started = true;
+                                    }
+                                }
+                            }
+                        }
+                        if !started {
+                            if let Some(issue_index) = self.canvas.hit_issue(press, origin, page) {
+                                if let Some(start_bbox) = page.issues[issue_index].bbox {
+                                    self.canvas.selected_issue = Some(issue_index);
+                                    self.canvas.selected = None;
+                                    self.canvas.drag = DragState::TranslateIssue {
+                                        page_index: self.current_page,
+                                        issue_index,
+                                        start_bbox,
+                                        start_pos: press,
+                                    };
+                                    started = true;
+                                }
+                            }
+                        }
                         if let Some((pi, bi)) = self.canvas.selected {
-                            if pi == self.current_page {
+                            if !started && pi == self.current_page {
                                 if let Some(bubble) = page.bubbles.get(bi) {
                                     let rect = self.canvas.screen_rect(
                                         bubble.bbox.as_ref().unwrap_or(&ZERO_RECT),
@@ -973,6 +1117,7 @@ impl EditorApp {
                         if !started {
                             if let Some(bi_hit) = self.canvas.hit_bubble(press, origin, page) {
                                 self.canvas.selected = Some((self.current_page, bi_hit));
+                                self.canvas.selected_issue = None;
                                 self.canvas.drag = DragState::TranslateBubble {
                                     page_index: self.current_page,
                                     bubble_index: bi_hit,
@@ -982,7 +1127,12 @@ impl EditorApp {
                                 self.begin_bubble_snapshot(self.current_page, bi_hit);
                             }
                         }
-                        if started {
+                        if started
+                            && matches!(
+                                self.canvas.drag,
+                                DragState::TranslateBubble { .. } | DragState::ResizeBubble { .. }
+                            )
+                        {
                             self.begin_bubble_snapshot(
                                 self.current_page,
                                 self.canvas.selected.map_or(0, |(_, bi)| bi),
@@ -1077,11 +1227,87 @@ impl EditorApp {
                             }
                             return;
                         }
+                        DragState::TranslateIssue {
+                            page_index,
+                            issue_index,
+                            start_bbox,
+                            start_pos,
+                        } => {
+                            let delta = pointer - start_pos;
+                            let mut bbox = start_bbox;
+                            bbox.x1 += delta.x / self.canvas.zoom;
+                            bbox.y1 += delta.y / self.canvas.zoom;
+                            bbox.x2 += delta.x / self.canvas.zoom;
+                            bbox.y2 += delta.y / self.canvas.zoom;
+                            let next = CanvasState::clamp_translate_bbox(bbox, image_size);
+                            if (next.x1 - start_bbox.x1).abs() > 0.01
+                                || (next.y1 - start_bbox.y1).abs() > 0.01
+                            {
+                                if !self.canvas.drag_moved {
+                                    self.record_history_before_mutation();
+                                }
+                                self.canvas.drag_moved = true;
+                                if let Some(state) = self.state.as_mut() {
+                                    state.set_issue_bbox(page_index, issue_index, next);
+                                }
+                            }
+                            return;
+                        }
+                        DragState::ResizeIssue {
+                            page_index,
+                            issue_index,
+                            start_bbox,
+                            start_pos,
+                            handle,
+                        } => {
+                            let delta = pointer - start_pos;
+                            let mut bbox = start_bbox;
+                            let dx = delta.x / self.canvas.zoom;
+                            let dy = delta.y / self.canvas.zoom;
+                            match handle {
+                                Handle::Tl => {
+                                    bbox.x1 += dx;
+                                    bbox.y1 += dy;
+                                }
+                                Handle::Tc => bbox.y1 += dy,
+                                Handle::Tr => {
+                                    bbox.x2 += dx;
+                                    bbox.y1 += dy;
+                                }
+                                Handle::Ml => bbox.x1 += dx,
+                                Handle::Mr => bbox.x2 += dx,
+                                Handle::Bl => {
+                                    bbox.x1 += dx;
+                                    bbox.y2 += dy;
+                                }
+                                Handle::Bc => bbox.y2 += dy,
+                                Handle::Br => {
+                                    bbox.x2 += dx;
+                                    bbox.y2 += dy;
+                                }
+                            }
+                            let next = CanvasState::clamp_resize_bbox(
+                                bbox, start_bbox, handle, image_size,
+                            );
+                            if next.x2 - next.x1 > 1.0 && next.y2 - next.y1 > 1.0 {
+                                if !self.canvas.drag_moved {
+                                    self.record_history_before_mutation();
+                                }
+                                self.canvas.drag_moved = true;
+                                if let Some(state) = self.state.as_mut() {
+                                    state.set_issue_bbox(page_index, issue_index, next);
+                                }
+                            }
+                            return;
+                        }
                         _ => {}
                     }
                 }
                 if response.clicked() && self.canvas.drag == DragState::None {
-                    if let Some(bi) = self.canvas.hit_bubble(pointer, origin, page) {
+                    if let Some(issue_index) = self.canvas.hit_issue(pointer, origin, page) {
+                        self.canvas.selected_issue = Some(issue_index);
+                        self.canvas.selected = None;
+                    } else if let Some(bi) = self.canvas.hit_bubble(pointer, origin, page) {
                         self.canvas.selected = Some((self.current_page, bi));
                         self.canvas.selected_issue = None;
                     } else {
@@ -1202,15 +1428,26 @@ impl EditorApp {
             } => {
                 let bbox = CanvasState::bbox_from_points(start_pos, current_pos, image_size);
                 if bbox.x2 - bbox.x1 >= 3.0 && bbox.y2 - bbox.y1 >= 3.0 {
-                    let issue_index = self
-                        .state
-                        .as_mut()
-                        .map(|state| state.push_issue(page_index, bbox));
+                    self.canvas.draw_issue_mode = false;
+                    self.record_history_before_mutation();
+                    let edit_target = self.canvas.draw_issue_edit_target.take();
+                    let issue_index = self.state.as_mut().map(|state| {
+                        if let Some(issue_index) = edit_target {
+                            state.set_issue_bbox(page_index, issue_index, bbox);
+                            issue_index
+                        } else {
+                            state.push_missing_dialogue_issue(page_index, bbox, None)
+                        }
+                    });
                     if let Some(issue_index) = issue_index {
                         self.canvas.selected_issue = Some(issue_index);
                         self.canvas.selected = None;
                         self.schedule_save();
                     }
+                } else {
+                    self.error_message = Some(
+                        "missing-dialogue flag was too small; drag a larger rectangle".to_owned(),
+                    );
                 }
             }
             DragState::TranslateBubble { .. } | DragState::ResizeBubble { .. } => {
@@ -1220,6 +1457,12 @@ impl EditorApp {
                 }
                 self.canvas.drag_snapshot = None;
                 self.canvas.drag_page_dirty_before = None;
+                self.canvas.drag_moved = false;
+            }
+            DragState::TranslateIssue { .. } | DragState::ResizeIssue { .. } => {
+                if self.canvas.drag_moved {
+                    self.schedule_save();
+                }
                 self.canvas.drag_moved = false;
             }
             DragState::DrawNewBubble {

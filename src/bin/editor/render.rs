@@ -43,6 +43,32 @@ pub fn rerender_page_with_state(
     image_path: &Path,
 ) -> anyhow::Result<RerenderResult> {
     let result = render_editor_page(&state.job_dir, image_path, &state.value, page_index)?;
+    extract_rerender_result(&state.job_dir, result)
+}
+
+/// Re-render under an operation-wide approval lease. The caller MUST already
+/// hold the workflow render lock for the job; no lock is acquired here, so
+/// the writer exclusion is never released between pages (Blocker 4).
+pub fn rerender_page_with_state_locked(
+    workflow: &fukidashi_mcp::workflow::Workflow,
+    state: &EditorState,
+    page_index: usize,
+    image_path: &Path,
+) -> anyhow::Result<RerenderResult> {
+    let result = fukidashi_mcp::editor::render_editor_page_locked(
+        workflow,
+        &state.job_dir,
+        image_path,
+        &state.value,
+        page_index,
+    )?;
+    extract_rerender_result(&state.job_dir, result)
+}
+
+fn extract_rerender_result(
+    job_dir: &Path,
+    result: serde_json::Value,
+) -> anyhow::Result<RerenderResult> {
     let rendered: std::path::PathBuf = result
         .get("rendered_image_path")
         .and_then(|v| v.as_str())
@@ -52,12 +78,12 @@ pub fn rerender_page_with_state(
         .get("state")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("render produced no normalized editor state"))?;
-    // `render_editor_page` already wrote project.json; resolve a job-relative
+    // The renderer already wrote project.json; resolve a job-relative
     // path to an absolute one for texture loading.
     let resolved = if rendered.is_absolute() {
         rendered
     } else {
-        state.job_dir.join(&rendered)
+        job_dir.join(&rendered)
     };
     Ok(RerenderResult {
         rendered_image_path: resolved,

@@ -799,6 +799,7 @@ pub fn fit_text_with_geometry(
         max_font_size,
         padding,
         None,
+        4.0,
         text,
         |size| Shaper::new(face, font, size),
     )
@@ -837,6 +838,7 @@ pub fn fit_text_with_font_candidates(
         max_font_size,
         padding,
         None,
+        4.0,
         text,
         |size| MultiShaper::new(fonts, size, &active_font_indices),
     )
@@ -871,6 +873,36 @@ pub fn fit_text_with_font_candidates_masked(
         max_font_size,
         padding,
         mask,
+        4.0,
+        text,
+        |size| MultiShaper::new(fonts, size, &active_font_indices),
+    )
+}
+
+/// Fit a compact rectangular label with a 2 px minimum inset. This is kept
+/// crate-private so regular bubble and prose callers retain the 4 px floor.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fit_text_with_font_candidates_compact(
+    fonts: &[FontCandidate<'_>],
+    text: &str,
+    bbox: Rect,
+    min_font_size: f32,
+    max_font_size: f32,
+) -> Result<LayoutResult> {
+    if fonts.is_empty() {
+        bail!("at least one font candidate is required");
+    }
+    let active_font_indices = active_font_indices(fonts, text)?;
+    fit_text_with_factory(
+        bbox,
+        None,
+        None,
+        "rectangle",
+        min_font_size,
+        max_font_size,
+        Some(2.0),
+        None,
+        2.0,
         text,
         |size| MultiShaper::new(fonts, size, &active_font_indices),
     )
@@ -886,6 +918,7 @@ fn fit_text_with_factory<F, S>(
     max_font_size: f32,
     padding: Option<f32>,
     mask: Option<LayoutMask>,
+    padding_floor: f32,
     text: &str,
     factory: F,
 ) -> Result<LayoutResult>
@@ -939,7 +972,7 @@ where
     let padding = padding
         .filter(|value| value.is_finite() && *value >= 0.0)
         .unwrap_or_else(|| (area.x2 - area.x1).min(area.y2 - area.y1) * 0.06);
-    let padding = padding.clamp(4.0, 16.0);
+    let padding = padding.clamp(padding_floor, 16.0);
     let safe_bbox = inset_rect(area, padding)?;
     let anchor = text_bbox.filter(|rect| valid_rect(*rect)).unwrap_or(area);
     let mask_center = mask

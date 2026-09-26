@@ -10,6 +10,7 @@
 use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::{collections::HashSet, fs};
 
 mod editor;
 
@@ -17,6 +18,75 @@ mod editor;
 pub const EXIT_OK: i32 = 0; // approved / wrote approve_export
 pub const EXIT_ERROR: i32 = 1; // fatal error
 pub const EXIT_CLOSED: i32 = 2; // user closed without approving
+
+fn register_platform_cjk_fallbacks(fonts: &mut egui::FontDefinitions) {
+    let directories = fukidashi_mcp::workflow::font_search_dirs();
+    let fallback_sets: [(&str, &[&str]); 3] = [
+        (
+            "PlatformCjkHan",
+            &[
+                "msyh.ttc",
+                "simsun.ttc",
+                "mingliu.ttc",
+                "msjh.ttc",
+                "NotoSansCJK-Regular.ttc",
+                "NotoSansCJKsc-Regular.otf",
+                "NotoSansCJKtc-Regular.otf",
+                "SourceHanSansSC-Regular.otf",
+                "SourceHanSansTC-Regular.otf",
+            ],
+        ),
+        (
+            "PlatformCjkKorean",
+            &[
+                "malgun.ttf",
+                "NotoSansCJKkr-Regular.otf",
+                "SourceHanSansKR-Regular.otf",
+            ],
+        ),
+        (
+            "PlatformCjkJapanese",
+            &[
+                "msgothic.ttc",
+                "meiryo.ttc",
+                "NotoSansCJKjp-Regular.otf",
+                "SourceHanSansJP-Regular.otf",
+            ],
+        ),
+    ];
+    let mut loaded_paths = HashSet::new();
+
+    for (font_id, names) in fallback_sets {
+        let Some(path) = names
+            .iter()
+            .flat_map(|name| {
+                directories
+                    .iter()
+                    .map(move |directory| directory.join(name))
+            })
+            .find(|path| {
+                let identity = fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                path.is_file() && !loaded_paths.contains(&identity)
+            })
+        else {
+            continue;
+        };
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let identity = fs::canonicalize(&path).unwrap_or(path);
+        loaded_paths.insert(identity);
+
+        let mut data = egui::FontData::from_owned(bytes);
+        data.index = 0;
+        fonts.font_data.insert(font_id.to_owned(), Arc::new(data));
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .push(font_id.to_owned());
+    }
+}
 
 /// Shared exit decision, read after `eframe::run_native` returns.
 #[derive(Default, Clone)]
@@ -50,8 +120,8 @@ struct Cli {
     editor_lease: Option<PathBuf>,
 }
 
-fn main() {
-    std::process::exit(run());
+fn main() -> std::process::ExitCode {
+    std::process::ExitCode::from(run() as u8)
 }
 
 fn run() -> i32 {
@@ -108,13 +178,30 @@ fn run() -> i32 {
         }
     };
 
+    fn load_app_icon() -> Option<egui::IconData> {
+        let bytes = include_bytes!("../../assets/fukidashi.png");
+        let image = image::load_from_memory(bytes).ok()?.into_rgba8();
+        let (width, height) = image.dimensions();
+        Some(egui::IconData {
+            rgba: image.into_raw(),
+            width,
+            height,
+        })
+    }
+
     let exit_state = Arc::new(Mutex::new(ExitState::default()));
 
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([720.0, 480.0])
+        .with_title("Fukidashi Editor");
+
+    if let Some(icon) = load_app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([720.0, 480.0])
-            .with_title("Fukidashi Editor"),
+        viewport,
         ..Default::default()
     };
 
@@ -144,6 +231,11 @@ fn run() -> i32 {
                     .entry(egui::FontFamily::Proportional)
                     .or_default()
                     .push("PatrickHand".to_owned());
+                // egui has no operating-system font fallback of its own.
+                // Add the available CJK faces after Latin/Vietnamese so the
+                // translation field can display Chinese, Korean, and Japanese
+                // instead of tofu without replacing the default UI face.
+                register_platform_cjk_fallbacks(&mut fonts);
                 cc.egui_ctx.set_fonts(fonts);
 
                 match editor::EditorApp::new(

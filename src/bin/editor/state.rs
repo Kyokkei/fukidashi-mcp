@@ -86,6 +86,7 @@ pub struct BubbleView {
     pub font_size: Option<f32>,
     pub padding: Option<f32>,
     pub flagged: bool,
+    pub retranslate_requested: bool,
     pub problem: bool,
     pub preserve_source: bool,
     pub render_dirty: bool,
@@ -96,9 +97,11 @@ pub struct BubbleView {
 #[derive(Clone)]
 pub struct IssueView {
     pub issue_type: String,
+    pub origin: String,
     pub bbox: Option<Rect>,
     pub note: String,
     pub corrected_text: Option<String>,
+    pub source_ocr: Option<String>,
 }
 
 /// Read-only view of a page (with resolved, on-disk image paths).
@@ -123,7 +126,7 @@ impl PageView {
     pub fn has_bubble_flags(&self) -> bool {
         self.bubbles
             .iter()
-            .any(|bubble| bubble.flagged || bubble.problem)
+            .any(|bubble| bubble.flagged || bubble.problem || bubble.retranslate_requested)
     }
 
     pub fn has_render_dirty(&self) -> bool {
@@ -205,6 +208,10 @@ impl EditorState {
                             .map(|v| v as f32),
                         padding: b.get("padding").and_then(|v| v.as_f64()).map(|v| v as f32),
                         flagged: b.get("flagged").and_then(|v| v.as_bool()).unwrap_or(false),
+                        retranslate_requested: b
+                            .get("retranslate_requested")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                         problem: b.get("problem").and_then(|v| v.as_bool()).unwrap_or(false),
                         preserve_source: b
                             .get("preserve_source")
@@ -238,6 +245,11 @@ impl EditorState {
                             .and_then(|v| v.as_str())
                             .unwrap_or("custom")
                             .to_owned(),
+                        origin: issue
+                            .get("origin")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_owned(),
                         bbox: issue
                             .get("bbox")
                             .and_then(|v| serde_json::from_value::<Rect>(v.clone()).ok()),
@@ -248,6 +260,10 @@ impl EditorState {
                             .to_owned(),
                         corrected_text: issue
                             .get("corrected_text")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned),
+                        source_ocr: issue
+                            .get("source_ocr")
                             .and_then(|v| v.as_str())
                             .map(str::to_owned),
                     })
@@ -301,10 +317,21 @@ impl EditorState {
                     let value = serde_json::Value::String(p);
                     obj.insert("font_path".to_owned(), value.clone());
                     obj.insert("_editor_requested_global_font_path".to_owned(), value);
+                    obj.insert(
+                        "_editor_global_font_explicit".to_owned(),
+                        serde_json::Value::Bool(true),
+                    );
                 }
                 _ => {
                     obj.insert("font_path".to_owned(), serde_json::Value::Null);
-                    obj.remove("_editor_requested_global_font_path");
+                    obj.insert(
+                        "_editor_requested_global_font_path".to_owned(),
+                        serde_json::Value::Null,
+                    );
+                    obj.insert(
+                        "_editor_global_font_explicit".to_owned(),
+                        serde_json::Value::Bool(true),
+                    );
                 }
             }
         }
@@ -473,9 +500,13 @@ impl EditorState {
     }
 
     pub fn set_bubble_translation(&mut self, page_index: usize, bubble_index: usize, text: String) {
+        let translation_is_explicit = !text.trim().is_empty();
         self.bubble_mut(page_index, bubble_index, |bubble| {
             if let Some(obj) = bubble.as_object_mut() {
                 obj.insert("translation".to_owned(), serde_json::Value::String(text));
+                if translation_is_explicit {
+                    obj.insert("preserve_source".to_owned(), serde_json::Value::Bool(false));
+                }
             }
         });
     }
@@ -567,6 +598,56 @@ impl EditorState {
         }
     }
 
+    pub fn retranslation_requests(&self) -> Vec<(usize, String)> {
+        self.value
+            .get("pages")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .flat_map(|(page_index, page)| {
+                page.get("bubbles")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|bubble| {
+                        bubble
+                            .get("retranslate_requested")
+                            .and_then(serde_json::Value::as_bool)
+                            == Some(true)
+                    })
+                    .map(move |bubble| {
+                        (
+                            page_index,
+                            bubble
+                                .get("id")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or("unknown")
+                                .to_owned(),
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    pub fn set_bubble_retranslate_requested(
+        &mut self,
+        page_index: usize,
+        bubble_index: usize,
+        requested: bool,
+    ) {
+        let was_dirty = self.page_render_dirty(page_index);
+        self.bubble_mut(page_index, bubble_index, |bubble| {
+            if let Some(obj) = bubble.as_object_mut() {
+                obj.insert(
+                    "retranslate_requested".to_owned(),
+                    serde_json::Value::Bool(requested),
+                );
+            }
+        });
+        self.set_page_render_dirty(page_index, was_dirty);
+    }
+
     pub fn set_bubble_preserve_source(
         &mut self,
         page_index: usize,
@@ -611,6 +692,83 @@ impl EditorState {
         issues.len().saturating_sub(1)
     }
 
+    /// Add a focused issue for dialogue missing from the cleaned/rendered
+    /// balloon. Carry OCR text from the best overlapping editor bubble when
+    /// the caller has no stronger source OCR value of its own.
+    pub(crate) fn push_missing_dialogue_issue(
+        &mut self,
+        page_index: usize,
+        bbox: Rect,
+        source_ocr: Option<&str>,
+    ) -> usize {
+        if bbox.validate().is_err() {
+            return 0;
+        }
+        let source_ocr = source_ocr
+            .map(str::trim)
+            .filter(|text| !text.is_empty() && text.len() <= 4096)
+            .map(str::to_owned)
+            .or_else(|| {
+                let bubbles = self
+                    .value
+                    .get("pages")
+                    .and_then(serde_json::Value::as_array)
+                    .and_then(|pages| pages.get(page_index))
+                    .and_then(|page| page.get("bubbles"))
+                    .and_then(serde_json::Value::as_array)?;
+                let issue_area = (bbox.x2 - bbox.x1) * (bbox.y2 - bbox.y1);
+                bubbles
+                    .iter()
+                    .filter_map(|bubble| {
+                        let bubble_bbox = bubble
+                            .get("bbox")
+                            .or_else(|| bubble.get("bubble_bbox"))
+                            .cloned()
+                            .and_then(|value| serde_json::from_value::<Rect>(value).ok())?
+                            .validate()
+                            .ok()?;
+                        let source = ["source_text", "source_ocr", "original_text", "text"]
+                            .into_iter()
+                            .filter_map(|key| bubble.get(key).and_then(|value| value.as_str()))
+                            .map(str::trim)
+                            .find(|text| !text.is_empty() && text.len() <= 4096)?;
+                        let intersection = (bbox.x2.min(bubble_bbox.x2)
+                            - bbox.x1.max(bubble_bbox.x1))
+                        .max(0.0)
+                            * (bbox.y2.min(bubble_bbox.y2) - bbox.y1.max(bubble_bbox.y1)).max(0.0);
+                        (intersection > 0.0).then_some((intersection / issue_area, source))
+                    })
+                    .max_by(|left, right| left.0.total_cmp(&right.0))
+                    .map(|(_, source)| source.to_owned())
+            });
+        let mut issue = serde_json::json!({
+            "issue_type": "wrong_or_missing_bubble",
+            "origin": "missing-dialogue-flag",
+            "bbox": {"x1": bbox.x1, "y1": bbox.y1, "x2": bbox.x2, "y2": bbox.y2},
+            "note": "Dialogue is missing from this balloon; inspect the source and provide the missing translation.",
+        });
+        if let Some(source_ocr) = source_ocr {
+            issue["source_ocr"] = serde_json::Value::String(source_ocr);
+        }
+        let Some(page) = self
+            .value
+            .get_mut("pages")
+            .and_then(|pages| pages.as_array_mut())
+            .and_then(|pages| pages.get_mut(page_index))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return 0;
+        };
+        let issues = page
+            .entry("issues")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        let Some(issues) = issues.as_array_mut() else {
+            return 0;
+        };
+        issues.push(issue);
+        issues.len().saturating_sub(1)
+    }
+
     pub(crate) fn remove_issue(&mut self, page_index: usize, issue_index: usize) -> bool {
         self.value
             .get_mut("pages")
@@ -624,6 +782,39 @@ impl EditorState {
                 true
             })
             .unwrap_or(false)
+    }
+
+    pub(crate) fn set_issue_bbox(
+        &mut self,
+        page_index: usize,
+        issue_index: usize,
+        bbox: Rect,
+    ) -> bool {
+        if bbox.validate().is_err() {
+            return false;
+        }
+        let Some(issue) = self
+            .value
+            .get_mut("pages")
+            .and_then(|pages| pages.as_array_mut())
+            .and_then(|pages| pages.get_mut(page_index))
+            .and_then(|page| page.get_mut("issues"))
+            .and_then(|issues| issues.as_array_mut())
+            .and_then(|issues| issues.get_mut(issue_index))
+            .and_then(|issue| issue.as_object_mut())
+        else {
+            return false;
+        };
+        issue.insert(
+            "bbox".to_owned(),
+            serde_json::json!({
+                "x1": bbox.x1,
+                "y1": bbox.y1,
+                "x2": bbox.x2,
+                "y2": bbox.y2,
+            }),
+        );
+        true
     }
 
     pub(crate) fn clear_issues(&mut self, page_index: usize) -> bool {
@@ -898,12 +1089,19 @@ pub fn load_or_create_review(job_dir: &PathBuf, requested_session: &Option<Strin
 /// Persist the project state with an atomic write (mirrors the loopback server).
 pub fn save_project(state: &EditorState) -> anyhow::Result<()> {
     let path = state.job_dir.join("project.json");
+    super::ensure_persisted_revision(&state.job_dir, &state.value)?;
     atomic_write_json(&path, &state.value)
 }
 
 /// Persist the review state (mirrors `save_review` on the MCP side).
 pub fn save_review_state(job_dir: &PathBuf, review: &ReviewState) -> anyhow::Result<()> {
     fukidashi_mcp::editor::write_review(job_dir, review)
+}
+
+/// Persist a native review action without waiting behind a managed export.
+pub fn try_save_review_state(job_dir: &PathBuf, review: &ReviewState) -> anyhow::Result<()> {
+    fukidashi_mcp::editor::try_write_review(job_dir, review)
+        .map_err(|error| anyhow::anyhow!("persist review state: {error:#}"))
 }
 
 /// Resolve the `review.json` path for the job.
@@ -914,19 +1112,8 @@ pub fn review_path(job_dir: &PathBuf) -> PathBuf {
 /// Atomic JSON write: `<path>.tmp` then `rename`. Same pattern as the loopback
 /// server's `atomic_json_save`.
 pub fn atomic_write_json(path: &std::path::Path, value: &serde_json::Value) -> anyhow::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("state path has no parent"))?;
-    let temp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|e| anyhow::anyhow!("create temporary editor state: {e}"))?;
-    serde_json::to_writer_pretty(temp.as_file(), value)
-        .map_err(|e| anyhow::anyhow!("write editor state: {e}"))?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|e| anyhow::anyhow!("flush editor state: {e}"))?;
-    temp.persist(path)
-        .map_err(|e| anyhow::anyhow!("promote editor state: {}", e.error))?;
-    Ok(())
+    fukidashi_mcp::editor::atomic_json_save(path, value)
+        .map_err(|error| anyhow::anyhow!("persist editor state: {error:#}"))
 }
 
 #[cfg(test)]
