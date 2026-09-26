@@ -4057,9 +4057,10 @@ pub(crate) fn editor_requested_font_path(bubble: &Value) -> Option<&str> {
             let cached = bubble
                 .get("_editor_cached_font_path")
                 .and_then(Value::as_str);
-            return if cached.is_some_and(|cached| cached != current)
-                && rendered != Some(current)
-                && resolved != Some(current)
+            return if crate::workflow::is_generic_desktop_font(Path::new(current))
+                || (cached.is_some_and(|cached| cached != current)
+                    && rendered != Some(current)
+                    && resolved != Some(current))
             {
                 Some(current)
             } else {
