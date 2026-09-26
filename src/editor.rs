@@ -2935,11 +2935,7 @@ fn mark_render_dirty_changes(current: &Value, incoming: &mut Value) {
         return;
     };
     for (index, incoming_page) in incoming_pages.iter_mut().enumerate() {
-        let incoming_signature = page_render_signature(incoming_page);
-        let Some(incoming_object) = incoming_page.as_object_mut() else {
-            continue;
-        };
-        let incoming_id = incoming_object.get("id").and_then(Value::as_str);
+        let incoming_id = incoming_page.get("id").and_then(Value::as_str);
         let current_page = current_pages
             .iter()
             .find(|candidate| {
@@ -2953,15 +2949,53 @@ fn mark_render_dirty_changes(current: &Value, incoming: &mut Value) {
         let Some(current_page) = current_page else {
             continue;
         };
+        let incoming_signature = page_render_signature(incoming_page);
+        let font_path_cleared = primary_font_path_was_cleared(current_page, incoming_page);
+        let already_dirty = current_page
+            .get("render_dirty")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let Some(incoming_object) = incoming_page.as_object_mut() else {
+            continue;
+        };
         if page_render_signature(current_page) != incoming_signature
-            || current_page
-                .get("render_dirty")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
+            || font_path_cleared
+            || already_dirty
         {
             incoming_object.insert("render_dirty".to_owned(), Value::Bool(true));
         }
     }
+}
+
+fn primary_font_path_was_cleared(previous: &Value, next: &Value) -> bool {
+    let Some(previous_bubbles) = previous.get("bubbles").and_then(Value::as_array) else {
+        return false;
+    };
+    let next_bubbles = next.get("bubbles").and_then(Value::as_array);
+    previous_bubbles.iter().enumerate().any(|(index, bubble)| {
+        if bubble_preserve_for_render(bubble)
+            || !bubble
+                .get("font_path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| !path.trim().is_empty())
+        {
+            return false;
+        }
+        let bubble_id = bubble.get("id").and_then(Value::as_str);
+        let next_bubble = next_bubbles.and_then(|bubbles| {
+            bubble_id
+                .and_then(|id| {
+                    bubbles
+                        .iter()
+                        .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(id))
+                })
+                .or_else(|| bubbles.get(index))
+        });
+        !next_bubble
+            .and_then(|bubble| bubble.get("font_path"))
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty())
+    })
 }
 
 fn review_blockers(state: &Value) -> Vec<Value> {
@@ -3474,7 +3508,8 @@ pub(crate) fn merge_saved_edits(base: &mut Value, saved: &Value) {
             .unwrap_or_default();
         migrate_legacy_bubble_ids(base_page, &mut saved_bubbles, index);
         migrate_legacy_bubble_ids(base_page, &mut saved_removed_bubbles, index);
-        let baseline_signature = page_render_signature(base_page);
+        let baseline_page = base_page.clone();
+        let baseline_signature = page_render_signature(&baseline_page);
 
         {
             let Some(base_object) = base_page.as_object_mut() else {
@@ -3706,8 +3741,9 @@ pub(crate) fn merge_saved_edits(base: &mut Value, saved: &Value) {
                 *base_bubbles = ordered;
             }
         }
-        let render_dirty =
-            editor_page_render_signature(&font_state, base_page) != baseline_signature;
+        let render_dirty = editor_page_render_signature(&font_state, base_page)
+            != baseline_signature
+            || primary_font_path_was_cleared(&baseline_page, base_page);
         if let Some(base_object) = base_page.as_object_mut() {
             base_object.insert("render_dirty".to_owned(), Value::Bool(render_dirty));
         }
