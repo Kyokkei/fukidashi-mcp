@@ -3637,6 +3637,11 @@ pub(crate) fn merge_saved_edits(base: &mut Value, saved: &Value) {
                             base_bubble_object.remove("_editor_requested_font_path");
                         }
                     } else {
+                        // Saved editor state is a full snapshot for each
+                        // bubble. If the public font field is absent, preserve
+                        // that cleared primary instead of resurrecting the
+                        // sidecar's previous request on the next render.
+                        base_bubble_object.remove("font_path");
                         base_bubble_object.remove("_editor_requested_font_path");
                     }
                 }
