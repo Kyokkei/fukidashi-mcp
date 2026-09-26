@@ -5711,7 +5711,11 @@ mod tests {
                             "source_language": "en",
                             "text": "Nhân vật nói chuyện với mọi người trong phòng.",
                             "bbox": {"x1":1.0,"y1":1.0,"x2":20.0,"y2":20.0}
-                        }]
+                        }],
+                        "report": {"bubbles": [{
+                            "index": 0,
+                            "ink_bbox": {"x1":2.0,"y1":2.0,"x2":10.0,"y2":10.0}
+                        }]}
                     }),
                     json!({}),
                 )

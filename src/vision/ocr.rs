@@ -3937,7 +3937,7 @@ fn group_prose_lines(
         .map(|region| (region.bbox.y2 - region.bbox.y1).max(1.0))
         .sum::<f32>()
         / regions.len() as f32;
-    let gap_limit = (average_height * 0.55)
+    let gap_limit = (average_height * 0.75)
         .max(8.0)
         .min(((page_width as f32 * page_height as f32).sqrt() * 0.08).max(10.0));
     let mut groups: Vec<Vec<OcrRegion>> = Vec::new();
