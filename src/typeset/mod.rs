@@ -277,7 +277,7 @@ pub fn typeset_page_with_fallbacks(
                     && is_compact_label(&payload.text, rect)
                     && payload.shape.is_none()
                     && payload.padding.is_none()
-                    && payload.min_font_size.map_or(true, |size| size <= 8.0) =>
+                    && payload.min_font_size.is_none_or(|size| size <= 8.0) =>
             {
                 match layout::fit_text_with_font_candidates_compact(
                     &candidates,

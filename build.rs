@@ -123,7 +123,7 @@ fn resource_compiler(target_env: &str, target_arch: &str) -> Option<PathBuf> {
                 return Some(versioned);
             }
         }
-        if let Some(bin) = root.join("bin").read_dir().ok() {
+        if let Ok(bin) = root.join("bin").read_dir() {
             let mut versions = bin
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())

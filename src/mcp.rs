@@ -4273,8 +4273,9 @@ impl FukidashiServer {
                         .as_ref()
                         .and_then(|manifest| manifest.get("preflight_context"))
                         == Some(&preflight_context_for_worker);
-                    if previous_context_matches && cache_matches_source {
-                        if let Some(previous) = previous_manifest
+                    if previous_context_matches
+                        && cache_matches_source
+                        && let Some(previous) = previous_manifest
                         .as_ref()
                         .and_then(|manifest| manifest.get("pages"))
                         .and_then(serde_json::Value::as_array)
@@ -4290,7 +4291,7 @@ impl FukidashiServer {
                                         == Some(&preflight_context_for_worker)
                             })
                         })
-                        {
+                    {
                             emit_preflight_progress(
                                 page_number,
                                 total_pages,
@@ -4309,7 +4310,6 @@ impl FukidashiServer {
                             pages.push(cached_page);
                             persist_progress(&pages)?;
                             continue;
-                        }
                     }
                     let reused = cache_matches_source;
                     let mut analysis = if cache_matches_source {

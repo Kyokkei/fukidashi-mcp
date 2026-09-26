@@ -59,14 +59,12 @@ if (-not $iscc) {
 
 Write-Host "Found Inno Setup Compiler at: $iscc" -ForegroundColor Green
 
-# 2. Verify Release Binaries
-$mcpExe = Join-Path $ScriptDir "target\release\fukidashi-mcp.exe"
-$editorExe = Join-Path $ScriptDir "target\release\fukidashi-editor.exe"
-if (-not (Test-Path $mcpExe) -or -not (Test-Path $editorExe)) {
-    Write-Host "Building release binaries with cargo..." -ForegroundColor Cyan
-    cargo build --release --features editor
-} else {
-    Write-Host "Release binaries verified." -ForegroundColor Green
+# 2. Build release binaries from the current locked source
+Write-Host "Building release binaries with cargo..." -ForegroundColor Cyan
+cargo build --locked --release --features editor
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Cargo release build failed with exit code $LASTEXITCODE."
+    exit $LASTEXITCODE
 }
 
 # 3. Ensure Output Directory

@@ -3,7 +3,7 @@
 ; =====================================================================
 
 #define MyAppName "Fukidashi"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "Yozora"
 #define MyAppURL "https://github.com/Kyokkei/fukidashi-mcp"
 #define MyAppExeName "fukidashi-editor.exe"
@@ -56,7 +56,7 @@ ArchitecturesInstallIn64BitMode=x64
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "configure_clients"; Description: "Automatically configure AI Clients (Claude Desktop, Claude Code, Codex, Gemini)"; GroupDescription: "AI Client Integration:"; Flags: checkedonce
+Name: "configure_clients"; Description: "Automatically configure supported AI clients (Codex, Claude Code, Antigravity, Gemini CLI, Cursor, VS Code/Copilot, Cline, OpenCode)"; GroupDescription: "AI Client Integration:"; Flags: checkedonce
 Name: "install_skill"; Description: "Install Comic Translation Skill (fukidashi-comic-translation)"; GroupDescription: "AI Client Integration:"; Flags: checkedonce
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}:"; Flags: checkedonce
 Name: "addtopath"; Description: "Add Fukidashi to user PATH environment variable"; GroupDescription: "System Integration:"; Flags: checkedonce
@@ -99,7 +99,7 @@ Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; Value
 Filename: "{app}\bin\{#MyAppMcpName}"; Parameters: "config-set --storage-root ""{app}"""; Flags: runhidden; StatusMsg: "Configuring storage paths..."
 
 ; 2. Automatically register MCP server in all detected AI clients
-Filename: "{app}\bin\{#MyAppMcpName}"; Parameters: "install --all"; Flags: runhidden; Tasks: configure_clients; StatusMsg: "Configuring Claude Desktop, Claude Code, Codex, and Gemini..."
+Filename: "{app}\bin\{#MyAppMcpName}"; Parameters: "install --all"; Flags: runhidden; Tasks: configure_clients; StatusMsg: "Configuring supported AI clients..."
 
 ; 3. Deploy comic translation skill to AI skill directories
 Filename: "{app}\bin\install-skills.cmd"; Flags: runhidden; Tasks: install_skill; StatusMsg: "Installing AI comic translation skills..."

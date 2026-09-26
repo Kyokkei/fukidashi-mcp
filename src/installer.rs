@@ -866,16 +866,13 @@ fn patch_json(client: Client, input: &[u8], executable: &Path) -> Result<Vec<u8>
         // `mcp.servers`, but a nested V2 timeout is explicitly ignored by
         // that runtime.  Remove only our same-name legacy entry so the
         // resulting config has one unambiguous Fukidashi server.
-        if let Some(mcp) = root
+        if let Some(servers) = root
             .get_mut("mcp")
             .and_then(serde_json::Value::as_object_mut)
+            .and_then(|mcp| mcp.get_mut("servers"))
+            .and_then(serde_json::Value::as_object_mut)
         {
-            if let Some(servers) = mcp
-                .get_mut("servers")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                servers.remove("fukidashi");
-            }
+            servers.remove("fukidashi");
         }
     }
     let servers = json_servers_mut(&mut root, client)?;
@@ -1046,10 +1043,10 @@ fn json_servers_mut(
     }
 }
 
-fn json_servers<'a>(
-    root: &'a serde_json::Value,
+fn json_servers(
+    root: &serde_json::Value,
     client: Client,
-) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+) -> Option<&serde_json::Map<String, serde_json::Value>> {
     if client == Client::OpenCode {
         let mcp = root.get("mcp")?.as_object()?;
         if mcp.get("fukidashi").is_some() {
