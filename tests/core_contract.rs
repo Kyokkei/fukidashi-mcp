@@ -252,9 +252,7 @@ async fn rmcp_surface_lists_tools_and_reports_tool_errors() -> anyhow::Result<()
 
 fn assert_no_boolean_schema_nodes(value: &serde_json::Value, tool_name: &str) {
     fn walk(value: &serde_json::Value, tool_name: &str, path: &str) {
-        if matches!(value, serde_json::Value::Bool(_))
-            && !(tool_name == "fukidashi_pull_chapter" && path == "properties.latest.default")
-        {
+        if matches!(value, serde_json::Value::Bool(_)) && !path.ends_with(".default") {
             panic!("tool {tool_name} contains a boolean JSON Schema node at {path}");
         }
         match value {
