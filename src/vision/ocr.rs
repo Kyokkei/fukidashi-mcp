@@ -3631,7 +3631,10 @@ fn prose_region_is_implausibly_collapsed(
         || (area >= 0.08 && chars_per_percent_of_page < 6.0)
         // A very wide, one-line chart OCR false positive can bridge otherwise
         // separate profile-card columns despite occupying little page area.
-        || (width / page_width >= 0.70 && height / page_height <= 0.035 && chars < 80)
+        || (width / page_width >= 0.70
+            && height / page_height <= 0.035
+            && chars < 80
+            && !has_japanese_script(&region.text))
         || (height / page_height >= 0.48 && width / page_width <= 0.22 && chars < 160)
 }
 

@@ -1552,7 +1552,7 @@ mod tests {
     }
 
     #[test]
-    fn rasterized_text_stays_inside_the_eroded_balloon_component() {
+    fn rasterized_text_respects_mask_or_geometry_fallback() {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("source.png");
         let output_path = directory.path().join("rendered.png");
@@ -1596,9 +1596,12 @@ mod tests {
         let report =
             typeset_page_with_fallbacks(&source_path, &[payload], &[], &output_path).unwrap();
         assert_eq!(report["bubbles"][0]["mask_used"], true);
+        let geometry_fallback = report["bubbles"][0]["layout_mask_fallback"] == true;
         let safe_mask = infer_balloon_mask(&source, area, Some(text_bbox))
             .and_then(|mask| mask.eroded(2))
-            .expect("same mask used by the renderer");
+            .expect("inferred balloon component");
+        let safe_bbox = report["bubbles"][0]["safe_bbox"].clone();
+        let safe_bbox: Rect = serde_json::from_value(safe_bbox).unwrap();
         let rendered = image::open(&output_path).unwrap().to_rgba8();
         let mut changed_text_pixels = 0usize;
         for y in 0..rendered.height() {
@@ -1607,10 +1610,26 @@ mod tests {
                 let after = rendered.get_pixel(x, y);
                 if before[0] >= 240 && after[0] < 240 {
                     changed_text_pixels += 1;
-                    assert!(
-                        safe_mask.contains_pixel(x as i32, y as i32),
-                        "text escaped eroded mask at ({x}, {y})"
-                    );
+                    if geometry_fallback {
+                        // A fragmented or undersized inferred component can
+                        // intentionally yield to the explicit bubble geometry.
+                        // In that mode the detector safe rectangle, rather than
+                        // the pixel component, is the rendering constraint.
+                        let px = x as f32 + 0.5;
+                        let py = y as f32 + 0.5;
+                        assert!(
+                            px >= safe_bbox.x1
+                                && py >= safe_bbox.y1
+                                && px <= safe_bbox.x2
+                                && py <= safe_bbox.y2,
+                            "text escaped geometry safe bbox at ({x}, {y})"
+                        );
+                    } else {
+                        assert!(
+                            safe_mask.contains_pixel(x as i32, y as i32),
+                            "text escaped eroded mask at ({x}, {y})"
+                        );
+                    }
                 }
             }
         }

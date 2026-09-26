@@ -1449,7 +1449,10 @@ mod tests {
         let path = config_path_for(Client::Cline, home, &None).unwrap();
         assert_eq!(
             path,
-            home.join(r".cline\data\settings\cline_mcp_settings.json")
+            home.join(".cline")
+                .join("data")
+                .join("settings")
+                .join("cline_mcp_settings.json")
         );
         let value = server_json(
             Client::Cline,
