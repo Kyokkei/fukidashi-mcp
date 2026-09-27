@@ -43,7 +43,7 @@ jobs:
           mkdir -p "$stage/licenses/fonts" release-assets
           install -m 0755 target/release/fukidashi-mcp "$stage/fukidashi-mcp"
           install -m 0755 target/release/fukidashi-editor "$stage/fukidashi-editor"
-          cp README.md LICENSE LICENSE-Comic-Translate "$stage/"
+          cp README.md LICENSE NOTICE LICENSE-Comic-Translate "$stage/"
           cp assets/fonts/ComicNeue-OFL.txt assets/fonts/PatrickHand-OFL.txt assets/fonts/README.md "$stage/licenses/fonts/"
           archive="fukidashi-mcp-${GITHUB_REF_NAME}-linux-x86_64.tar.gz"
           tar -C package -czf "release-assets/$archive" fukidashi-mcp
@@ -58,7 +58,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$stage/licenses/fonts", 'release-assets' | Out-Null
           Copy-Item 'target/release/fukidashi-mcp.exe' "$stage/fukidashi-mcp.exe"
           Copy-Item 'target/release/fukidashi-editor.exe' "$stage/fukidashi-editor.exe"
-          Copy-Item README.md, LICENSE, LICENSE-Comic-Translate $stage
+          Copy-Item README.md, LICENSE, NOTICE, LICENSE-Comic-Translate $stage
           Copy-Item assets/fonts/ComicNeue-OFL.txt, assets/fonts/PatrickHand-OFL.txt, assets/fonts/README.md "$stage/licenses/fonts/"
           $archive = "fukidashi-mcp-$env:GITHUB_REF_NAME-windows-x86_64.zip"
           Compress-Archive -Path 'package/fukidashi-mcp' -DestinationPath "release-assets/$archive" -Force

@@ -67,6 +67,11 @@ Source: "{#RepoDir}\target\release\{#MyAppMcpName}"; DestDir: "{app}\bin"; Flags
 Source: "{#RepoDir}\target\release\{#MyAppExeName}"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#RepoDir}\assets\install-skills.cmd"; DestDir: "{app}\bin"; Flags: ignoreversion
 
+; --- License & Notices ---
+Source: "{#RepoDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoDir}\NOTICE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#RepoDir}\LICENSE-Comic-Translate"; DestDir: "{app}"; Flags: ignoreversion
+
 ; --- ONNX Runtime DLL ---
 Source: "{#RuntimeDllDir}\onnxruntime.dll"; DestDir: "{app}\bin"; Flags: ignoreversion skipifsourcedoesntexist
 

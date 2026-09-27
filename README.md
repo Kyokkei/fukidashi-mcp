@@ -11,7 +11,7 @@
 [![Protocol: MCP v3.2](https://img.shields.io/badge/MCP-v3.2.0-purple.svg)](https://modelcontextprotocol.io/)
 [![100% Local Vision Core](https://img.shields.io/badge/Vision_Core-100%25_Offline-success.svg)](#-battle-tested-hardware--verified-models)
 
-**Fukidashi** turns **OpenAI Codex**, **Claude Code**, **Claude Desktop**, and **Antigravity** into an autonomous, professional manga localization studio running on your local machine.
+**Fukidashi** turns **OpenAI Codex**, **Claude Code**, **Gemini CLI**, and **Antigravity** into an autonomous, professional manga localization studio running on your local machine.
 
 *Zero cloud subscriptions for vision. Zero cloud fees for cleaning. 100% private OCR, inpainting, and typesetting on consumer GPU/CPU.*
 
@@ -168,10 +168,10 @@ Fukidashi provides native auto-wiring across all major developer and consumer AI
 
 | AI Client / Harness | Mode | Auto-Configuration Target |
 | :--- | :--- | :--- |
-| **OpenAI Codex** | CLI & Desktop IDE | ✅ `~/.codex/config.json` |
-| **Google Antigravity (AGY)** | AGY 1.0 & AGY 2.0 | ✅ `~/.gemini/antigravity/mcp/` |
+| **OpenAI Codex** | CLI & Desktop IDE | ✅ `~/.codex/config.toml` |
+| **Google Antigravity (AGY)** | AGY 1.0 & AGY 2.0 | ✅ `~/.gemini/config/mcp_config.json` |
 | **Claude Code** | CLI Agent | ✅ `~/.claude.json` |
-| **Claude Desktop** | Native Desktop App | ✅ `%APPDATA%\Claude\claude_desktop_config.json` |
+| **Gemini CLI** | CLI Agent | ✅ `~/.gemini/settings.json` |
 | **Cursor** | AI Code Editor | ✅ `~/.cursor/mcp.json` |
 | **VS Code** | Copilot / MCP Extension | ✅ `Code/User/mcp.json` |
 | **Cline** | IDE Extension / CLI | ✅ `%USERPROFILE%\.cline\data\settings\cline_mcp_settings.json` |
